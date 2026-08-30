@@ -62,6 +62,28 @@ class TestCustomParentPermissions(unittest.TestCase):
         finally:
             shared.cleanup()
 
+    def test_env_db_in_shared_parent_not_chmodded(self):
+        # Regression for the re-review P1: AGENT_INBOX_DB points at a file in a
+        # pre-existing shared dir AND get_connection() is called with no
+        # explicit path. The first fix compared against get_db_path().parent,
+        # which equals that shared dir here -> wrongly "owned". Must stay 0755.
+        shared = tempfile.TemporaryDirectory()
+        shared_path = Path(shared.name)
+        os.chmod(shared_path, 0o755)
+        prev = os.environ.get("AGENT_INBOX_DB")
+        os.environ["AGENT_INBOX_DB"] = str(shared_path / "inbox.db")
+        try:
+            conn = get_connection()  # no explicit path -> resolves via env
+            conn.close()
+            mode = stat.S_IMODE(os.stat(shared_path).st_mode)
+            self.assertEqual(mode, 0o755)
+        finally:
+            if prev is None:
+                os.environ.pop("AGENT_INBOX_DB", None)
+            else:
+                os.environ["AGENT_INBOX_DB"] = prev
+            shared.cleanup()
+
     def test_created_parent_is_locked_down(self):
         # A parent the service itself creates SHOULD be tightened to 0700.
         base = tempfile.TemporaryDirectory()

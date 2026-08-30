@@ -5,7 +5,7 @@ import sqlite3
 from pathlib import Path
 from typing import Union
 
-from agent_inbox.config import DIR_MODE, FILE_MODE, get_db_path
+from agent_inbox.config import DIR_MODE, FILE_MODE, get_data_dir, get_db_path
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -109,12 +109,16 @@ def get_connection(db_path: Union[str, Path, None] = None) -> sqlite3.Connection
         target_path = db_path.expanduser().resolve()
 
     # Decide whether we're allowed to tighten the parent directory. We only own
-    # (and may chmod) the parent if we just created it, or it is the default
-    # service data directory. A pre-existing custom parent is left untouched.
-    default_parent = get_db_path().parent.expanduser().resolve()
+    # (and may chmod) the parent if we just created it, or it is the service's
+    # own data directory (~/.agent-inboxes, or AGENT_INBOX_DIR — a dir the
+    # service manages). We deliberately compare against get_data_dir(), NOT
+    # get_db_path().parent: AGENT_INBOX_DB can point at an arbitrary file inside
+    # a pre-existing SHARED directory (e.g. /tmp), and that directory must never
+    # have its permissions rewritten out from under other users.
+    service_data_dir = get_data_dir()
     parent_existed = target_path.parent.exists()
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    own_parent = (not parent_existed) or (target_path.parent == default_parent)
+    own_parent = (not parent_existed) or (target_path.parent == service_data_dir)
 
     ensure_permissions(target_path, chmod_parent=own_parent)
 
