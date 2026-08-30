@@ -35,6 +35,14 @@ class InboxService:
         ).fetchone()
         return row[0] if row else None
 
+    def _is_thread_member(self, thread_id: str, inbox_id: int) -> bool:
+        """True if the inbox is a member of the thread (present in thread_inboxes)."""
+        row = self.conn.execute(
+            "SELECT 1 FROM thread_inboxes WHERE thread_id = ? AND inbox_id = ?",
+            (thread_id, inbox_id),
+        ).fetchone()
+        return row is not None
+
     def ensure_project(self, slug: str) -> int:
         """Idempotently ensure a project exists and return its ID."""
         canonical_slug = normalize_slug(slug)
@@ -52,38 +60,58 @@ class InboxService:
         return row[0]
 
     def ensure_inbox(self, address: str, display_name: Optional[str] = None) -> dict:
-        """Idempotently ensure an inbox exists. Updates last_seen_at."""
-        local_part, project_slug = parse_address(address)
-        project_id = self.ensure_project(project_slug)
-        now = utc_now_iso()
+        """Idempotently ensure an inbox exists. Updates last_seen_at.
 
-        row = self.conn.execute(
-            """
-            SELECT id, display_name, created_at FROM inboxes
-            WHERE project_id = ? AND local_part = ? COLLATE NOCASE
-            """,
-            (project_id, local_part),
-        ).fetchone()
+        When called outside an existing transaction (e.g. the standalone
+        ``PUT /v1/inboxes/{address}`` path) this owns a single ``BEGIN IMMEDIATE``
+        span so the project row and the inbox row commit atomically. When called
+        from inside send/reply — which already hold a transaction — it detects
+        the open span via ``conn.in_transaction`` and stays inert, letting the
+        caller's transaction wrap it. Autocommit mode (isolation_level=None) makes
+        ``in_transaction`` a reliable signal here.
+        """
+        owns_txn = not self.conn.in_transaction
+        if owns_txn:
+            self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            local_part, project_slug = parse_address(address)
+            project_id = self.ensure_project(project_slug)
+            now = utc_now_iso()
 
-        if row:
-            inbox_id = row["id"]
-            created_at = row["created_at"]
-            new_display = display_name if display_name is not None else row["display_name"]
-            self.conn.execute(
-                "UPDATE inboxes SET last_seen_at = ?, display_name = ? WHERE id = ?",
-                (now, new_display, inbox_id),
-            )
-            created = False
-        else:
-            cur = self.conn.execute(
+            row = self.conn.execute(
                 """
-                INSERT INTO inboxes (project_id, local_part, display_name, created_at, last_seen_at)
-                VALUES (?, ?, ?, ?, ?)
+                SELECT id, display_name, created_at FROM inboxes
+                WHERE project_id = ? AND local_part = ? COLLATE NOCASE
                 """,
-                (project_id, local_part, display_name, now, now),
-            )
-            created_at = now
-            created = True
+                (project_id, local_part),
+            ).fetchone()
+
+            if row:
+                inbox_id = row["id"]
+                created_at = row["created_at"]
+                new_display = display_name if display_name is not None else row["display_name"]
+                self.conn.execute(
+                    "UPDATE inboxes SET last_seen_at = ?, display_name = ? WHERE id = ?",
+                    (now, new_display, inbox_id),
+                )
+                created = False
+            else:
+                self.conn.execute(
+                    """
+                    INSERT INTO inboxes (project_id, local_part, display_name, created_at, last_seen_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (project_id, local_part, display_name, now, now),
+                )
+                created_at = now
+                created = True
+
+            if owns_txn:
+                self.conn.execute("COMMIT")
+        except BaseException:
+            if owns_txn:
+                self.conn.execute("ROLLBACK")
+            raise
 
         return {
             "address": f"{local_part}@{project_slug}",
@@ -611,6 +639,12 @@ class InboxService:
         if not thread_row:
             raise NotFoundError("thread_not_found", f"Thread '{thread_id}' not found")
 
+        # A thread is only visible to its member inboxes. Raise the SAME
+        # not-found error on a non-member so we never leak that the thread
+        # exists to an unrelated (or freshly auto-provisioned) inbox.
+        if not self._is_thread_member(thread_id, inbox_id):
+            raise NotFoundError("thread_not_found", f"Thread '{thread_id}' not found")
+
         email_rows = self.conn.execute(
             """
             SELECT e.id, e.from_inbox_id, e.subject, e.body_markdown, e.reply_to_email_id, e.sent_at,
@@ -689,6 +723,12 @@ class InboxService:
         # Check thread exists
         thread_row = self.conn.execute("SELECT id FROM threads WHERE id = ?", (thread_id,)).fetchone()
         if not thread_row:
+            raise NotFoundError("thread_not_found", f"Thread '{thread_id}' not found")
+
+        # Same membership invariant as get_thread: a non-member (or freshly
+        # auto-provisioned) inbox must not be able to mark an unrelated thread
+        # read, and must not learn the thread exists. Same not-found error.
+        if not self._is_thread_member(thread_id, inbox_id):
             raise NotFoundError("thread_not_found", f"Thread '{thread_id}' not found")
 
         now = utc_now_iso()

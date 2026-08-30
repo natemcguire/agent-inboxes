@@ -241,10 +241,26 @@ class AgentInboxServer(HTTPServer):
         self.verbose = verbose
 
 
+# The service is unauthenticated by design and MUST stay on the loopback
+# interface. Binding it to 0.0.0.0 or a LAN address would expose every inbox
+# on the machine to the local network. Fail loudly rather than silently
+# rebinding, so whoever set a non-loopback host learns why it was refused.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
+
+
 def run_server(host: Optional[str] = None, port: Optional[int] = None, db_path: Optional[str] = None, verbose: bool = False) -> None:
     """Run loopback server in foreground."""
     target_host = host or get_host()
     target_port = port or get_port()
+
+    if target_host not in LOOPBACK_HOSTS:
+        raise ValueError(
+            f"Refusing to bind agent-inbox to non-loopback host '{target_host}'. "
+            f"This service is unauthenticated and local-only; it may only bind "
+            f"{' or '.join(sorted(LOOPBACK_HOSTS))}. "
+            f"Remove --host / AGENT_INBOX_HOST or set it to 127.0.0.1."
+        )
+
     conn = get_connection(db_path)
     
     server = AgentInboxServer((target_host, target_port), conn, verbose=verbose)

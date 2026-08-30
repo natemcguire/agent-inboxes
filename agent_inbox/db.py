@@ -77,12 +77,20 @@ CREATE INDEX IF NOT EXISTS idx_threads_activity ON threads(last_email_at DESC);
 """
 
 
-def ensure_permissions(path: Path) -> None:
-    """Ensure directory permissions are 0700 and file permissions are 0600."""
+def ensure_permissions(path: Path, chmod_parent: bool = True) -> None:
+    """Ensure the db file is 0600, and (only when we own it) the parent is 0700.
+
+    ``chmod_parent`` is False for a caller-supplied ``--db``/``AGENT_INBOX_DB``
+    file living in a pre-existing shared directory (e.g. ``/tmp``): rewriting
+    that directory's permissions to 0700 would lock out other users of an
+    unrelated directory. We only tighten a parent the service itself created or
+    the default service-owned data dir. The db file's own 0600 is always safe.
+    """
     try:
-        parent = path.parent
-        if parent.exists():
-            os.chmod(parent, DIR_MODE)
+        if chmod_parent:
+            parent = path.parent
+            if parent.exists():
+                os.chmod(parent, DIR_MODE)
         if path.exists():
             os.chmod(path, FILE_MODE)
     except OSError:
@@ -100,8 +108,15 @@ def get_connection(db_path: Union[str, Path, None] = None) -> sqlite3.Connection
     else:
         target_path = db_path.expanduser().resolve()
 
+    # Decide whether we're allowed to tighten the parent directory. We only own
+    # (and may chmod) the parent if we just created it, or it is the default
+    # service data directory. A pre-existing custom parent is left untouched.
+    default_parent = get_db_path().parent.expanduser().resolve()
+    parent_existed = target_path.parent.exists()
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    ensure_permissions(target_path)
+    own_parent = (not parent_existed) or (target_path.parent == default_parent)
+
+    ensure_permissions(target_path, chmod_parent=own_parent)
 
     conn = sqlite3.connect(
         str(target_path),
@@ -117,7 +132,7 @@ def get_connection(db_path: Union[str, Path, None] = None) -> sqlite3.Connection
     conn.execute("PRAGMA busy_timeout = 5000;")
 
     # Ensure permissions after creation
-    ensure_permissions(target_path)
+    ensure_permissions(target_path, chmod_parent=own_parent)
 
     # Initialize schema
     init_db(conn)
