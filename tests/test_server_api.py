@@ -91,6 +91,10 @@ class TestServerAPI(unittest.TestCase):
                 "https://nates-software.com",
             )
             self.assertIn("Idempotency-Key", r.headers.get("Access-Control-Allow-Headers", ""))
+            # Chrome Private Network Access: public->loopback needs this opt-in.
+            self.assertEqual(
+                r.headers.get("Access-Control-Allow-Private-Network"), "true"
+            )
 
     def test_put_and_list_inboxes(self):
         # Register inboxes

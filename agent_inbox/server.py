@@ -62,6 +62,11 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                 "Access-Control-Allow-Headers",
                 "Content-Type, Idempotency-Key, Accept",
             )
+            # A page on https://nates-software.com fetching http://127.0.0.1
+            # is a public->loopback request; Chrome's Private Network Access
+            # rules require the server to opt in on the preflight, or the
+            # browser blocks it even with valid CORS.
+            self.send_header("Access-Control-Allow-Private-Network", "true")
             self.send_header("Access-Control-Max-Age", "600")
 
     def do_OPTIONS(self) -> None:
