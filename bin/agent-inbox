@@ -2,6 +2,21 @@
 """Executable launcher for agent-inbox."""
 
 import sys
+
+# Enforce the documented runtime BEFORE importing the package, which uses
+# 3.11+ stdlib behavior. The `#!/usr/bin/env python3` shebang resolves to
+# whatever python3 is first on PATH — on stock macOS that can be Xcode's
+# Python 3.9, under which the service listens on the port but hangs every
+# request and logs nothing (the worst possible failure for a shareware
+# install). Fail loudly with the fix instead.
+if sys.version_info < (3, 11):
+    sys.exit(
+        f"agent-inbox requires Python 3.11+ (found {sys.version_info.major}."
+        f"{sys.version_info.minor}). Run it with a 3.11+ interpreter, e.g. "
+        f"`python3.12 bin/agent-inbox ...` or install a newer python3 "
+        f"(brew install python@3.12) and ensure it's first on PATH."
+    )
+
 from pathlib import Path
 
 # Add package root to sys.path so it works when executed directly
