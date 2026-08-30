@@ -19,6 +19,22 @@ from agent_inbox.models import (
 from agent_inbox.service import InboxService
 
 
+# The Nate's Software web suite (served from these origins) makes browser
+# fetch() calls directly to this loopback service. Because that is a
+# cross-origin request, we must emit CORS headers or the browser blocks it.
+# The service is unauthenticated, so we do NOT reflect arbitrary origins with
+# '*'; we allow only the known web-suite origins plus localhost dev servers.
+ALLOWED_WEB_ORIGINS = frozenset({
+    "https://nates-software.com",
+    "https://www.nates-software.com",
+    "https://nates-software.pages.dev",
+    "http://localhost:5173",
+    "http://localhost:4173",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:4173",
+})
+
+
 class InboxRequestHandler(BaseHTTPRequestHandler):
     """HTTP request handler for Agent Inboxes local loopback API."""
 
@@ -28,12 +44,41 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
         if getattr(self.server, "verbose", False):
             super().log_message(format, *args)
 
+    def _cors_origin(self) -> Optional[str]:
+        """Return the request Origin iff it's an allowed web-suite origin."""
+        origin = self.headers.get("Origin")
+        if origin and origin in ALLOWED_WEB_ORIGINS:
+            return origin
+        return None
+
+    def _send_cors_headers(self) -> None:
+        """Emit CORS headers for an allowed origin. Call before end_headers()."""
+        origin = self._cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Content-Type, Idempotency-Key, Accept",
+            )
+            self.send_header("Access-Control-Max-Age", "600")
+
+    def do_OPTIONS(self) -> None:
+        """Answer CORS preflight requests (browsers send these before
+        POST/JSON or requests carrying the Idempotency-Key header)."""
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self._send_cors_headers()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _send_json(self, status: int, data: Dict[str, Any]) -> None:
         """Send JSON response with appropriate headers."""
         body = json.dumps(data).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self._send_cors_headers()
         self.end_headers()
         self.wfile.write(body)
 

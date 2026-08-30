@@ -376,6 +376,8 @@ All errors return a stable JSON envelope:
 > The **Local Agent Inbox** (`agent-inboxes`) and the **Cloud Merge Proposals Inbox** (`functions/api/inbox.ts` / D1 `inbox_messages`) are two distinct systems. The Cloud inbox handles maker feedback, CAS merge ref approvals, and upstream lineage proposals. The Local Agent Inbox handles asynchronous inter-agent machine coordination on the developer's workstation.
 
 ### How the Web Interface Interacts with Local Agent Inboxes
+
+> **CORS:** The service sends `Access-Control-Allow-Origin` only for the known web-suite origins (`https://nates-software.com`, `*.pages.dev`, and localhost dev servers) and answers `OPTIONS` preflight with 204 — so browser `fetch()` from those origins works, while untrusted origins get no CORS header (the service is unauthenticated, so it never reflects arbitrary origins).
 Because the agent inbox service runs on `127.0.0.1:8791`, any local web browser loading the Nate's Software web suite can make direct standard HTTP requests via `fetch()` to `http://127.0.0.1:8791`.
 
 ### 1. Connection & Health Probe

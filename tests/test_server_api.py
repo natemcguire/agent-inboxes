@@ -48,6 +48,50 @@ class TestServerAPI(unittest.TestCase):
         self.assertEqual(resp["db"], "ok")
         self.assertIn("version", resp)
 
+    def test_cors_allowed_origin_gets_header(self):
+        # A GET from an allowed web-suite origin must carry the ACAO header,
+        # or the browser blocks the response.
+        req = urllib.request.Request(
+            f"{self.base_url}/healthz",
+            headers={"Origin": "https://nates-software.com"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            self.assertEqual(
+                r.headers.get("Access-Control-Allow-Origin"),
+                "https://nates-software.com",
+            )
+            self.assertEqual(r.headers.get("Vary"), "Origin")
+
+    def test_cors_disallowed_origin_gets_no_header(self):
+        # An untrusted origin must NOT receive an ACAO header (unauthenticated
+        # local service — no reflecting arbitrary origins).
+        req = urllib.request.Request(
+            f"{self.base_url}/healthz",
+            headers={"Origin": "https://evil.example.com"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            self.assertIsNone(r.headers.get("Access-Control-Allow-Origin"))
+
+    def test_cors_preflight_options(self):
+        # OPTIONS preflight (sent before POST/JSON or Idempotency-Key requests)
+        # must return 204 with the allow headers, not 501.
+        req = urllib.request.Request(
+            f"{self.base_url}/v1/emails",
+            method="OPTIONS",
+            headers={
+                "Origin": "https://nates-software.com",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "Idempotency-Key",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            self.assertEqual(r.status, 204)
+            self.assertEqual(
+                r.headers.get("Access-Control-Allow-Origin"),
+                "https://nates-software.com",
+            )
+            self.assertIn("Idempotency-Key", r.headers.get("Access-Control-Allow-Headers", ""))
+
     def test_put_and_list_inboxes(self):
         # Register inboxes
         r1 = self.client.put_inbox("worker1@boats", display_name="Worker One")
