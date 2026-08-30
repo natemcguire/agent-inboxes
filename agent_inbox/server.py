@@ -1,0 +1,261 @@
+"""Loopback HTTP Server implementation for Agent Inboxes."""
+
+import json
+import sqlite3
+import urllib.parse
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any, Dict, Optional, Tuple
+
+from agent_inbox import __version__
+from agent_inbox.config import get_db_path, get_host, get_port
+from agent_inbox.db import get_connection
+from agent_inbox.models import (
+    ConflictError,
+    InboxError,
+    NotFoundError,
+    ValidationError,
+)
+from agent_inbox.service import InboxService
+
+
+class InboxRequestHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for Agent Inboxes local loopback API."""
+
+    # Disable default logging to stderr in quiet mode / handle explicitly
+    def log_message(self, format: str, *args: Any) -> None:
+        # Override to prevent unsolicited stderr spam during tests
+        if getattr(self.server, "verbose", False):
+            super().log_message(format, *args)
+
+    def _send_json(self, status: int, data: Dict[str, Any]) -> None:
+        """Send JSON response with appropriate headers."""
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_error(self, exc: InboxError) -> None:
+        """Send formatted JSON error response."""
+        self._send_json(exc.status_code, exc.to_dict())
+
+    def _read_json_body(self) -> Dict[str, Any]:
+        """Read and parse JSON request body."""
+        content_length_str = self.headers.get("Content-Length")
+        if not content_length_str:
+            return {}
+        try:
+            length = int(content_length_str)
+            raw = self.rfile.read(length).decode("utf-8")
+            if not raw.strip():
+                return {}
+            return json.loads(raw)
+        except (ValueError, json.JSONDecodeError) as e:
+            raise ValidationError("invalid_json", f"Request body must be valid JSON: {str(e)}")
+
+    def _get_idempotency_key(self) -> str:
+        """Extract Idempotency-Key header or raise ValidationError."""
+        key = self.headers.get("Idempotency-Key")
+        if not key or not key.strip():
+            raise ValidationError("missing_idempotency_key", "Idempotency-Key header is required")
+        return key.strip()
+
+    def _get_service(self) -> InboxService:
+        """Get InboxService attached to server's DB connection."""
+        return InboxService(self.server.db_conn)
+
+    def do_GET(self) -> None:
+        """Route GET requests."""
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            query = urllib.parse.parse_qs(parsed.query)
+
+            # /healthz
+            if path == "/healthz":
+                # Check DB responsiveness
+                try:
+                    self.server.db_conn.execute("SELECT 1").fetchone()
+                    db_status = "ok"
+                except Exception:
+                    db_status = "error"
+                self._send_json(HTTPStatus.OK, {
+                    "status": "ok",
+                    "db": db_status,
+                    "version": __version__,
+                })
+                return
+
+            # /v1/inboxes
+            if path == "/v1/inboxes":
+                service = self._get_service()
+                project_slug = query.get("project", [None])[0]
+                inboxes = service.list_inboxes(project_slug)
+                self._send_json(HTTPStatus.OK, {"inboxes": inboxes})
+                return
+
+            # Path matching for /v1/inboxes/{address}/threads...
+            parts = [urllib.parse.unquote(p) for p in path.strip("/").split("/")]
+            if len(parts) >= 3 and parts[0] == "v1" and parts[1] == "inboxes":
+                address = parts[2]
+                
+                # /v1/inboxes/{address}/threads
+                if len(parts) == 4 and parts[3] == "threads":
+                    service = self._get_service()
+                    unread_val = query.get("unread", ["false"])[0].lower()
+                    unread_only = unread_val in ("true", "1", "yes")
+                    limit_str = query.get("limit", ["50"])[0]
+                    try:
+                        limit = int(limit_str)
+                    except ValueError:
+                        limit = 50
+                    threads = service.list_threads(address, unread_only=unread_only, limit=limit)
+                    self._send_json(HTTPStatus.OK, {"threads": threads})
+                    return
+
+                # /v1/inboxes/{address}/threads/{thread_id}
+                if len(parts) == 5 and parts[3] == "threads":
+                    thread_id = parts[4]
+                    service = self._get_service()
+                    thread_data = service.get_thread(address, thread_id)
+                    self._send_json(HTTPStatus.OK, thread_data)
+                    return
+
+            raise NotFoundError("not_found", f"Cannot GET {path}")
+
+        except InboxError as e:
+            self._send_error(e)
+        except Exception as e:
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {
+                "error": {"code": "internal_error", "message": str(e)}
+            })
+
+    def do_PUT(self) -> None:
+        """Route PUT requests."""
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            parts = [urllib.parse.unquote(p) for p in path.strip("/").split("/")]
+
+            # PUT /v1/inboxes/{address}
+            if len(parts) == 3 and parts[0] == "v1" and parts[1] == "inboxes":
+                address = parts[2]
+                body = self._read_json_body()
+                display_name = body.get("display_name")
+                service = self._get_service()
+                result = service.ensure_inbox(address, display_name=display_name)
+                status = HTTPStatus.CREATED if result["created"] else HTTPStatus.OK
+                self._send_json(status, result)
+                return
+
+            raise NotFoundError("not_found", f"Cannot PUT {path}")
+
+        except InboxError as e:
+            self._send_error(e)
+        except Exception as e:
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {
+                "error": {"code": "internal_error", "message": str(e)}
+            })
+
+    def do_POST(self) -> None:
+        """Route POST requests."""
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            parts = [urllib.parse.unquote(p) for p in path.strip("/").split("/")]
+
+            # POST /v1/emails
+            if path == "/v1/emails":
+                idempotency_key = self._get_idempotency_key()
+                body = self._read_json_body()
+                from_addr = body.get("from")
+                to_addrs = body.get("to", [])
+                cc_addrs = body.get("cc", [])
+                subject = body.get("subject", "")
+                body_markdown = body.get("body_markdown", "")
+
+                service = self._get_service()
+                res = service.send_email(
+                    from_addr=from_addr,
+                    to_addrs=to_addrs,
+                    cc_addrs=cc_addrs,
+                    subject=subject,
+                    body_markdown=body_markdown,
+                    client_token=idempotency_key,
+                )
+                self._send_json(HTTPStatus.CREATED, res)
+                return
+
+            # POST /v1/emails/{email_id}/reply
+            if len(parts) == 4 and parts[0] == "v1" and parts[1] == "emails" and parts[3] == "reply":
+                email_id = parts[2]
+                idempotency_key = self._get_idempotency_key()
+                body = self._read_json_body()
+                from_addr = body.get("from")
+                body_markdown = body.get("body_markdown", "")
+                to_addrs = body.get("to")
+                cc_addrs = body.get("cc")
+
+                service = self._get_service()
+                res = service.reply_email(
+                    reply_to_email_id=email_id,
+                    from_addr=from_addr,
+                    body_markdown=body_markdown,
+                    client_token=idempotency_key,
+                    to_addrs=to_addrs,
+                    cc_addrs=cc_addrs,
+                )
+                self._send_json(HTTPStatus.CREATED, res)
+                return
+
+            # POST /v1/inboxes/{address}/threads/{thread_id}/read
+            if len(parts) == 6 and parts[0] == "v1" and parts[1] == "inboxes" and parts[3] == "threads" and parts[5] == "read":
+                address = parts[2]
+                thread_id = parts[4]
+                service = self._get_service()
+                count = service.mark_thread_read(address, thread_id)
+                self._send_json(HTTPStatus.OK, {
+                    "thread_id": thread_id,
+                    "marked_read": count,
+                })
+                return
+
+            raise NotFoundError("not_found", f"Cannot POST {path}")
+
+        except InboxError as e:
+            self._send_error(e)
+        except Exception as e:
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {
+                "error": {"code": "internal_error", "message": str(e)}
+            })
+
+
+class AgentInboxServer(HTTPServer):
+    """Custom HTTPServer maintaining SQLite connection."""
+
+    def __init__(self, server_address: Tuple[str, int], db_conn: sqlite3.Connection, verbose: bool = False):
+        super().__init__(server_address, InboxRequestHandler)
+        self.db_conn = db_conn
+        self.verbose = verbose
+
+
+def run_server(host: Optional[str] = None, port: Optional[int] = None, db_path: Optional[str] = None, verbose: bool = False) -> None:
+    """Run loopback server in foreground."""
+    target_host = host or get_host()
+    target_port = port or get_port()
+    conn = get_connection(db_path)
+    
+    server = AgentInboxServer((target_host, target_port), conn, verbose=verbose)
+    print(f"Agent Inboxes service listening on http://{target_host}:{target_port}")
+    print(f"Database: {get_db_path() if not db_path else db_path}")
+    print("Press Ctrl+C to stop.")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping server...")
+    finally:
+        server.server_close()
+        conn.close()

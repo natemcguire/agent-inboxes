@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-inboxes"
+version = "1.0.0"
+description = "Local-First Single-Machine Async Message Service for Coding Agents"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Nate McGuire" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: MacOS :: MacOS X",
+    "Topic :: Communications :: Email",
+]
+
+[project.scripts]
+agent-inbox = "agent_inbox.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agent_inbox*"]

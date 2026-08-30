@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Executable launcher for agent-inbox."""
+
+import sys
+from pathlib import Path
+
+# Add package root to sys.path so it works when executed directly
+pkg_root = Path(__file__).resolve().parent.parent
+if str(pkg_root) not in sys.path:
+    sys.path.insert(0, str(pkg_root))
+
+from agent_inbox.cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())
