@@ -552,6 +552,11 @@ class AgentInboxServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, server_address: Tuple[str, int], db_conn: sqlite3.Connection, verbose: bool = False):
+        # Set before super().__init__: a failed socket bind (port in use) makes
+        # socketserver call server_close() mid-init, which touches these — an
+        # AttributeError here used to mask the real "Address already in use".
+        self._cloud_worker = None
+        self._cloud_check_at = 0.0
         super().__init__(server_address, InboxRequestHandler)
         self.db_conn = db_conn
         self.verbose = verbose
@@ -564,8 +569,6 @@ class AgentInboxServer(ThreadingHTTPServer):
                 break
         self.db_path = db_file if db_file else None
         self._thread_db = threading.local()
-        self._cloud_worker = None
-        self._cloud_check_at = 0.0
 
     def nudge_cloud_sync(self) -> None:
         if self._cloud_worker is not None:

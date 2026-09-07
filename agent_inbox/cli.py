@@ -87,6 +87,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
     try:
         run_server(host=args.host, port=args.port, db_path=args.db, verbose=args.verbose)
         return 0
+    except OSError as e:
+        if getattr(e, "errno", None) == 48:  # EADDRINUSE on macOS
+            _print_error(
+                f"Port {args.port} is already in use — the service is probably already "
+                f"running (LaunchAgent). Check: curl http://{args.host}:{args.port}/healthz"
+            )
+            return 1
+        _print_error(str(e))
+        return 1
     except Exception as e:
         _print_error(str(e))
         return 1
