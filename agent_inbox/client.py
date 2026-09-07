@@ -55,6 +55,9 @@ class InboxClient:
             req_headers["X-Agent-Address"] = derive_identity()[2]
         except Exception:
             pass
+        if self.session_id:
+            req_headers["X-Agent-Session"] = self.session_id
+            req_headers["X-Agent-Pid"] = str(os.getpid())
         if headers:
             req_headers.update(headers)
 

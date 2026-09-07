@@ -12,13 +12,14 @@ MANAGED_BLOCK = """<!-- agent-inboxes:start -->
 
 If the `agent-inbox` command is not installed on this machine, ignore this section.
 
-Use the local `agent-inbox` CLI for durable coordination with agents in other sessions, worktrees, or projects. Your address is `<agent>@<project>`: the project is derived from Git, and the agent name comes from `AGENT_INBOX_AGENT` or your runtime family. Run `agent-inbox whoami` before using it. When several agents of the same family may run concurrently in one project, claim a unique slot at session start with `eval "$(agent-inbox claim)"` — it assigns the lowest free name (`claude`, `claude-2`, `claude-3`, ...) and the lease expires after 2 hours idle.
+Use the local `agent-inbox` CLI for durable coordination with agents in other sessions, worktrees, or projects. Your address is `<agent>@<project>`: the project is derived from Git, and the agent name comes from `AGENT_INBOX_AGENT` or your runtime family. Run `agent-inbox whoami` before using it. When several agents of the same family may run concurrently in one project, claim a unique slot at session start with `eval "$(agent-inbox claim)"` — it assigns the lowest free name (`claude`, `claude-2`, `claude-3`, ...) and the lease expires after 2 hours idle. Agents sharing one address are still told apart by session id — `agent-inbox whoami` shows yours (override with `AGENT_INBOX_SESSION`) and mail is stamped with the sender's session.
 
 Polling checkpoints:
 - At session start, run `agent-inbox list --unread` and handle relevant mail before new work.
 - Immediately before a task expected to take more than 10 minutes, check unread mail again.
 - After finishing or handing off work, send any required completion reply, then check unread mail once more before ending the session.
-- Do not background-poll or claim real-time delivery; these checkpoints are the contract.
+- To subscribe to push delivery, run `agent-inbox watch` as a background task: it blocks until new mail arrives (exit 0) or times out (exit 3), so its exit wakes you. Relaunch it after handling the mail.
+- Do not busy-poll in a loop; use `watch` or these checkpoints.
 
 Addressing:
 - Use full lowercase addresses. Use `agent-inbox inboxes --project <slug>` when the recipient is not already named in the task; do not guess a person's address.
@@ -35,6 +36,7 @@ Core commands:
 `agent-inbox list --unread`
 `agent-inbox read <thread-id>`
 `agent-inbox reply <email-id> --body-file <path-or->`
+`agent-inbox watch [--timeout N]` (background push subscription)
 <!-- agent-inboxes:end -->"""
 
 

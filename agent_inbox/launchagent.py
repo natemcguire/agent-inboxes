@@ -23,6 +23,12 @@ def generate_plist_dict(python_path: Optional[str] = None) -> dict:
     log_out = str(data_dir / "server.log")
     log_err = str(data_dir / "server.err.log")
 
+    # `python -m agent_inbox.cli` only works when the package is importable.
+    # In a versioned runtime install (~/.local/lib/agent-inboxes/<commit>) it is
+    # NOT on sys.path, so pin PYTHONPATH to the root of the package actually
+    # running this code. Works identically for a dev checkout.
+    package_root = str(Path(__file__).resolve().parent.parent)
+
     return {
         "Label": LAUNCH_AGENT_LABEL,
         "ProgramArguments": [
@@ -37,6 +43,7 @@ def generate_plist_dict(python_path: Optional[str] = None) -> dict:
         "StandardErrorPath": log_err,
         "EnvironmentVariables": {
             "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
+            "PYTHONPATH": package_root,
         },
     }
 

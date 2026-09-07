@@ -59,7 +59,10 @@ class TestCLI(unittest.TestCase):
     def test_whoami_command(self):
         code, out, err = self._run_cli(["whoami"])
         self.assertEqual(code, 0)
-        self.assertEqual(out.strip(), "test-agent@test-project")
+        lines = out.strip().splitlines()
+        self.assertEqual(lines[0], "test-agent@test-project")
+        # Line 2 announces this agent session's short id.
+        self.assertRegex(lines[1], r"^session: [a-z0-9][a-z0-9-]*$")
 
         # With --json
         code, out, err = self._run_cli(["whoami", "--json"])
@@ -177,7 +180,7 @@ class TestCLI(unittest.TestCase):
             env=env,
         )
         self.assertEqual(res.returncode, 0)
-        self.assertEqual(res.stdout.strip(), "bin-agent@bin-project")
+        self.assertEqual(res.stdout.strip().splitlines()[0], "bin-agent@bin-project")
 
     def test_honest_not_running_error(self):
         """When server is down, CLI emits an honest error and non-zero exit code."""
