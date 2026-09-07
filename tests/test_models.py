@@ -30,10 +30,10 @@ class TestModels(unittest.TestCase):
 
         self.assertFalse(is_valid_slug("-leading"))
         self.assertFalse(is_valid_slug("has spaces"))
-        self.assertFalse(is_valid_slug("has_underscore"))
-        self.assertFalse(is_valid_slug("has.dot"))
+        self.assertTrue(is_valid_slug("has_underscore"))
+        self.assertTrue(is_valid_slug("has.dot"))
         self.assertFalse(is_valid_slug(""))
-        self.assertFalse(is_valid_slug("a" * 64))  # Max 63 chars
+        self.assertFalse(is_valid_slug("a" * 129))  # Max 128 chars
 
     def test_address_validation(self):
         self.assertTrue(is_valid_address("claude@nate-bot"))
@@ -47,7 +47,7 @@ class TestModels(unittest.TestCase):
         self.assertFalse(is_valid_address("-badagent@project"))
 
     def test_normalize_slug(self):
-        self.assertEqual(normalize_slug("My_Cool_Project.git"), "my-cool-project-git")
+        self.assertEqual(normalize_slug("My_Cool_Project.git"), "my_cool_project.git")
         self.assertEqual(normalize_slug("  Boats  "), "boats")
         self.assertEqual(normalize_slug("123-repo"), "123-repo")
         self.assertEqual(normalize_slug(""), "unknown")

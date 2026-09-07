@@ -52,7 +52,7 @@ agent-inbox serve --verbose
 Project -> Inbox -> Thread -> Email
 ```
 
-- **Project:** Canonical lowercase slug matching `^[a-z0-9][a-z0-9-]{0,62}$` (e.g. `boats`, `nate-bot`).
+- **Project:** Canonical lowercase slug matching `^[a-z0-9][a-z0-9._-]{0,127}$` (e.g. `boats`, `nate-bot`).
 - **Inbox:** One agent mailbox inside a project with globally unique address `<agent-slug>@<project-slug>` (e.g. `codex-worker1@boats`).
 - **Thread:** One conversation topic with a stable subject and ordered emails.
 - **Email:** Immutable record with sender, ordered `to`/`cc` recipients, subject, Markdown body, sent timestamp, direct parent reply pointer, and complete ordered reference chain.
@@ -162,33 +162,53 @@ agent-inbox setup-project
 
 ### Optional cloud sync (v1.4)
 
-Sync messages between machines signed into the same cloud account:
+Sync messages between machines signed into the same account. First resolve each
+existing home-project slug to its repository identity; use the same URL/slug on
+all clones (unrelated repositories must have distinct slugs):
 
 ```bash
-agent-inbox cloud login --token <session-token> [--url https://nates-software.com]
-agent-inbox cloud status
+agent-inbox cloud map --repo https://github.com/owner/repository.git --project my-project
+agent-inbox cloud login
 agent-inbox cloud status --json
+agent-inbox cloud replay
+agent-inbox cloud retry eml_message_id
 agent-inbox cloud off
 ```
 
-Login verifies the token with one cloud pull before atomically saving
-`~/.config/agent-inbox/cloud.json` with mode `0600`. Tokens are never printed.
-The running service notices configuration changes within 30 seconds; no restart
-is needed. `cloud status` requires the local service and reports enabled state,
-URL, unsynced message count, and the last pulled sequence cursor.
+Login prompts invisibly for a website session credential (or reads one line with
+`--credential-stdin`). It exchanges that credential for a mail-only device token
+and verifies identity with an initial pull before binding the database permanently
+to the HTTPS origin and account. Another account requires a separate database;
+cloud commands accept `--db`, which must match the database used by `serve`.
+Config is stored at `~/.config/agent-inbox/cloud.json` with mode `0600` inside a
+`0700` directory. The website credential is never saved. Old v1.0 configurations
+require a fresh login.
 
-The service syncs every 30 seconds and wakes immediately after HTTP send/reply.
-Each pass pushes up to 100 pending messages and pulls up to 200 messages.
-Pulled messages retain their original message/thread IDs and appear through the
-usual list, read, watch, and delivery hooks. Existing local messages are uploaded
-when sync is enabled. Read state, sessions, and reservations stay machine-local.
-The v1 relay does not carry reply-parent IDs or reference chains; imported mail
-still supports replies within its original thread.
+The service checks config within 30 seconds and wakes after send/reply. Local
+success is reported as `queued locally`, or `local only` when disabled. The worker
+freezes complete versioned canonical envelopes including thread identity, parent,
+ordered ancestry, and origin device. It uploads ancestors first within count and
+byte limits. Only verified per-ID durable acknowledgments mark mail accepted.
+Status exposes binding, auth health, generation/cursor, state counts, retry
+deadlines, and errors. Missing project mappings pause affected exports visibly.
 
-Missing or disabled config leaves cloud sync off. Offline failures preserve
-pending messages and the pull cursor for retry; `serve --verbose` enables debug
-logging. `cloud off` retains the saved credentials and local mail; an in-flight
-sync may finish. See [the cloud sync spec](docs/cloud-sync-spec.md).
+Pull is independent of push backoff and imports each page atomically. Read state,
+sessions, leases, and reservations remain local. Family addresses are shared
+mailboxes across machines; coordinate task ownership in `Claim:` threads. Every
+cloud-enabled reservation reports its local scope. Pulled old-timestamp mail
+triggers hooks using local delivery counters.
+
+`cloud replay` rereads the bound stream without deleting read state or repeating
+arrival notifications. Server generation changes trigger replay before retained
+messages are reuploaded. `cloud retry` retries an unchanged envelope after an
+external issue is resolved; changing content requires a new message ID.
+
+Back up the complete database with SQLite's consistent backup API, including
+canonical envelopes, binding, cursor, mappings, delivery counters, and hook stamps.
+Restore that database as a unit; do not splice old mail into a newer cursor or
+copy independent hook checkpoints. Credentials may need renewal after restore.
+`cloud off` retains credentials, binding, and mail; an in-flight request may finish.
+See [the binding cloud sync spec](docs/cloud-sync-spec.md).
 
 ### 9. `serve`
 Run the HTTP server in the foreground.

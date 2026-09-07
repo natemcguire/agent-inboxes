@@ -11,14 +11,14 @@ from agent_inbox import hooks
 
 
 def _thread(subject, last):
-    return {"thread_id": "thr_x", "subject": subject, "last_email_at": last}
+    return {"thread_id": "thr_x", "subject": subject, "last_email_at": last, "activity_id": int(last[11:13] + last[14:16])}
 
 
 class TestBuildNotice(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.patcher = mock.patch("agent_inbox.hooks.get_data_dir", return_value=Path(self.tmp.name))
+        self.patcher = mock.patch.dict("os.environ", {"AGENT_INBOX_DB": str(Path(self.tmp.name) / "inbox.db")})
         self.patcher.start()
 
     def tearDown(self):
