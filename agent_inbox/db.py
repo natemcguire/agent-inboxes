@@ -214,3 +214,58 @@ def init_db(conn: sqlite3.Connection) -> None:
     reservation_columns = {row[1] for row in conn.execute("PRAGMA table_info(reservations)")}
     if "repo_key" not in reservation_columns:
         conn.execute("ALTER TABLE reservations ADD COLUMN repo_key TEXT")
+
+    # v1.1 relay contract. Each upgrade is additive and repeatable.
+    columns = {r[1] for r in conn.execute('PRAGMA table_info(cloud_state)')}
+    additions = {
+        'endpoint': 'TEXT', 'user_id': 'TEXT', 'generation': 'TEXT',
+        'auth_state': "TEXT NOT NULL DEFAULT 'signed-out'",
+        'last_push_at': 'TEXT', 'last_pull_at': 'TEXT', 'last_error': 'TEXT',
+        'push_retry_at': 'REAL NOT NULL DEFAULT 0', 'pull_retry_at': 'REAL NOT NULL DEFAULT 0',
+        'push_failures': 'INTEGER NOT NULL DEFAULT 0', 'pull_failures': 'INTEGER NOT NULL DEFAULT 0',
+        'replaying': 'INTEGER NOT NULL DEFAULT 0',
+    }
+    for name, declaration in additions.items():
+        if name not in columns:
+            conn.execute(f'ALTER TABLE cloud_state ADD COLUMN {name} {declaration}')
+    for table, name in [('emails', 'delivery_id'), ('threads', 'activity_id')]:
+        if name not in {r[1] for r in conn.execute(f'PRAGMA table_info({table})')}:
+            conn.execute(f'ALTER TABLE {table} ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0')
+    conn.executescript('''
+        CREATE TABLE IF NOT EXISTS cloud_envelopes (
+            message_id TEXT PRIMARY KEY REFERENCES emails(id),
+            envelope_json TEXT,
+            state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN
+              ('pending','retryable','acknowledged','permanently_rejected')),
+            reason TEXT, attempts INTEGER NOT NULL DEFAULT 0, retry_at REAL NOT NULL DEFAULT 0,
+            ack_generation TEXT, ack_seq INTEGER, ack_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS cloud_threads (
+            thread_id TEXT PRIMARY KEY REFERENCES threads(id), metadata_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS delivery_counter (id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL);
+        INSERT OR IGNORE INTO delivery_counter VALUES (1,0);
+        CREATE TABLE IF NOT EXISTS hook_stamps (address TEXT PRIMARY KEY, seen_activity INTEGER NOT NULL, last_emit REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS project_mappings (repo_identity TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+        CREATE TRIGGER IF NOT EXISTS immutable_cloud_binding BEFORE UPDATE OF endpoint,user_id ON cloud_state
+        WHEN OLD.endpoint IS NOT NULL AND (NEW.endpoint IS NOT OLD.endpoint OR NEW.user_id IS NOT OLD.user_id)
+        BEGIN SELECT RAISE(ABORT, 'cloud binding is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS allocate_delivery AFTER INSERT ON emails BEGIN
+          UPDATE delivery_counter SET value=value+1 WHERE id=1;
+          UPDATE emails SET delivery_id=(SELECT value FROM delivery_counter WHERE id=1) WHERE id=NEW.id;
+          UPDATE threads SET activity_id=(SELECT value FROM delivery_counter WHERE id=1) WHERE id=NEW.thread_id;
+        END;
+    ''')
+    if 'dependency_stamp' not in {r[1] for r in conn.execute('PRAGMA table_info(cloud_envelopes)')}:
+        conn.execute('ALTER TABLE cloud_envelopes ADD COLUMN dependency_stamp TEXT')
+    # Backfill old mail once in local arrival order, never from cloud sequences.
+    conn.execute('BEGIN IMMEDIATE')
+    try:
+        for row in conn.execute('SELECT id,thread_id FROM emails WHERE delivery_id=0 ORDER BY rowid').fetchall():
+            conn.execute('UPDATE delivery_counter SET value=value+1 WHERE id=1')
+            conn.execute('UPDATE emails SET delivery_id=(SELECT value FROM delivery_counter WHERE id=1) WHERE id=?', (row['id'],))
+        conn.execute('UPDATE threads SET activity_id=COALESCE((SELECT MAX(delivery_id) FROM emails WHERE thread_id=threads.id),0)')
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
