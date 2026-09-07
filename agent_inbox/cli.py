@@ -26,6 +26,7 @@ from agent_inbox.launchagent import (
     uninstall_launchagent,
 )
 from agent_inbox.models import InboxError, ServerNotRunningError
+from agent_inbox.hooks import hooks_status, install_hooks, run_hook_check, uninstall_hooks
 from agent_inbox.project_setup import ONBOARDING_PROMPT, copy_to_clipboard, setup_global, setup_project
 from agent_inbox.server import run_server
 
@@ -132,14 +133,52 @@ def cmd_send(args: argparse.Namespace, client: InboxClient) -> int:
         return 1
 
 
+def _normalized_subject(text: str) -> str:
+    import re as _re
+    text = (text or "").strip().casefold()
+    text = _re.sub(r"^(re|fwd?):\s*", "", text)
+    return _re.sub(r"\s+", " ", text)
+
+
 def cmd_reply(args: argparse.Namespace, client: InboxClient) -> int:
-    """Reply to an existing email in a thread."""
+    """Reply to an existing email in a thread.
+
+    Threading discipline: one topic per thread. Accepts an email id (eml_...)
+    or a thread id (thr_... — replies to its newest email). When --subject is
+    declared and differs materially from the thread's subject, the reply is
+    refused: a different topic belongs in a NEW thread via `send`.
+    """
     try:
         from_addr = args.from_addr
         if not from_addr:
             _, _, from_addr = derive_identity()
 
         body = _read_body(args.body, args.body_file)
+
+        email_id = args.email_id
+        thread_subject = None
+        if email_id.startswith("thr_"):
+            thread = client.get_thread(from_addr, email_id)
+            thread_subject = str(thread.get("subject") or (thread.get("thread") or {}).get("subject") or "")
+            emails = thread.get("emails") or []
+            if not emails:
+                _print_error("Thread has no emails to reply to.", "invalid_argument")
+                return 1
+            email_id = emails[-1]["id"]
+        declared = getattr(args, "subject", None)
+        if declared is not None:
+            if thread_subject is None:
+                _print_error(
+                    "To declare --subject on a reply, pass the thread id (thr_...) so the topic can be checked — or drop --subject. A different topic belongs in a new thread: use `send`.",
+                    "invalid_argument",
+                )
+                return 1
+            if _normalized_subject(declared) != _normalized_subject(thread_subject):
+                _print_error(
+                    f"different topic → use send. This thread is '{thread_subject}'; your declared subject is '{declared}'. One topic per thread.",
+                    "different_topic",
+                )
+                return 1
 
         to_list = None
         if args.to:
@@ -164,6 +203,14 @@ def cmd_reply(args: argparse.Namespace, client: InboxClient) -> int:
         if args.json:
             print(json.dumps(res, indent=2))
         else:
+            if thread_subject is None:
+                try:
+                    thread = client.get_thread(from_addr, res["thread_id"])
+                    thread_subject = str(thread.get("subject") or (thread.get("thread") or {}).get("subject") or "")
+                except Exception:
+                    thread_subject = ""
+            if thread_subject:
+                print(f"Replying in thread: '{thread_subject}'")
             print(f"Sent reply {res['email_id']} in thread {res['thread_id']}")
         return 0
     except ValueError as e:
@@ -282,6 +329,184 @@ def cmd_inboxes(args: argparse.Namespace, client: InboxClient) -> int:
         return 1
 
 
+def _parse_duration(raw: str) -> int:
+    """Parse '90s', '15m', '1h' (or bare seconds) into seconds."""
+    s = str(raw).strip().lower()
+    if not s:
+        raise ValueError("Empty duration")
+    unit = 1
+    if s.endswith("s"):
+        s = s[:-1]
+    elif s.endswith("m"):
+        unit, s = 60, s[:-1]
+    elif s.endswith("h"):
+        unit, s = 3600, s[:-1]
+    try:
+        value = float(s)
+    except ValueError:
+        raise ValueError(f"Invalid duration '{raw}' (use 90s, 15m, or 1h)")
+    return int(value * unit)
+
+
+def _format_expiry(seconds: Optional[int]) -> str:
+    if seconds is None:
+        return "unknown"
+    if seconds < 90:
+        return f"{max(seconds, 0)}s"
+    if seconds < 5400:
+        return f"{round(seconds / 60)}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+def _print_reservation_conflicts(conflicts: list) -> None:
+    print("Reservation conflict — nothing was reserved:")
+    for c in conflicts:
+        sess = f" (session {c['session']})" if c.get("session") else ""
+        reason = f" — {c['reason']}" if c.get("reason") else ""
+        held = f" via {c['reserved_path']}" if c.get("reserved_path") and c.get("reserved_path") != c.get("path") else ""
+        print(f"• {c['path']}{held}: held by {c['holder']}{sess}{reason} "
+              f"(expires in {_format_expiry(c.get('expires_in_seconds'))})")
+    if conflicts:
+        holder = conflicts[0]["holder"]
+        path = conflicts[0]["path"]
+        print("Wait, work elsewhere, or mail the holder:")
+        print(f'  agent-inbox send --to {holder} --subject "File conflict: {path}" --body-file -')
+
+
+def cmd_reserve(args: argparse.Namespace, client: InboxClient) -> int:
+    """Acquire advisory file reservations (all-or-nothing)."""
+    try:
+        _, _, address = derive_identity()
+        project = derive_project()
+        ttl_seconds = _parse_duration(args.ttl) if args.ttl else None
+        wait_deadline = time.monotonic() + max(1.0, float(args.wait_timeout)) if args.wait else None
+
+        while True:
+            try:
+                res = client.acquire_reservations(
+                    project=project,
+                    paths=args.paths,
+                    holder=address,
+                    reason=args.reason or "",
+                    ttl_seconds=ttl_seconds,
+                    force=args.force,
+                )
+                break
+            except InboxError as e:
+                conflicts = getattr(e, "payload", None) or {}
+                conflicts = conflicts.get("conflicts")
+                if e.code != "reservation_conflict" or conflicts is None:
+                    raise
+                if not args.wait:
+                    if args.json:
+                        print(json.dumps({"conflicts": conflicts}, indent=2))
+                    else:
+                        _print_reservation_conflicts(conflicts)
+                    return 3
+                remaining = wait_deadline - time.monotonic()
+                if remaining <= 0:
+                    if args.json:
+                        print(json.dumps({"conflicts": conflicts, "wait_timeout": True}, indent=2))
+                    else:
+                        print(f"Wait timed out after {int(args.wait_timeout)}s.")
+                        _print_reservation_conflicts(conflicts)
+                    return 3
+                # Long-poll server-side until free (or leg timeout), then retry
+                # the atomic acquire. No queue/fairness: a racing waiter may win.
+                client.wait_reservations(
+                    project, args.paths, address, timeout=min(60.0, remaining)
+                )
+
+        if args.force:
+            print("WARNING: --force released other agents' active reservations. "
+                  "Mail the previous holder(s) to coordinate.", file=sys.stderr)
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            for r in res.get("reservations", []):
+                print(f"Reserved {r['path']} (expires in {_format_expiry(r.get('expires_in_seconds'))})")
+        return 0
+    except ValueError as e:
+        _print_error(str(e), "invalid_argument")
+        return 1
+    except InboxError as e:
+        _print_error(e.message, e.code)
+        return 1
+    except Exception as e:
+        _print_error(str(e))
+        return 1
+
+
+def _cmd_renew_or_release(args: argparse.Namespace, client: InboxClient, action: str) -> int:
+    try:
+        _, _, address = derive_identity()
+        project = derive_project()
+        if not args.all and not args.paths:
+            _print_error(f"Provide paths or --all to {action}", "invalid_argument")
+            return 1
+        if action == "renew":
+            res = client.renew_reservations(project, address, paths=args.paths or None, renew_all=args.all)
+            done_key, verb = "renewed", "Renewed"
+        else:
+            res = client.release_reservations(project, address, paths=args.paths or None, release_all=args.all)
+            done_key, verb = "released", "Released"
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            for p in res.get(done_key, []):
+                print(f"{verb} {p}")
+            if not res.get(done_key):
+                print(f"Nothing to {action}.")
+            for p in res.get("missed", []):
+                print(f"warning: not held by you (skipped): {p}", file=sys.stderr)
+        return 0
+    except InboxError as e:
+        _print_error(e.message, e.code)
+        return 1
+    except Exception as e:
+        _print_error(str(e))
+        return 1
+
+
+def cmd_renew(args: argparse.Namespace, client: InboxClient) -> int:
+    """Renew held reservations (extends expiry by each lease's own TTL)."""
+    return _cmd_renew_or_release(args, client, "renew")
+
+
+def cmd_release(args: argparse.Namespace, client: InboxClient) -> int:
+    """Release held reservations. Safe to run twice (missed paths warn, exit 0)."""
+    return _cmd_renew_or_release(args, client, "release")
+
+
+def cmd_reservations(args: argparse.Namespace, client: InboxClient) -> int:
+    """List active reservations for the project."""
+    try:
+        project = args.project or derive_project()
+        holder = None
+        if args.mine:
+            _, _, holder = derive_identity()
+        reservations = client.list_reservations(project, holder=holder)
+        if args.json:
+            print(json.dumps({"reservations": reservations}, indent=2))
+        else:
+            if not reservations:
+                print(f"No active reservations in '{project}'.")
+                return 0
+            print(f"Active reservations ({project}):")
+            for r in reservations:
+                sess = f" (session {r['session']})" if r.get("session") else ""
+                reason = f" — {r['reason']}" if r.get("reason") else ""
+                print(f"• {r['path']}: {r['holder']}{sess}{reason} "
+                      f"(expires in {_format_expiry(r.get('expires_in_seconds'))})")
+        return 0
+    except InboxError as e:
+        _print_error(e.message, e.code)
+        return 1
+    except Exception as e:
+        _print_error(str(e))
+        return 1
+
+
 def cmd_watch(args: argparse.Namespace, client: InboxClient) -> int:
     """Block until new unread mail arrives (long-poll), then print a summary.
 
@@ -352,6 +577,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
         for runtime, target, status in setup_global():
             print(f"Global instructions [{runtime}] {target}: {status}")
+
+        for runtime, status in install_hooks():
+            print(f"Hooks [{runtime}]: {status}")
 
         # Test healthz
         client = InboxClient()
@@ -438,6 +666,24 @@ def cmd_claim(args: argparse.Namespace, client: InboxClient) -> int:
         return 1
 
 
+def cmd_hooks(args: argparse.Namespace) -> int:
+    """Install/uninstall/report the per-turn mail delivery hooks."""
+    try:
+        action = args.hooks_action
+        if action == "install":
+            rows = install_hooks()
+        elif action == "uninstall":
+            rows = uninstall_hooks()
+        else:
+            rows = hooks_status()
+        for runtime, status in rows:
+            print(f"Hooks [{runtime}]: {status}")
+        return 0
+    except Exception as e:
+        _print_error(str(e))
+        return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build command-line parser."""
     parser = argparse.ArgumentParser(
@@ -475,7 +721,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # reply
     p_reply = subparsers.add_parser("reply", help="Reply to an email in a thread")
-    p_reply.add_argument("email_id", help="ID of the email to reply to")
+    p_reply.add_argument("email_id", help="ID of the email (eml_...) or thread (thr_...) to reply to")
+    p_reply.add_argument("--subject", help="Declare the topic; refused if it differs from the thread's subject (one topic per thread)")
     p_reply.add_argument("--body", help="Message body markdown")
     p_reply.add_argument("--body-file", help="Read message body from file or - for stdin")
     p_reply.add_argument("--to", action="append", help="Override reply-to recipients (repeatable)")
@@ -497,6 +744,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_read.add_argument("--inbox", help="Inbox address (defaults to derived identity)")
     p_read.add_argument("--no-mark-read", action="store_true", help="Do not mark emails as read")
     p_read.add_argument("--json", action="store_true", help="Output JSON")
+
+    # reserve / renew / release / reservations (NB-7 advisory file leases)
+    p_reserve = subparsers.add_parser("reserve", help="Reserve file paths (advisory lease, all-or-nothing)")
+    p_reserve.add_argument("paths", nargs="+", help="Repo-relative paths; trailing / reserves a directory")
+    p_reserve.add_argument("--reason", help="Why you are reserving (shown to conflicting agents)")
+    p_reserve.add_argument("--ttl", help="Lease TTL: 90s, 15m (default), or up to 2h")
+    p_reserve.add_argument("--wait", action="store_true", help="Wait until the paths are free, then acquire")
+    p_reserve.add_argument("--wait-timeout", type=float, default=120.0, help="Max seconds to wait (default: 120)")
+    p_reserve.add_argument("--force", action="store_true", help="Take over active reservations (audited; mail the holder)")
+    p_reserve.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_renew = subparsers.add_parser("renew", help="Renew held reservations (extends by each lease's TTL)")
+    p_renew.add_argument("paths", nargs="*", help="Paths to renew")
+    p_renew.add_argument("--all", action="store_true", help="Renew everything you hold in this project")
+    p_renew.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_release = subparsers.add_parser("release", help="Release held reservations")
+    p_release.add_argument("paths", nargs="*", help="Paths to release")
+    p_release.add_argument("--all", action="store_true", help="Release everything you hold in this project")
+    p_release.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_rsv = subparsers.add_parser("reservations", help="List active file reservations")
+    p_rsv.add_argument("--project", help="Project slug (defaults to current project)")
+    p_rsv.add_argument("--mine", action="store_true", help="Only reservations held by this agent")
+    p_rsv.add_argument("--json", action="store_true", help="Output JSON")
 
     # watch
     p_watch = subparsers.add_parser("watch", help="Block until new unread mail arrives (long-poll push subscription)")
@@ -521,6 +793,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_proj.add_argument("--copy", action="store_true", help="Also copy the onboarding prompt to the clipboard")
 
     # prompt
+    p_hooks = subparsers.add_parser("hooks", help="Manage per-turn mail delivery hooks for agent runtimes")
+    p_hooks.add_argument("hooks_action", choices=["install", "uninstall", "status"], help="What to do")
+
+    p_hc = subparsers.add_parser("hook-check")
+    p_hc.add_argument("--format", dest="hc_format", choices=["plain", "json"], default="plain")
+
     p_prompt = subparsers.add_parser("prompt", help="Print the compact agent onboarding prompt")
     p_prompt.add_argument("--copy", action="store_true", help="Also copy the prompt to the clipboard (macOS)")
 
@@ -557,6 +835,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_list(args, client)
     elif args.command == "read":
         return cmd_read(args, client)
+    elif args.command == "reserve":
+        return cmd_reserve(args, client)
+    elif args.command == "renew":
+        return cmd_renew(args, client)
+    elif args.command == "release":
+        return cmd_release(args, client)
+    elif args.command == "reservations":
+        return cmd_reservations(args, client)
     elif args.command == "watch":
         return cmd_watch(args, client)
     elif args.command == "inboxes":
@@ -569,6 +855,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_setup_project(args)
     elif args.command == "prompt":
         return cmd_prompt(args)
+    elif args.command == "hooks":
+        return cmd_hooks(args)
+    elif args.command == "hook-check":
+        stdin_text = "" if sys.stdin.isatty() else sys.stdin.read()
+        return run_hook_check(args.hc_format, stdin_text)
     elif args.command == "claim":
         return cmd_claim(args, client)
 

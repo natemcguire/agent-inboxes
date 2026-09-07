@@ -19,6 +19,65 @@ from agent_inbox.models import (
 # A session counts as "active" if it interacted within this window.
 SESSION_ACTIVE_WINDOW_SECONDS = 30 * 60
 
+# File reservation (NB-7) TTL bounds: default 15 minutes, range 1m–2h.
+# The 2h cap bounds a single lease's horizon, not total hold time — renewal
+# extends by the lease's own TTL, so the horizon can never exceed the cap.
+RESERVATION_DEFAULT_TTL_SECONDS = 15 * 60
+RESERVATION_MIN_TTL_SECONDS = 60
+RESERVATION_MAX_TTL_SECONDS = 2 * 60 * 60
+
+_ISO_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+
+def _iso_add_seconds(iso_ts: str, seconds: int) -> str:
+    """Return the RFC 3339 timestamp `seconds` after `iso_ts` (same format)."""
+    dt = datetime.datetime.strptime(iso_ts, _ISO_FMT).replace(tzinfo=datetime.timezone.utc)
+    out = dt + datetime.timedelta(seconds=seconds)
+    return out.strftime("%Y-%m-%dT%H:%M:%S.") + f"{out.microsecond // 1000:03d}Z"
+
+
+def _iso_diff_seconds(from_ts: str, to_ts: str) -> int:
+    """Whole seconds from `from_ts` to `to_ts` (may be negative)."""
+    a = datetime.datetime.strptime(from_ts, _ISO_FMT)
+    b = datetime.datetime.strptime(to_ts, _ISO_FMT)
+    return int((b - a).total_seconds())
+
+
+def normalize_reservation_path(raw) -> str:
+    """Normalize a repo-relative POSIX reservation path.
+
+    Rejects absolute paths, empty paths, and any `..` segment. Strips `./`
+    segments and duplicate slashes. A trailing `/` is preserved: it marks a
+    directory reservation, semantically distinct from a file path. Storage is
+    case-preserving; comparisons are case-insensitive.
+    """
+    if not raw or not isinstance(raw, str) or not raw.strip():
+        raise ValidationError("validation_error", "Reservation path must be a non-empty string")
+    p = raw.strip().replace("\\", "/")
+    if p.startswith("/"):
+        raise ValidationError("validation_error", f"Reservation path must be repo-relative, not absolute: '{raw}'")
+    is_dir = p.endswith("/")
+    segments = [s for s in p.split("/") if s not in ("", ".")]
+    if not segments:
+        raise ValidationError("validation_error", f"Reservation path is empty after normalization: '{raw}'")
+    if any(s == ".." for s in segments):
+        raise ValidationError("validation_error", f"Reservation path may not contain '..': '{raw}'")
+    return "/".join(segments) + ("/" if is_dir else "")
+
+
+def reservation_paths_conflict(a: str, b: str) -> bool:
+    """True when two normalized reservation paths overlap (case-insensitive):
+    same path, an ancestor directory reservation, or a descendant of a
+    requested directory."""
+    la, lb = a.lower(), b.lower()
+    if la == lb:
+        return True
+    if lb.endswith("/") and la.startswith(lb):
+        return True
+    if la.endswith("/") and lb.startswith(la):
+        return True
+    return False
+
 
 def _session_active_cutoff_iso() -> str:
     """RFC 3339 UTC cutoff; timestamps at/after it are 'active'. Same format as
@@ -915,6 +974,329 @@ class InboxService:
             "cursor": cursor,
             "latest": latest,
         }
+
+    # ------------------------------------------------------------------
+    # File reservations (NB-7): advisory write-coordination leases.
+    # A reservation is a lease, not a lock — nothing is enforced on the
+    # filesystem and expired rows are swept lazily on every touch.
+    # ------------------------------------------------------------------
+
+    def _sweep_expired_reservations(self, project_id: int, now: str) -> None:
+        """Lazily close expired-but-unreleased rows (audit: released_by='expired')."""
+        self.conn.execute(
+            """
+            UPDATE reservations
+            SET released_at = expires_at, released_by = 'expired'
+            WHERE project_id = ? AND released_at IS NULL AND expires_at <= ?
+            """,
+            (project_id, now),
+        )
+
+    def _active_reservations(self, project_id: int) -> List[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT r.id, r.path, r.holder_inbox_id, r.holder_session, r.reason,
+                   r.ttl_seconds, r.created_at, r.expires_at,
+                   i.local_part, p.slug AS project_slug
+            FROM reservations r
+            JOIN inboxes i ON r.holder_inbox_id = i.id
+            JOIN projects p ON i.project_id = p.id
+            WHERE r.project_id = ? AND r.released_at IS NULL
+            ORDER BY r.created_at ASC, r.id ASC
+            """,
+            (project_id,),
+        ).fetchall()
+
+    @staticmethod
+    def _is_own(row: sqlite3.Row, inbox_id: int, session: Optional[str]) -> bool:
+        return row["holder_inbox_id"] == inbox_id and (row["holder_session"] or None) == (session or None)
+
+    def _conflict_dict(self, requested_path: str, row: sqlite3.Row, now: str) -> dict:
+        return {
+            "path": requested_path,
+            "reserved_path": row["path"],
+            "holder": f"{row['local_part']}@{row['project_slug']}",
+            "session": row["holder_session"],
+            "reason": row["reason"],
+            "created_at": row["created_at"],
+            "expires_at": row["expires_at"],
+            "expires_in_seconds": _iso_diff_seconds(now, row["expires_at"]),
+        }
+
+    def _reservation_dict(self, row: sqlite3.Row, now: str) -> dict:
+        return {
+            "path": row["path"],
+            "holder": f"{row['local_part']}@{row['project_slug']}",
+            "session": row["holder_session"],
+            "reason": row["reason"],
+            "ttl_seconds": row["ttl_seconds"],
+            "created_at": row["created_at"],
+            "expires_at": row["expires_at"],
+            "expires_in_seconds": _iso_diff_seconds(now, row["expires_at"]),
+        }
+
+    def _find_conflicts(
+        self,
+        project_id: int,
+        paths: List[str],
+        inbox_id: int,
+        session: Optional[str],
+        now: str,
+    ) -> Tuple[List[dict], List[sqlite3.Row], dict]:
+        """Return (conflicts, conflicting_rows, own_active_by_path) for the
+        requested paths against the project's active reservations."""
+        active = self._active_reservations(project_id)
+        conflicts: List[dict] = []
+        conflict_rows: List[sqlite3.Row] = []
+        own_by_path: dict = {}
+        seen_row_ids = set()
+        for req in paths:
+            for row in active:
+                if self._is_own(row, inbox_id, session):
+                    if row["path"].lower() == req.lower():
+                        own_by_path[req] = row
+                    continue
+                if reservation_paths_conflict(req, row["path"]):
+                    conflicts.append(self._conflict_dict(req, row, now))
+                    if row["id"] not in seen_row_ids:
+                        seen_row_ids.add(row["id"])
+                        conflict_rows.append(row)
+        return conflicts, conflict_rows, own_by_path
+
+    def acquire_reservations(
+        self,
+        project_slug: str,
+        paths: List[str],
+        holder_addr: str,
+        session: Optional[str],
+        reason: str = "",
+        ttl_seconds: Optional[int] = None,
+        force: bool = False,
+        client_token: Optional[str] = None,
+    ) -> dict:
+        """All-or-nothing multi-path acquire inside one BEGIN IMMEDIATE span.
+
+        Returns {"reservations": [...]} on success or {"conflicts": [...]} when
+        any path is actively held by a different (address, session) and force is
+        False. Re-acquiring an own active path renews it (idempotent).
+        """
+        if not client_token or not isinstance(client_token, str) or not client_token.strip():
+            raise ValidationError("missing_idempotency_key", "Idempotency-Key header is required")
+        client_token = client_token.strip()
+        if not paths or not isinstance(paths, list):
+            raise ValidationError("validation_error", "'paths' list cannot be empty")
+
+        norm_paths: List[str] = []
+        for p in paths:
+            np = normalize_reservation_path(p)
+            if np.lower() not in {x.lower() for x in norm_paths}:
+                norm_paths.append(np)
+
+        ttl = RESERVATION_DEFAULT_TTL_SECONDS if ttl_seconds is None else int(ttl_seconds)
+        ttl = max(RESERVATION_MIN_TTL_SECONDS, min(ttl, RESERVATION_MAX_TTL_SECONDS))
+        norm_holder = normalize_address(holder_addr)
+        reason = (reason or "").strip()
+
+        # Idempotent replay of a retried acquire call.
+        existing = self.conn.execute(
+            """
+            SELECT r.id, r.path, r.holder_inbox_id, r.holder_session, r.reason,
+                   r.ttl_seconds, r.created_at, r.expires_at,
+                   i.local_part, p.slug AS project_slug
+            FROM reservations r
+            JOIN inboxes i ON r.holder_inbox_id = i.id
+            JOIN projects p ON i.project_id = p.id
+            WHERE r.client_token = ?
+            """,
+            (client_token,),
+        ).fetchall()
+        if existing:
+            now = utc_now_iso()
+            return {"reservations": [self._reservation_dict(r, now) for r in existing]}
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.conn.execute(
+                "SELECT id FROM reservations WHERE client_token = ?", (client_token,)
+            ).fetchall()
+            if existing:
+                self.conn.execute("COMMIT")
+                return self.acquire_reservations(  # replay path above (no txn)
+                    project_slug, paths, holder_addr, session, reason, ttl_seconds, force, client_token
+                )
+
+            self.ensure_inbox(norm_holder)
+            inbox_id = self._get_inbox_id(norm_holder)
+            project_id = self.ensure_project(project_slug)
+            now = utc_now_iso()
+            self._sweep_expired_reservations(project_id, now)
+
+            conflicts, conflict_rows, own_by_path = self._find_conflicts(
+                project_id, norm_paths, inbox_id, session, now
+            )
+
+            if conflicts and not force:
+                self.conn.execute("ROLLBACK")
+                return {"conflicts": conflicts}
+
+            if conflicts and force:
+                for row in conflict_rows:
+                    self.conn.execute(
+                        "UPDATE reservations SET released_at = ?, released_by = ? WHERE id = ?",
+                        (now, f"forced:{norm_holder}", row["id"]),
+                    )
+
+            expires_at = _iso_add_seconds(now, ttl)
+            for np in norm_paths:
+                own = own_by_path.get(np)
+                if own is not None:
+                    # Idempotent re-acquire renews the existing lease.
+                    self.conn.execute(
+                        """
+                        UPDATE reservations
+                        SET expires_at = ?, ttl_seconds = ?, reason = ?, client_token = ?
+                        WHERE id = ?
+                        """,
+                        (expires_at, ttl, reason or own["reason"], client_token, own["id"]),
+                    )
+                else:
+                    self.conn.execute(
+                        """
+                        INSERT INTO reservations
+                          (project_id, path, holder_inbox_id, holder_session, reason,
+                           ttl_seconds, created_at, expires_at, client_token)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (project_id, np, inbox_id, session, reason, ttl, now, expires_at, client_token),
+                    )
+            self.conn.execute("COMMIT")
+        except BaseException:
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
+
+        rows = self.conn.execute(
+            """
+            SELECT r.id, r.path, r.holder_inbox_id, r.holder_session, r.reason,
+                   r.ttl_seconds, r.created_at, r.expires_at,
+                   i.local_part, p.slug AS project_slug
+            FROM reservations r
+            JOIN inboxes i ON r.holder_inbox_id = i.id
+            JOIN projects p ON i.project_id = p.id
+            WHERE r.client_token = ?
+            """,
+            (client_token,),
+        ).fetchall()
+        now = utc_now_iso()
+        return {"reservations": [self._reservation_dict(r, now) for r in rows]}
+
+    def _own_active_rows(
+        self, project_id: int, inbox_id: int, session: Optional[str]
+    ) -> List[sqlite3.Row]:
+        return [
+            r for r in self._active_reservations(project_id)
+            if self._is_own(r, inbox_id, session)
+        ]
+
+    def _renew_or_release(
+        self,
+        project_slug: str,
+        holder_addr: str,
+        session: Optional[str],
+        paths: Optional[List[str]],
+        release_all: bool,
+        release: bool,
+    ) -> dict:
+        """Shared implementation for renew (release=False) and release (=True)."""
+        norm_holder = normalize_address(holder_addr)
+        self.ensure_inbox(norm_holder)
+        inbox_id = self._get_inbox_id(norm_holder)
+        project_id = self.ensure_project(project_slug)
+
+        norm_paths = [normalize_reservation_path(p) for p in (paths or [])]
+        if not release_all and not norm_paths:
+            raise ValidationError("validation_error", "Provide paths or all=true")
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            now = utc_now_iso()
+            self._sweep_expired_reservations(project_id, now)
+            own = self._own_active_rows(project_id, inbox_id, session)
+            own_by_lower = {r["path"].lower(): r for r in own}
+
+            if release_all:
+                targets = list(own)
+                missed: List[str] = []
+            else:
+                targets = []
+                missed = []
+                for np in norm_paths:
+                    row = own_by_lower.get(np.lower())
+                    if row is not None:
+                        targets.append(row)
+                    else:
+                        missed.append(np)
+
+            done: List[str] = []
+            for row in targets:
+                if release:
+                    self.conn.execute(
+                        "UPDATE reservations SET released_at = ?, released_by = 'holder' WHERE id = ?",
+                        (now, row["id"]),
+                    )
+                else:
+                    # Renew extends to now + the lease's own TTL (horizon <= 2h).
+                    self.conn.execute(
+                        "UPDATE reservations SET expires_at = ? WHERE id = ?",
+                        (_iso_add_seconds(now, row["ttl_seconds"]), row["id"]),
+                    )
+                done.append(row["path"])
+            self.conn.execute("COMMIT")
+        except BaseException:
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
+
+        key = "released" if release else "renewed"
+        return {key: done, "missed": missed}
+
+    def renew_reservations(
+        self, project_slug: str, holder_addr: str, session: Optional[str],
+        paths: Optional[List[str]] = None, renew_all: bool = False,
+    ) -> dict:
+        return self._renew_or_release(project_slug, holder_addr, session, paths, renew_all, release=False)
+
+    def release_reservations(
+        self, project_slug: str, holder_addr: str, session: Optional[str],
+        paths: Optional[List[str]] = None, release_all: bool = False,
+    ) -> dict:
+        return self._renew_or_release(project_slug, holder_addr, session, paths, release_all, release=True)
+
+    def list_reservations(self, project_slug: str, holder_addr: Optional[str] = None) -> List[dict]:
+        """List active reservations for a project (after the lazy expiry sweep)."""
+        project_id = self.ensure_project(project_slug)
+        now = utc_now_iso()
+        self._sweep_expired_reservations(project_id, now)
+        rows = self._active_reservations(project_id)
+        result = [self._reservation_dict(r, now) for r in rows]
+        if holder_addr:
+            norm = normalize_address(holder_addr)
+            result = [r for r in result if r["holder"] == norm]
+        return result
+
+    def reservation_conflicts(
+        self, project_slug: str, paths: List[str], holder_addr: str, session: Optional[str],
+    ) -> List[dict]:
+        """Non-mutating conflict check used by the wait long-poll."""
+        norm_holder = normalize_address(holder_addr)
+        self.ensure_inbox(norm_holder)
+        inbox_id = self._get_inbox_id(norm_holder)
+        project_id = self.ensure_project(project_slug)
+        now = utc_now_iso()
+        self._sweep_expired_reservations(project_id, now)
+        norm_paths = [normalize_reservation_path(p) for p in paths]
+        conflicts, _, _ = self._find_conflicts(project_id, norm_paths, inbox_id, session, now)
+        return conflicts
 
     def mark_thread_read(self, address: str, thread_id: str) -> int:
         """Mark every delivered email in the thread read for the given inbox."""

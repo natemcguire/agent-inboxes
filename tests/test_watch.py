@@ -66,6 +66,8 @@ class TestSchemaUpgrade(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )}
                 self.assertIn("sessions", tables)
+                # NB-7: the reservations table is also created on upgrade.
+                self.assertIn("reservations", tables)
             finally:
                 conn.close()
 

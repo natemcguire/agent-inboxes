@@ -89,6 +89,24 @@ CREATE TABLE IF NOT EXISTS agent_leases (
   PRIMARY KEY (agent_slug, project_slug)
 );
 
+CREATE TABLE IF NOT EXISTS reservations (
+  id              INTEGER PRIMARY KEY,
+  project_id      INTEGER NOT NULL REFERENCES projects(id),
+  path            TEXT    NOT NULL,             -- normalized, repo-relative (case-preserving)
+  holder_inbox_id INTEGER NOT NULL REFERENCES inboxes(id),
+  holder_session  TEXT,                         -- session slug (nullable for old clients)
+  reason          TEXT    NOT NULL DEFAULT '',
+  ttl_seconds     INTEGER NOT NULL,
+  created_at      TEXT    NOT NULL,
+  expires_at      TEXT    NOT NULL,
+  released_at     TEXT,                         -- NULL while active
+  released_by     TEXT,                         -- 'holder' | 'expired' | 'forced:<address>'
+  client_token    TEXT                          -- acquire idempotency (shared per call)
+);
+CREATE INDEX IF NOT EXISTS idx_reservations_active
+  ON reservations(project_id, path) WHERE released_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_reservations_token ON reservations(client_token);
+
 CREATE INDEX IF NOT EXISTS idx_emails_thread_sent ON emails(thread_id, sent_at, id);
 CREATE INDEX IF NOT EXISTS idx_recipients_unread ON email_recipients(inbox_id, read_at, email_id);
 CREATE INDEX IF NOT EXISTS idx_threads_activity ON threads(last_email_at DESC);

@@ -21,8 +21,10 @@ from agent_inbox.models import (
 class InboxClient:
     """Client for interacting with local Agent Inboxes service via HTTP."""
 
-    def __init__(self, base_url: Optional[str] = None, session_id: Optional[str] = None):
+    def __init__(self, base_url: Optional[str] = None, session_id: Optional[str] = None, timeout: Optional[float] = None):
         self.base_url = (base_url or get_server_url()).rstrip("/")
+        # Default per-request timeout; explicit per-call timeouts still win.
+        self.default_timeout = timeout
         # Optional short session slug identifying THIS agent session; sent as
         # X-Agent-Session so the service can distinguish concurrent same-family
         # agents sharing one inbox address.
@@ -35,7 +37,7 @@ class InboxClient:
         body: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
         query: Optional[Dict[str, Any]] = None,
-        timeout: float = 10.0,
+        timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Perform HTTP request and return parsed JSON response."""
         full_path = path
@@ -69,7 +71,8 @@ class InboxClient:
         req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
 
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            effective_timeout = timeout if timeout is not None else (self.default_timeout if self.default_timeout is not None else 10.0)
+            with urllib.request.urlopen(req, timeout=effective_timeout) as resp:
                 resp_body = resp.read().decode("utf-8")
                 if not resp_body.strip():
                     return {}
@@ -82,6 +85,7 @@ class InboxClient:
                 code = err_data.get("code", "http_error")
                 message = err_data.get("message", f"HTTP {e.code}: {e.reason}")
             except Exception:
+                err_json = {}
                 code = "http_error"
                 message = f"HTTP {e.code}: {e.reason}"
 
@@ -90,7 +94,11 @@ class InboxClient:
             elif e.code == 404:
                 raise NotFoundError(code, message)
             elif e.code == 409:
-                raise ConflictError(code, message)
+                conflict = ConflictError(code, message)
+                # Carry the full body (e.g. reservation conflict details) so
+                # callers can render holder/expiry information.
+                conflict.payload = err_json
+                raise conflict
             else:
                 raise InboxError(code, message, status_code=e.code)
 
@@ -203,6 +211,87 @@ class InboxClient:
         return self._request(
             "GET",
             f"/v1/inboxes/{encoded_addr}/watch",
+            query=query,
+            timeout=timeout + 10.0,
+        )
+
+    # -- File reservations (NB-7) -------------------------------------
+
+    def acquire_reservations(
+        self,
+        project: str,
+        paths: List[str],
+        holder: str,
+        session: Optional[str] = None,
+        reason: str = "",
+        ttl_seconds: Optional[int] = None,
+        force: bool = False,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """All-or-nothing acquire. Raises ConflictError (with .payload carrying
+        'conflicts') when any path is held by another agent and force=False."""
+        key = idempotency_key or str(uuid.uuid4())
+        body: Dict[str, Any] = {"paths": paths, "holder": holder, "reason": reason}
+        if session or self.session_id:
+            body["session"] = session or self.session_id
+        if ttl_seconds is not None:
+            body["ttl_seconds"] = int(ttl_seconds)
+        if force:
+            body["force"] = True
+        return self._request(
+            "POST",
+            f"/v1/projects/{urllib.parse.quote(project)}/reservations",
+            body=body,
+            headers={"Idempotency-Key": key},
+        )
+
+    def _reservation_action(
+        self, action: str, project: str, holder: str,
+        session: Optional[str], paths: Optional[List[str]], do_all: bool,
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"holder": holder}
+        if session or self.session_id:
+            body["session"] = session or self.session_id
+        if do_all:
+            body["all"] = True
+        else:
+            body["paths"] = paths or []
+        return self._request(
+            "POST",
+            f"/v1/projects/{urllib.parse.quote(project)}/reservations/{action}",
+            body=body,
+        )
+
+    def renew_reservations(self, project: str, holder: str, session: Optional[str] = None,
+                           paths: Optional[List[str]] = None, renew_all: bool = False) -> Dict[str, Any]:
+        return self._reservation_action("renew", project, holder, session, paths, renew_all)
+
+    def release_reservations(self, project: str, holder: str, session: Optional[str] = None,
+                             paths: Optional[List[str]] = None, release_all: bool = False) -> Dict[str, Any]:
+        return self._reservation_action("release", project, holder, session, paths, release_all)
+
+    def list_reservations(self, project: str, holder: Optional[str] = None) -> List[Dict[str, Any]]:
+        query = {"holder": holder} if holder else None
+        res = self._request(
+            "GET", f"/v1/projects/{urllib.parse.quote(project)}/reservations", query=query
+        )
+        return res.get("reservations", [])
+
+    def wait_reservations(
+        self, project: str, paths: List[str], holder: str,
+        session: Optional[str] = None, timeout: float = 60.0,
+    ) -> Dict[str, Any]:
+        """Long-poll until the paths are free for this holder (or timeout)."""
+        query: Dict[str, Any] = {
+            "paths": ",".join(paths),
+            "holder": holder,
+            "timeout": int(timeout),
+        }
+        if session or self.session_id:
+            query["session"] = session or self.session_id
+        return self._request(
+            "GET",
+            f"/v1/projects/{urllib.parse.quote(project)}/reservations/wait",
             query=query,
             timeout=timeout + 10.0,
         )

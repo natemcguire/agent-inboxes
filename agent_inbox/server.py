@@ -247,6 +247,49 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     self._send_json(HTTPStatus.OK, thread_data)
                     return
 
+            # /v1/projects/{project}/reservations[/wait]
+            if len(parts) >= 4 and parts[0] == "v1" and parts[1] == "projects" and parts[3] == "reservations":
+                project = parts[2]
+                service = self._get_service()
+
+                # GET /v1/projects/{project}/reservations
+                if len(parts) == 4:
+                    holder = query.get("holder", [None])[0]
+                    reservations = service.list_reservations(project, holder_addr=holder)
+                    self._send_json(HTTPStatus.OK, {"reservations": reservations})
+                    return
+
+                # GET /v1/projects/{project}/reservations/wait — long-poll until
+                # all requested paths are free for this (holder, session).
+                # Same threaded long-poll pattern as /watch.
+                if len(parts) == 5 and parts[4] == "wait":
+                    raw_paths = query.get("paths", [""])[0]
+                    req_paths = [p for p in raw_paths.split(",") if p.strip()]
+                    if not req_paths:
+                        raise ValidationError("validation_error", "'paths' query parameter is required")
+                    holder = query.get("holder", [None])[0]
+                    if not holder:
+                        raise ValidationError("validation_error", "'holder' query parameter is required")
+                    session = query.get("session", [None])[0] or self._get_session_id()
+                    try:
+                        timeout = float(query.get("timeout", ["60"])[0])
+                    except ValueError:
+                        timeout = 60.0
+                    timeout = max(0.0, min(timeout, 300.0))
+
+                    self._touch_session(service, holder)
+                    deadline = time.monotonic() + timeout
+                    while True:
+                        conflicts = service.reservation_conflicts(project, req_paths, holder, session)
+                        remaining = deadline - time.monotonic()
+                        if not conflicts:
+                            self._send_json(HTTPStatus.OK, {"free": True})
+                            return
+                        if remaining <= 0:
+                            self._send_json(HTTPStatus.OK, {"free": False, "conflicts": conflicts})
+                            return
+                        time.sleep(min(1.0, remaining))
+
             raise NotFoundError("not_found", f"Cannot GET {path}")
 
         except InboxError as e:
@@ -374,6 +417,59 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     "marked_read": count,
                 })
                 return
+
+            # POST /v1/projects/{project}/reservations[/renew|/release]
+            if len(parts) >= 4 and parts[0] == "v1" and parts[1] == "projects" and parts[3] == "reservations":
+                project = parts[2]
+                service = self._get_service()
+
+                # POST /v1/projects/{project}/reservations — all-or-nothing acquire.
+                if len(parts) == 4:
+                    idempotency_key = self._get_idempotency_key()
+                    body = self._read_json_body()
+                    holder = body.get("holder")
+                    if not holder:
+                        raise ValidationError("validation_error", "'holder' address is required")
+                    session = body.get("session") or self._get_session_id()
+                    res = service.acquire_reservations(
+                        project_slug=project,
+                        paths=body.get("paths"),
+                        holder_addr=holder,
+                        session=session,
+                        reason=body.get("reason", ""),
+                        ttl_seconds=body.get("ttl_seconds"),
+                        force=bool(body.get("force", False)),
+                        client_token=idempotency_key,
+                    )
+                    self._touch_session(service, holder)
+                    if "conflicts" in res:
+                        self._send_json(HTTPStatus.CONFLICT, {
+                            "error": {
+                                "code": "reservation_conflict",
+                                "message": "One or more paths are actively reserved by another agent",
+                            },
+                            "conflicts": res["conflicts"],
+                        })
+                        return
+                    self._send_json(HTTPStatus.CREATED, res)
+                    return
+
+                # POST .../reservations/renew | .../reservations/release
+                if len(parts) == 5 and parts[4] in ("renew", "release"):
+                    body = self._read_json_body()
+                    holder = body.get("holder")
+                    if not holder:
+                        raise ValidationError("validation_error", "'holder' address is required")
+                    session = body.get("session") or self._get_session_id()
+                    paths = body.get("paths")
+                    do_all = bool(body.get("all", False))
+                    if parts[4] == "renew":
+                        res = service.renew_reservations(project, holder, session, paths=paths, renew_all=do_all)
+                    else:
+                        res = service.release_reservations(project, holder, session, paths=paths, release_all=do_all)
+                    self._touch_session(service, holder)
+                    self._send_json(HTTPStatus.OK, res)
+                    return
 
             raise NotFoundError("not_found", f"Cannot POST {path}")
 

@@ -20,15 +20,21 @@ Polling checkpoints:
 - After finishing or handing off work, send any required completion reply, then check unread mail once more before ending the session.
 - To subscribe to push delivery, run `agent-inbox watch` as a background task: it blocks until new mail arrives (exit 0) or times out (exit 3), so its exit wakes you. Relaunch it after handling the mail.
 - Do not busy-poll in a loop; use `watch` or these checkpoints.
+- When delivery hooks are installed (`agent-inbox hooks status`), unread mail is also injected into your context automatically each turn; the checkpoints above remain the guaranteed fallback.
 
 Addressing:
 - Use full lowercase addresses. Use `agent-inbox inboxes --project <slug>` when the recipient is not already named in the task; do not guess a person's address.
 - Put action owners in `to` and observers in `cc`. Message only the smallest relevant set of agents.
-- Use `send` for a new topic and `reply` for an existing one. Keep one topic per thread, preserve the subject, and reply to the newest relevant email.
+- One topic per thread — hard rule. Before replying, check the thread subject; if your message is about anything else, start a NEW thread with `send`. A reply that mixes topics is worse than two short threads.
+- Subject conventions: release coordination on subjects starting "Release:", work claims on "Claim:", design reviews on "Design:". Never announce releases inside a design thread or vice versa.
+- Use `send` for a new topic and `reply` for an existing one; reply to the newest relevant email. `reply` accepts a thread id (thr_...) and prints the thread subject; declaring `--subject` on a reply is refused when it differs from the thread's topic.
 
 Send mail for cross-session requests, blockers, handoffs, decisions that change another agent's work, shared interface changes, and completion notices another agent is waiting for. Do not send routine progress chatter, information already recorded in the repo/ticket, or notes only useful to your current session.
 
-Agent Inboxes never reserves files or grants permission to edit them. Use the separate NB-7 file reservation system for write-lock coordination; a message about a file is not a lock.
+File reservations (advisory leases, not locks):
+- Before editing files another agent plausibly touches: `agent-inbox reserve <paths> --reason "..."` (15m default TTL). On conflict, don't edit — wait (`--wait`), work elsewhere, or mail the holder.
+- If your task runs long, `agent-inbox renew --all` at your mail checkpoints. Run `agent-inbox release --all` at handoff.
+- Reservations expire on their own and are never permission to skip coordination mail. Never `--force` without messaging the holder. A message about a file is not a lock, and a reservation is not a message.
 
 Core commands:
 `eval "$(agent-inbox claim)"` (concurrent same-family agents, at session start)
