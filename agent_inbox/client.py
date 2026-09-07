@@ -21,7 +21,8 @@ from agent_inbox.models import (
 class InboxClient:
     """Client for interacting with local Agent Inboxes service via HTTP."""
 
-    def __init__(self, base_url: Optional[str] = None, session_id: Optional[str] = None, timeout: Optional[float] = None):
+    def __init__(self, base_url: Optional[str] = None, session_id: Optional[str] = None,
+                 timeout: Optional[float] = None, repo_key: Optional[str] = None):
         self.base_url = (base_url or get_server_url()).rstrip("/")
         # Default per-request timeout; explicit per-call timeouts still win.
         self.default_timeout = timeout
@@ -29,6 +30,9 @@ class InboxClient:
         # X-Agent-Session so the service can distinguish concurrent same-family
         # agents sharing one inbox address.
         self.session_id = session_id
+        # Optional worktree-safe repository identity; sent as X-Repo-Key so
+        # same-basename repos don't cross-conflict on file reservations.
+        self.repo_key = repo_key
 
     def _request(
         self,
@@ -60,6 +64,8 @@ class InboxClient:
         if self.session_id:
             req_headers["X-Agent-Session"] = self.session_id
             req_headers["X-Agent-Pid"] = str(os.getpid())
+        if self.repo_key:
+            req_headers["X-Repo-Key"] = self.repo_key
         if headers:
             req_headers.update(headers)
 
@@ -220,18 +226,24 @@ class InboxClient:
     def acquire_reservations(
         self,
         project: str,
-        paths: List[str],
-        holder: str,
+        paths: Optional[List[str]] = None,
+        holder: str = "",
         session: Optional[str] = None,
         reason: str = "",
         ttl_seconds: Optional[int] = None,
         force: bool = False,
         idempotency_key: Optional[str] = None,
+        resources: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """All-or-nothing acquire. Raises ConflictError (with .payload carrying
-        'conflicts') when any path is held by another agent and force=False."""
+        """All-or-nothing acquire of file paths OR named resources (not both).
+        Raises ConflictError (with .payload carrying 'conflicts') when any key
+        is held by another agent and force=False."""
         key = idempotency_key or str(uuid.uuid4())
-        body: Dict[str, Any] = {"paths": paths, "holder": holder, "reason": reason}
+        body: Dict[str, Any] = {"holder": holder, "reason": reason}
+        if resources is not None:
+            body["resources"] = resources
+        else:
+            body["paths"] = paths
         if session or self.session_id:
             body["session"] = session or self.session_id
         if ttl_seconds is not None:
@@ -270,12 +282,28 @@ class InboxClient:
                              paths: Optional[List[str]] = None, release_all: bool = False) -> Dict[str, Any]:
         return self._reservation_action("release", project, holder, session, paths, release_all)
 
-    def list_reservations(self, project: str, holder: Optional[str] = None) -> List[Dict[str, Any]]:
-        query = {"holder": holder} if holder else None
-        res = self._request(
-            "GET", f"/v1/projects/{urllib.parse.quote(project)}/reservations", query=query
+    def list_reservations(self, project: str, holder: Optional[str] = None,
+                          history: bool = False, limit: int = 50) -> Dict[str, Any]:
+        """Active reservations for a project; add finished audit rows with
+        history=True. Returns the full payload dict ({'reservations', 'history'?})."""
+        query: Dict[str, Any] = {}
+        if holder:
+            query["holder"] = holder
+        if history:
+            query["history"] = "1"
+            query["limit"] = int(limit)
+        return self._request(
+            "GET", f"/v1/projects/{urllib.parse.quote(project)}/reservations",
+            query=query or None,
         )
-        return res.get("reservations", [])
+
+    def list_reservations_global(self, history: bool = False, limit: int = 50) -> Dict[str, Any]:
+        """Machine-wide reservations across projects (observer/web-UI view)."""
+        query: Dict[str, Any] = {}
+        if history:
+            query["history"] = "1"
+            query["limit"] = int(limit)
+        return self._request("GET", "/v1/reservations", query=query or None)
 
     def wait_reservations(
         self, project: str, paths: List[str], holder: str,

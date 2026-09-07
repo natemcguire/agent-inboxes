@@ -138,6 +138,25 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
             return sid.strip()[:64]
         return None
 
+    def _get_repo_key(self) -> Optional[str]:
+        """Optional X-Repo-Key header: worktree-safe repository identity for
+        file reservations. Absent (None) stays conservative."""
+        key = self.headers.get("X-Repo-Key")
+        if key and key.strip():
+            return key.strip()[:64]
+        return None
+
+    @staticmethod
+    def _history_requested(query: Dict[str, list]) -> bool:
+        return query.get("history", ["0"])[0].lower() in ("1", "true", "yes")
+
+    @staticmethod
+    def _history_limit(query: Dict[str, list]) -> int:
+        try:
+            return int(query.get("limit", ["50"])[0])
+        except ValueError:
+            return 50
+
     def _get_session_pid(self) -> Optional[int]:
         """Optional X-Agent-Pid header (best-effort, informational)."""
         raw = self.headers.get("X-Agent-Pid")
@@ -247,16 +266,32 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     self._send_json(HTTPStatus.OK, thread_data)
                     return
 
+            # GET /v1/reservations — machine-wide observer listing (web UI):
+            # active reservations across all projects, plus optional history.
+            if path == "/v1/reservations":
+                service = self._get_service()
+                payload: Dict[str, Any] = {"reservations": service.list_reservations_all()}
+                if self._history_requested(query):
+                    payload["history"] = service.reservation_history(
+                        None, limit=self._history_limit(query)
+                    )
+                self._send_json(HTTPStatus.OK, payload)
+                return
+
             # /v1/projects/{project}/reservations[/wait]
             if len(parts) >= 4 and parts[0] == "v1" and parts[1] == "projects" and parts[3] == "reservations":
                 project = parts[2]
                 service = self._get_service()
 
-                # GET /v1/projects/{project}/reservations
+                # GET /v1/projects/{project}/reservations[?history=1&limit=N]
                 if len(parts) == 4:
                     holder = query.get("holder", [None])[0]
-                    reservations = service.list_reservations(project, holder_addr=holder)
-                    self._send_json(HTTPStatus.OK, {"reservations": reservations})
+                    payload = {"reservations": service.list_reservations(project, holder_addr=holder)}
+                    if self._history_requested(query):
+                        payload["history"] = service.reservation_history(
+                            project, limit=self._history_limit(query)
+                        )
+                    self._send_json(HTTPStatus.OK, payload)
                     return
 
                 # GET /v1/projects/{project}/reservations/wait — long-poll until
@@ -277,10 +312,13 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                         timeout = 60.0
                     timeout = max(0.0, min(timeout, 300.0))
 
+                    repo_key = self._get_repo_key()
                     self._touch_session(service, holder)
                     deadline = time.monotonic() + timeout
                     while True:
-                        conflicts = service.reservation_conflicts(project, req_paths, holder, session)
+                        conflicts = service.reservation_conflicts(
+                            project, req_paths, holder, session, repo_key=repo_key
+                        )
                         remaining = deadline - time.monotonic()
                         if not conflicts:
                             self._send_json(HTTPStatus.OK, {"free": True})
@@ -440,6 +478,8 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                         ttl_seconds=body.get("ttl_seconds"),
                         force=bool(body.get("force", False)),
                         client_token=idempotency_key,
+                        repo_key=body.get("repo_key") or self._get_repo_key(),
+                        resources=body.get("resources"),
                     )
                     self._touch_session(service, holder)
                     if "conflicts" in res:

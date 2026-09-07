@@ -1,7 +1,9 @@
 """Core domain and transactional database operations for Agent Inboxes."""
 
 import datetime
+import re
 import sqlite3
+import uuid
 from typing import List, Optional, Tuple
 
 from agent_inbox.models import (
@@ -43,6 +45,52 @@ def _iso_diff_seconds(from_ts: str, to_ts: str) -> int:
     return int((b - a).total_seconds())
 
 
+# Named (non-file) resource leases live in the same reservations table under
+# an internal key prefix that a normalized file path can never produce:
+# normalization collapses duplicate slashes, so 'res://<name>' is unreachable
+# from any path input. Resources are project-wide, exact-match only.
+RESOURCE_PREFIX = "res://"
+_RESOURCE_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9:_-]*$")
+
+
+def normalize_resource_name(raw) -> str:
+    """Validate and canonicalize a resource lease name (e.g. 'release:pages')."""
+    if not raw or not isinstance(raw, str) or not raw.strip():
+        raise ValidationError("validation_error", "Resource name must be a non-empty string")
+    name = raw.strip().lower()
+    if not _RESOURCE_NAME_PATTERN.match(name):
+        raise ValidationError(
+            "validation_error",
+            f"Invalid resource name '{raw}': must match [a-z0-9][a-z0-9:_-]*",
+        )
+    return name
+
+
+def resource_key(name: str) -> str:
+    """Internal storage key for a resource lease."""
+    return RESOURCE_PREFIX + normalize_resource_name(name)
+
+
+def is_resource_key(key: str) -> bool:
+    return isinstance(key, str) and key.startswith(RESOURCE_PREFIX)
+
+
+def reservation_kind(key: str) -> str:
+    return "resource" if is_resource_key(key) else "file"
+
+
+def reservation_display(key: str) -> str:
+    """Outward-facing form: resource keys are shown as their bare name."""
+    return key[len(RESOURCE_PREFIX):] if is_resource_key(key) else key
+
+
+def normalize_reservation_key(raw) -> str:
+    """Normalize either a file path or an internal 'res://<name>' resource key."""
+    if isinstance(raw, str) and raw.startswith(RESOURCE_PREFIX):
+        return resource_key(raw[len(RESOURCE_PREFIX):])
+    return normalize_reservation_path(raw)
+
+
 def normalize_reservation_path(raw) -> str:
     """Normalize a repo-relative POSIX reservation path.
 
@@ -66,10 +114,15 @@ def normalize_reservation_path(raw) -> str:
 
 
 def reservation_paths_conflict(a: str, b: str) -> bool:
-    """True when two normalized reservation paths overlap (case-insensitive):
-    same path, an ancestor directory reservation, or a descendant of a
-    requested directory."""
+    """True when two normalized reservation keys overlap (case-insensitive).
+
+    File paths overlap on the same path, an ancestor directory reservation, or
+    a descendant of a requested directory. Resource keys ('res://…') never
+    prefix-conflict: they match exactly or not at all, and never against files.
+    """
     la, lb = a.lower(), b.lower()
+    if is_resource_key(la) or is_resource_key(lb):
+        return la == lb
     if la == lb:
         return True
     if lb.endswith("/") and la.startswith(lb):
@@ -981,8 +1034,19 @@ class InboxService:
     # filesystem and expired rows are swept lazily on every touch.
     # ------------------------------------------------------------------
 
-    def _sweep_expired_reservations(self, project_id: int, now: str) -> None:
-        """Lazily close expired-but-unreleased rows (audit: released_by='expired')."""
+    def _sweep_expired_reservations(self, project_id: Optional[int], now: str) -> None:
+        """Lazily close expired-but-unreleased rows (audit: released_by='expired').
+        Sweeps one project, or every project when project_id is None."""
+        if project_id is None:
+            self.conn.execute(
+                """
+                UPDATE reservations
+                SET released_at = expires_at, released_by = 'expired'
+                WHERE released_at IS NULL AND expires_at <= ?
+                """,
+                (now,),
+            )
+            return
         self.conn.execute(
             """
             UPDATE reservations
@@ -992,29 +1056,56 @@ class InboxService:
             (project_id, now),
         )
 
-    def _active_reservations(self, project_id: int) -> List[sqlite3.Row]:
+    _RESERVATION_SELECT = """
+        SELECT r.id, r.path, r.holder_inbox_id, r.holder_session, r.reason,
+               r.ttl_seconds, r.created_at, r.expires_at, r.released_at,
+               r.released_by, r.repo_key,
+               i.local_part, p.slug AS project_slug,
+               rp.slug AS reservation_project
+        FROM reservations r
+        JOIN inboxes i ON r.holder_inbox_id = i.id
+        JOIN projects p ON i.project_id = p.id
+        JOIN projects rp ON r.project_id = rp.id
+    """
+
+    def _active_reservations(self, project_id: Optional[int] = None) -> List[sqlite3.Row]:
+        """Active rows for one project, or machine-wide when project_id is None."""
+        if project_id is None:
+            return self.conn.execute(
+                self._RESERVATION_SELECT
+                + " WHERE r.released_at IS NULL ORDER BY rp.slug ASC, r.created_at ASC, r.id ASC"
+            ).fetchall()
         return self.conn.execute(
-            """
-            SELECT r.id, r.path, r.holder_inbox_id, r.holder_session, r.reason,
-                   r.ttl_seconds, r.created_at, r.expires_at,
-                   i.local_part, p.slug AS project_slug
-            FROM reservations r
-            JOIN inboxes i ON r.holder_inbox_id = i.id
-            JOIN projects p ON i.project_id = p.id
-            WHERE r.project_id = ? AND r.released_at IS NULL
-            ORDER BY r.created_at ASC, r.id ASC
-            """,
+            self._RESERVATION_SELECT
+            + " WHERE r.project_id = ? AND r.released_at IS NULL ORDER BY r.created_at ASC, r.id ASC",
             (project_id,),
+        ).fetchall()
+
+    def _finished_reservations(self, project_id: Optional[int], limit: int) -> List[sqlite3.Row]:
+        """Finished (released/expired/forced) audit rows, newest first."""
+        limit = max(1, min(int(limit or 50), 200))
+        if project_id is None:
+            return self.conn.execute(
+                self._RESERVATION_SELECT
+                + " WHERE r.released_at IS NOT NULL ORDER BY r.released_at DESC, r.id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return self.conn.execute(
+            self._RESERVATION_SELECT
+            + " WHERE r.project_id = ? AND r.released_at IS NOT NULL"
+            + " ORDER BY r.released_at DESC, r.id DESC LIMIT ?",
+            (project_id, limit),
         ).fetchall()
 
     @staticmethod
     def _is_own(row: sqlite3.Row, inbox_id: int, session: Optional[str]) -> bool:
         return row["holder_inbox_id"] == inbox_id and (row["holder_session"] or None) == (session or None)
 
-    def _conflict_dict(self, requested_path: str, row: sqlite3.Row, now: str) -> dict:
+    def _conflict_dict(self, requested_key: str, row: sqlite3.Row, now: str) -> dict:
         return {
-            "path": requested_path,
-            "reserved_path": row["path"],
+            "path": reservation_display(requested_key),
+            "kind": reservation_kind(requested_key),
+            "reserved_path": reservation_display(row["path"]),
             "holder": f"{row['local_part']}@{row['project_slug']}",
             "session": row["holder_session"],
             "reason": row["reason"],
@@ -1023,9 +1114,10 @@ class InboxService:
             "expires_in_seconds": _iso_diff_seconds(now, row["expires_at"]),
         }
 
-    def _reservation_dict(self, row: sqlite3.Row, now: str) -> dict:
-        return {
-            "path": row["path"],
+    def _reservation_dict(self, row: sqlite3.Row, now: str, include_project: bool = False) -> dict:
+        d = {
+            "path": reservation_display(row["path"]),
+            "kind": reservation_kind(row["path"]),
             "holder": f"{row['local_part']}@{row['project_slug']}",
             "session": row["holder_session"],
             "reason": row["reason"],
@@ -1034,6 +1126,46 @@ class InboxService:
             "expires_at": row["expires_at"],
             "expires_in_seconds": _iso_diff_seconds(now, row["expires_at"]),
         }
+        if row["repo_key"]:
+            d["repo_key"] = row["repo_key"]
+        if include_project:
+            d["project"] = row["reservation_project"]
+        return d
+
+    def _history_dict(self, row: sqlite3.Row, include_project: bool = False) -> dict:
+        d = {
+            "path": reservation_display(row["path"]),
+            "kind": reservation_kind(row["path"]),
+            "holder": f"{row['local_part']}@{row['project_slug']}",
+            "session": row["holder_session"],
+            "reason": row["reason"],
+            "created_at": row["created_at"],
+            "expires_at": row["expires_at"],
+            "released_at": row["released_at"],
+            "released_by": row["released_by"],
+        }
+        if row["repo_key"]:
+            d["repo_key"] = row["repo_key"]
+        if include_project:
+            d["project"] = row["reservation_project"]
+        return d
+
+    @staticmethod
+    def _repo_compatible_conflict(req_key: str, req_repo_key: Optional[str], row: sqlite3.Row) -> bool:
+        """Whether an overlapping active row actually conflicts, given repo keys.
+
+        Resources are project-wide — repo identity never exempts them. For file
+        paths, two leases conflict only when either side lacks a repo key
+        (NULL stays conservative so legacy/keyless clients still conflict
+        rather than silently bypass) or the keys are equal. Different keys mean
+        different repositories that merely share a directory basename.
+        """
+        if is_resource_key(req_key) or is_resource_key(row["path"]):
+            return True
+        row_key = row["repo_key"]
+        if req_repo_key is None or row_key is None:
+            return True
+        return req_repo_key == row_key
 
     def _find_conflicts(
         self,
@@ -1042,9 +1174,10 @@ class InboxService:
         inbox_id: int,
         session: Optional[str],
         now: str,
+        repo_key: Optional[str] = None,
     ) -> Tuple[List[dict], List[sqlite3.Row], dict]:
         """Return (conflicts, conflicting_rows, own_active_by_path) for the
-        requested paths against the project's active reservations."""
+        requested keys against the project's active reservations."""
         active = self._active_reservations(project_id)
         conflicts: List[dict] = []
         conflict_rows: List[sqlite3.Row] = []
@@ -1056,7 +1189,9 @@ class InboxService:
                     if row["path"].lower() == req.lower():
                         own_by_path[req] = row
                     continue
-                if reservation_paths_conflict(req, row["path"]):
+                if reservation_paths_conflict(req, row["path"]) and self._repo_compatible_conflict(
+                    req, repo_key, row
+                ):
                     conflicts.append(self._conflict_dict(req, row, now))
                     if row["id"] not in seen_row_ids:
                         seen_row_ids.add(row["id"])
@@ -1073,22 +1208,36 @@ class InboxService:
         ttl_seconds: Optional[int] = None,
         force: bool = False,
         client_token: Optional[str] = None,
+        repo_key: Optional[str] = None,
+        resources: Optional[List[str]] = None,
     ) -> dict:
-        """All-or-nothing multi-path acquire inside one BEGIN IMMEDIATE span.
+        """All-or-nothing multi-key acquire inside one BEGIN IMMEDIATE span.
 
+        A call reserves either file ``paths`` or named ``resources`` — not both.
         Returns {"reservations": [...]} on success or {"conflicts": [...]} when
-        any path is actively held by a different (address, session) and force is
-        False. Re-acquiring an own active path renews it (idempotent).
+        any key is actively held by a different (address, session) and force is
+        False. Re-acquiring an own active key renews it (idempotent). A forced
+        takeover auto-mails each displaced holder after commit; mail failure
+        never rolls back or errors the acquire.
         """
         if not client_token or not isinstance(client_token, str) or not client_token.strip():
             raise ValidationError("missing_idempotency_key", "Idempotency-Key header is required")
         client_token = client_token.strip()
-        if not paths or not isinstance(paths, list):
-            raise ValidationError("validation_error", "'paths' list cannot be empty")
+        if paths and resources:
+            raise ValidationError("validation_error", "A call reserves either 'paths' or 'resources', not both")
+        if resources:
+            if not isinstance(resources, list):
+                raise ValidationError("validation_error", "'resources' must be a list")
+            requested = [resource_key(r) for r in resources]
+            # Resource leases are project-wide: repo identity never applies.
+            repo_key = None
+        else:
+            if not paths or not isinstance(paths, list):
+                raise ValidationError("validation_error", "'paths' list cannot be empty")
+            requested = [normalize_reservation_key(p) for p in paths]
 
         norm_paths: List[str] = []
-        for p in paths:
-            np = normalize_reservation_path(p)
+        for np in requested:
             if np.lower() not in {x.lower() for x in norm_paths}:
                 norm_paths.append(np)
 
@@ -1099,15 +1248,7 @@ class InboxService:
 
         # Idempotent replay of a retried acquire call.
         existing = self.conn.execute(
-            """
-            SELECT r.id, r.path, r.holder_inbox_id, r.holder_session, r.reason,
-                   r.ttl_seconds, r.created_at, r.expires_at,
-                   i.local_part, p.slug AS project_slug
-            FROM reservations r
-            JOIN inboxes i ON r.holder_inbox_id = i.id
-            JOIN projects p ON i.project_id = p.id
-            WHERE r.client_token = ?
-            """,
+            self._RESERVATION_SELECT + " WHERE r.client_token = ?",
             (client_token,),
         ).fetchall()
         if existing:
@@ -1132,42 +1273,48 @@ class InboxService:
             self._sweep_expired_reservations(project_id, now)
 
             conflicts, conflict_rows, own_by_path = self._find_conflicts(
-                project_id, norm_paths, inbox_id, session, now
+                project_id, norm_paths, inbox_id, session, now, repo_key=repo_key
             )
 
             if conflicts and not force:
                 self.conn.execute("ROLLBACK")
                 return {"conflicts": conflicts}
 
+            displaced: dict = {}
             if conflicts and force:
                 for row in conflict_rows:
                     self.conn.execute(
                         "UPDATE reservations SET released_at = ?, released_by = ? WHERE id = ?",
                         (now, f"forced:{norm_holder}", row["id"]),
                     )
+                    victim = f"{row['local_part']}@{row['project_slug']}"
+                    displaced.setdefault(victim, []).append(reservation_display(row["path"]))
 
             expires_at = _iso_add_seconds(now, ttl)
             for np in norm_paths:
                 own = own_by_path.get(np)
                 if own is not None:
-                    # Idempotent re-acquire renews the existing lease.
+                    # Idempotent re-acquire renews the existing lease (and
+                    # refreshes its repo identity to the caller's current one).
                     self.conn.execute(
                         """
                         UPDATE reservations
-                        SET expires_at = ?, ttl_seconds = ?, reason = ?, client_token = ?
+                        SET expires_at = ?, ttl_seconds = ?, reason = ?, client_token = ?, repo_key = ?
                         WHERE id = ?
                         """,
-                        (expires_at, ttl, reason or own["reason"], client_token, own["id"]),
+                        (expires_at, ttl, reason or own["reason"], client_token,
+                         None if is_resource_key(np) else repo_key, own["id"]),
                     )
                 else:
                     self.conn.execute(
                         """
                         INSERT INTO reservations
                           (project_id, path, holder_inbox_id, holder_session, reason,
-                           ttl_seconds, created_at, expires_at, client_token)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ttl_seconds, created_at, expires_at, client_token, repo_key)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (project_id, np, inbox_id, session, reason, ttl, now, expires_at, client_token),
+                        (project_id, np, inbox_id, session, reason, ttl, now, expires_at,
+                         client_token, None if is_resource_key(np) else repo_key),
                     )
             self.conn.execute("COMMIT")
         except BaseException:
@@ -1176,19 +1323,63 @@ class InboxService:
             raise
 
         rows = self.conn.execute(
-            """
-            SELECT r.id, r.path, r.holder_inbox_id, r.holder_session, r.reason,
-                   r.ttl_seconds, r.created_at, r.expires_at,
-                   i.local_part, p.slug AS project_slug
-            FROM reservations r
-            JOIN inboxes i ON r.holder_inbox_id = i.id
-            JOIN projects p ON i.project_id = p.id
-            WHERE r.client_token = ?
-            """,
+            self._RESERVATION_SELECT + " WHERE r.client_token = ?",
             (client_token,),
         ).fetchall()
         now = utc_now_iso()
-        return {"reservations": [self._reservation_dict(r, now) for r in rows]}
+        result = {"reservations": [self._reservation_dict(r, now) for r in rows]}
+        if displaced:
+            notified = self._notify_takeover(norm_holder, session, reason, displaced)
+            if notified:
+                result["notified"] = notified
+        return result
+
+    def _notify_takeover(
+        self,
+        taker_addr: str,
+        taker_session: Optional[str],
+        reason: str,
+        displaced: dict,
+    ) -> List[str]:
+        """Auto-mail each displaced holder about a forced takeover.
+
+        Runs AFTER the takeover transaction has committed: a mail failure must
+        neither roll back the takeover nor error the acquire, so every send is
+        individually failure-isolated. One mail per displaced holder per
+        takeover event, listing all of their displaced paths.
+        """
+        notified: List[str] = []
+        for victim, victim_paths in displaced.items():
+            subject = f"Reservation takeover: {victim_paths[0]}"
+            if len(victim_paths) > 1:
+                subject += f" (+{len(victim_paths) - 1} more)"
+            path_lines = "\n".join(f"- `{p}`" for p in victim_paths)
+            session_note = f" (session {taker_session})" if taker_session else ""
+            reason_note = reason or "(no reason given)"
+            body = (
+                f"Your active reservation(s) were taken over with `--force`:\n\n"
+                f"{path_lines}\n\n"
+                f"Taken by: {taker_addr}{session_note}\n"
+                f"Reason: {reason_note}\n\n"
+                f"Audit: the displaced lease rows are recorded with "
+                f"`released_by=forced:{taker_addr}`.\n"
+                f"Reply to this mail to coordinate if you were still working on them."
+            )
+            try:
+                self.send_email(
+                    from_addr=taker_addr,
+                    to_addrs=[victim],
+                    cc_addrs=[],
+                    subject=subject,
+                    body_markdown=body,
+                    client_token=str(uuid.uuid4()),
+                    sender_session=taker_session,
+                )
+                notified.append(victim)
+            except Exception:
+                # Advisory courtesy mail only — never fail the acquire.
+                pass
+        return notified
 
     def _own_active_rows(
         self, project_id: int, inbox_id: int, session: Optional[str]
@@ -1213,7 +1404,7 @@ class InboxService:
         inbox_id = self._get_inbox_id(norm_holder)
         project_id = self.ensure_project(project_slug)
 
-        norm_paths = [normalize_reservation_path(p) for p in (paths or [])]
+        norm_paths = [normalize_reservation_key(p) for p in (paths or [])]
         if not release_all and not norm_paths:
             raise ValidationError("validation_error", "Provide paths or all=true")
 
@@ -1235,7 +1426,7 @@ class InboxService:
                     if row is not None:
                         targets.append(row)
                     else:
-                        missed.append(np)
+                        missed.append(reservation_display(np))
 
             done: List[str] = []
             for row in targets:
@@ -1250,7 +1441,7 @@ class InboxService:
                         "UPDATE reservations SET expires_at = ? WHERE id = ?",
                         (_iso_add_seconds(now, row["ttl_seconds"]), row["id"]),
                     )
-                done.append(row["path"])
+                done.append(reservation_display(row["path"]))
             self.conn.execute("COMMIT")
         except BaseException:
             if self.conn.in_transaction:
@@ -1284,8 +1475,28 @@ class InboxService:
             result = [r for r in result if r["holder"] == norm]
         return result
 
+    def reservation_history(self, project_slug: Optional[str] = None, limit: int = 50) -> List[dict]:
+        """Finished (released/expired/forced) audit rows, newest first.
+
+        Per-project when a slug is given, machine-wide otherwise. The lazy
+        expiry sweep runs first so just-expired leases appear in history rather
+        than lingering as stale actives."""
+        now = utc_now_iso()
+        project_id = self.ensure_project(project_slug) if project_slug else None
+        self._sweep_expired_reservations(project_id, now)
+        rows = self._finished_reservations(project_id, limit)
+        return [self._history_dict(r, include_project=project_id is None) for r in rows]
+
+    def list_reservations_all(self) -> List[dict]:
+        """Machine-wide active reservations across all projects (observer view)."""
+        now = utc_now_iso()
+        self._sweep_expired_reservations(None, now)
+        rows = self._active_reservations(None)
+        return [self._reservation_dict(r, now, include_project=True) for r in rows]
+
     def reservation_conflicts(
         self, project_slug: str, paths: List[str], holder_addr: str, session: Optional[str],
+        repo_key: Optional[str] = None,
     ) -> List[dict]:
         """Non-mutating conflict check used by the wait long-poll."""
         norm_holder = normalize_address(holder_addr)
@@ -1294,8 +1505,10 @@ class InboxService:
         project_id = self.ensure_project(project_slug)
         now = utc_now_iso()
         self._sweep_expired_reservations(project_id, now)
-        norm_paths = [normalize_reservation_path(p) for p in paths]
-        conflicts, _, _ = self._find_conflicts(project_id, norm_paths, inbox_id, session, now)
+        norm_paths = [normalize_reservation_key(p) for p in paths]
+        conflicts, _, _ = self._find_conflicts(
+            project_id, norm_paths, inbox_id, session, now, repo_key=repo_key
+        )
         return conflicts
 
     def mark_thread_read(self, address: str, thread_id: str) -> int:

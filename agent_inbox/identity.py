@@ -164,6 +164,45 @@ def derive_session() -> str:
     return _short_session_hash(f"ppid:{ppid}:{start_time}")
 
 
+def derive_repo_key(cwd: Optional[Union[str, Path]] = None) -> Optional[str]:
+    """
+    Derive a stable repository identity key for file reservations.
+
+    Two different repos that share a directory basename must not cross-conflict,
+    while all worktrees of ONE repo must share a key. `git rev-parse
+    --git-common-dir` points every worktree at the main repository's .git
+    directory; hashing its symlink-resolved absolute path gives exactly that
+    identity. Returns 12 lowercase hex chars, or None outside a git repo.
+
+    AGENT_INBOX_REPO_KEY overrides derivation (useful for tests and non-git
+    setups); it is normalized to lowercase [0-9a-f-] and truncated to 64 chars.
+    """
+    env_key = os.environ.get("AGENT_INBOX_REPO_KEY")
+    if env_key and env_key.strip():
+        cleaned = "".join(c for c in env_key.strip().lower() if c.isalnum() or c == "-")
+        return cleaned[:64] or None
+
+    working_dir = Path(cwd).expanduser().resolve() if cwd else Path.cwd().resolve()
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=str(working_dir),
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            return None
+        common_dir = Path(res.stdout.strip())
+        if not common_dir.is_absolute():
+            common_dir = working_dir / common_dir
+        real = common_dir.resolve()
+        return hashlib.sha256(str(real).encode("utf-8")).hexdigest()[:12]
+    except Exception:
+        return None
+
+
 def derive_identity(cwd: Optional[Union[str, Path]] = None) -> Tuple[str, str, str]:
     """
     Derive full identity tuple: (agent_slug, project_slug, full_address).

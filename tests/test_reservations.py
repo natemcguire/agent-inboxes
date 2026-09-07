@@ -172,3 +172,173 @@ class TestReservationWaitE2E(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRepoKeysResourcesAndTakeoverMail(unittest.TestCase):
+    """v1.3.0: worktree-safe repo keys, forced-takeover mail, resource leases."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.conn = get_connection(Path(self.tmp_dir.name) / "res13.db")
+        self.svc = InboxService(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp_dir.cleanup()
+
+    def test_repo_key_conflict_matrix(self):
+        # Holder A reserves with repo key K1.
+        self.svc.acquire_reservations(
+            "proj", ["src/app.ts"], "a@proj", "s-aaaa",
+            client_token=_tok(), repo_key="aaaaaaaaaaaa",
+        )
+        # Different repo key -> different repository sharing a basename: free.
+        res_other_repo = self.svc.acquire_reservations(
+            "proj", ["src/app.ts"], "b@proj", "s-bbbb",
+            client_token=_tok(), repo_key="bbbbbbbbbbbb",
+        )
+        self.assertNotIn("conflicts", res_other_repo)
+
+        # Same repo key -> conflicts with A's lease.
+        res_same_repo = self.svc.acquire_reservations(
+            "proj", ["src/app.ts"], "c@proj", "s-cccc",
+            client_token=_tok(), repo_key="aaaaaaaaaaaa",
+        )
+        self.assertIn("conflicts", res_same_repo)
+
+        # NULL requester key stays conservative: conflicts with BOTH keyed leases.
+        res_null_req = self.svc.acquire_reservations(
+            "proj", ["src/app.ts"], "d@proj", "s-dddd", client_token=_tok(),
+        )
+        self.assertIn("conflicts", res_null_req)
+        self.assertEqual(len(res_null_req["conflicts"]), 2)
+
+        # NULL row key stays conservative too: keyed requester on a keyless lease.
+        self.svc.acquire_reservations(
+            "proj", ["legacy.txt"], "d@proj", "s-dddd", client_token=_tok(),
+        )
+        res_keyed_vs_null = self.svc.acquire_reservations(
+            "proj", ["legacy.txt"], "a@proj", "s-aaaa",
+            client_token=_tok(), repo_key="aaaaaaaaaaaa",
+        )
+        self.assertIn("conflicts", res_keyed_vs_null)
+
+    def test_forced_takeover_notifies_displaced_holder_and_isolates_mail_failure(self):
+        self.svc.acquire_reservations(
+            "proj", ["src/a.ts", "src/b.ts"], "victim@proj", "s-vvvv",
+            reason="editing both", client_token=_tok(),
+        )
+        res = self.svc.acquire_reservations(
+            "proj", ["src/a.ts", "src/b.ts"], "taker@proj", "s-tttt",
+            reason="hotfix", force=True, client_token=_tok(),
+        )
+        self.assertNotIn("conflicts", res)
+        self.assertEqual(res.get("notified"), ["victim@proj"])
+
+        # Exactly ONE mail for the event, listing both paths, readable by the victim.
+        threads = self.svc.list_threads("victim@proj", unread_only=True)
+        self.assertEqual(len(threads), 1)
+        self.assertIn("Reservation takeover: src/a.ts", threads[0]["subject"])
+        detail = self.svc.get_thread("victim@proj", threads[0]["thread_id"])
+        body = detail["emails"][0]["body_markdown"]
+        self.assertIn("src/a.ts", body)
+        self.assertIn("src/b.ts", body)
+        self.assertIn("forced:taker@proj", body)
+        self.assertEqual(detail["emails"][0]["from"], "taker@proj")
+
+        # Mail failure must not error the acquire nor roll back the takeover.
+        self.svc.acquire_reservations(
+            "proj", ["solo.ts"], "victim2@proj", "s-v2v2", client_token=_tok(),
+        )
+        with mock.patch.object(
+            InboxService, "send_email", side_effect=RuntimeError("mail down")
+        ):
+            res2 = self.svc.acquire_reservations(
+                "proj", ["solo.ts"], "taker@proj", "s-tttt",
+                force=True, client_token=_tok(),
+            )
+        self.assertNotIn("conflicts", res2)
+        self.assertNotIn("notified", res2)
+        forced_row = self.conn.execute(
+            "SELECT released_by FROM reservations WHERE path='solo.ts' AND released_at IS NOT NULL"
+        ).fetchone()
+        self.assertEqual(forced_row["released_by"], "forced:taker@proj")
+
+    def test_resource_leases_exact_match_only_and_repo_key_exempt(self):
+        res = self.svc.acquire_reservations(
+            "proj", None, "a@proj", "s-aaaa",
+            client_token=_tok(), resources=["release:pages"],
+        )
+        got = res["reservations"][0]
+        self.assertEqual(got["path"], "release:pages")
+        self.assertEqual(got["kind"], "resource")
+
+        # Exact-match only: a longer-named resource does not prefix-conflict.
+        res2 = self.svc.acquire_reservations(
+            "proj", None, "b@proj", "s-bbbb",
+            client_token=_tok(), resources=["release:pages-preview"],
+        )
+        self.assertNotIn("conflicts", res2)
+
+        # Same resource name conflicts even with different repo keys (project-wide).
+        res3 = self.svc.acquire_reservations(
+            "proj", None, "c@proj", "s-cccc",
+            client_token=_tok(), resources=["release:pages"], repo_key="cccccccccccc",
+        )
+        self.assertIn("conflicts", res3)
+        self.assertEqual(res3["conflicts"][0]["kind"], "resource")
+
+        # A file path can never collide with the resource namespace.
+        res4 = self.svc.acquire_reservations(
+            "proj", ["res://release:pages"], "d@proj", "s-dddd", client_token=_tok(),
+        )
+        # Explicit res:// in a path list round-trips to the same resource -> conflict,
+        # while an ordinary file named like the resource is free.
+        self.assertIn("conflicts", res4)
+        res5 = self.svc.acquire_reservations(
+            "proj", ["release:pages"], "d@proj", "s-dddd", client_token=_tok(),
+        )
+        self.assertNotIn("conflicts", res5)
+
+        # Invalid resource names are rejected.
+        with self.assertRaises(service_mod.ValidationError):
+            self.svc.acquire_reservations(
+                "proj", None, "e@proj", "s-eeee",
+                client_token=_tok(), resources=["Bad Name!"],
+            )
+
+    def test_global_listing_and_history_ordering_limit(self):
+        real_now = utc_now_iso()
+        self.svc.acquire_reservations(
+            "proj-one", ["a.txt"], "a@proj-one", "s-aaaa", client_token=_tok(), ttl_seconds=60,
+        )
+        self.svc.acquire_reservations(
+            "proj-two", None, "b@proj-two", "s-bbbb",
+            client_token=_tok(), resources=["release:pages"],
+        )
+        self.svc.release_reservations("proj-one", "a@proj-one", "s-aaaa", release_all=True)
+        # A second finished row, later: forced takeover in proj-two.
+        self.svc.acquire_reservations(
+            "proj-two", ["z.txt"], "b@proj-two", "s-bbbb", client_token=_tok(), ttl_seconds=60,
+        )
+        # Advance past the 60s lease's expiry but inside the resource's 15m TTL.
+        future = _iso_add_seconds(real_now, 120)
+        with mock.patch.object(service_mod, "utc_now_iso", return_value=future):
+            # Sweep on the global read: z.txt expires into history.
+            active = self.svc.list_reservations_all()
+            self.assertEqual(len(active), 1)
+            self.assertEqual(active[0]["project"], "proj-two")
+            self.assertEqual(active[0]["kind"], "resource")
+
+            history = self.svc.reservation_history(None, limit=50)
+            # Newest first: expiry of z.txt (released_at = its expires_at,
+            # 60s after creation) sorts after a.txt's immediate release.
+            self.assertEqual([h["path"] for h in history], ["z.txt", "a.txt"])
+            self.assertEqual(history[0]["released_by"], "expired")
+            self.assertEqual(history[0]["project"], "proj-two")
+            self.assertEqual(history[1]["released_by"], "holder")
+            self.assertEqual(history[1]["project"], "proj-one")
+            self.assertEqual(len(self.svc.reservation_history(None, limit=1)), 1)
+            # Per-project history filters correctly.
+            per = self.svc.reservation_history("proj-one", limit=50)
+            self.assertEqual([h["path"] for h in per], ["a.txt"])

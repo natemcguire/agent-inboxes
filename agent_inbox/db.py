@@ -101,7 +101,8 @@ CREATE TABLE IF NOT EXISTS reservations (
   expires_at      TEXT    NOT NULL,
   released_at     TEXT,                         -- NULL while active
   released_by     TEXT,                         -- 'holder' | 'expired' | 'forced:<address>'
-  client_token    TEXT                          -- acquire idempotency (shared per call)
+  client_token    TEXT,                         -- acquire idempotency (shared per call)
+  repo_key        TEXT                          -- worktree-safe repo identity (NULL = conservative)
 );
 CREATE INDEX IF NOT EXISTS idx_reservations_active
   ON reservations(project_id, path) WHERE released_at IS NULL;
@@ -196,3 +197,9 @@ def init_db(conn: sqlite3.Connection) -> None:
     email_columns = {row[1] for row in conn.execute("PRAGMA table_info(emails)")}
     if "sender_session" not in email_columns:
         conn.execute("ALTER TABLE emails ADD COLUMN sender_session TEXT")
+
+    # v1.3: reservations.repo_key (nullable) — worktree-safe repository identity.
+    # NULL is conservative: keyless leases conflict with everything in-project.
+    reservation_columns = {row[1] for row in conn.execute("PRAGMA table_info(reservations)")}
+    if "repo_key" not in reservation_columns:
+        conn.execute("ALTER TABLE reservations ADD COLUMN repo_key TEXT")

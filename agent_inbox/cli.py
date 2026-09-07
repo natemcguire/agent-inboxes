@@ -19,7 +19,7 @@ from agent_inbox.config import (
     get_port,
     get_server_url,
 )
-from agent_inbox.identity import derive_agent, derive_identity, derive_project, derive_session
+from agent_inbox.identity import derive_agent, derive_identity, derive_project, derive_repo_key, derive_session
 from agent_inbox.launchagent import (
     install_launchagent,
     load_launchagent,
@@ -361,10 +361,11 @@ def _format_expiry(seconds: Optional[int]) -> str:
 def _print_reservation_conflicts(conflicts: list) -> None:
     print("Reservation conflict — nothing was reserved:")
     for c in conflicts:
+        label = "[resource] " if c.get("kind") == "resource" else ""
         sess = f" (session {c['session']})" if c.get("session") else ""
         reason = f" — {c['reason']}" if c.get("reason") else ""
         held = f" via {c['reserved_path']}" if c.get("reserved_path") and c.get("reserved_path") != c.get("path") else ""
-        print(f"• {c['path']}{held}: held by {c['holder']}{sess}{reason} "
+        print(f"• {label}{c['path']}{held}: held by {c['holder']}{sess}{reason} "
               f"(expires in {_format_expiry(c.get('expires_in_seconds'))})")
     if conflicts:
         holder = conflicts[0]["holder"]
@@ -374,18 +375,28 @@ def _print_reservation_conflicts(conflicts: list) -> None:
 
 
 def cmd_reserve(args: argparse.Namespace, client: InboxClient) -> int:
-    """Acquire advisory file reservations (all-or-nothing)."""
+    """Acquire advisory reservations: file paths OR named resources (all-or-nothing)."""
     try:
         _, _, address = derive_identity()
         project = derive_project()
         ttl_seconds = _parse_duration(args.ttl) if args.ttl else None
+        resources = args.resource or None
+        if resources and args.paths:
+            _print_error("A call reserves either paths or --resource names, not both", "invalid_argument")
+            return 1
+        if not resources and not args.paths:
+            _print_error("Provide paths or --resource <name>", "invalid_argument")
+            return 1
+        # Wait-loop keys: resources travel as internal res:// keys.
+        wait_keys = [f"res://{r}" for r in resources] if resources else args.paths
         wait_deadline = time.monotonic() + max(1.0, float(args.wait_timeout)) if args.wait else None
 
         while True:
             try:
                 res = client.acquire_reservations(
                     project=project,
-                    paths=args.paths,
+                    paths=None if resources else args.paths,
+                    resources=resources,
                     holder=address,
                     reason=args.reason or "",
                     ttl_seconds=ttl_seconds,
@@ -414,7 +425,7 @@ def cmd_reserve(args: argparse.Namespace, client: InboxClient) -> int:
                 # Long-poll server-side until free (or leg timeout), then retry
                 # the atomic acquire. No queue/fairness: a racing waiter may win.
                 client.wait_reservations(
-                    project, args.paths, address, timeout=min(60.0, remaining)
+                    project, wait_keys, address, timeout=min(60.0, remaining)
                 )
 
         if args.force:
@@ -424,7 +435,10 @@ def cmd_reserve(args: argparse.Namespace, client: InboxClient) -> int:
             print(json.dumps(res, indent=2))
         else:
             for r in res.get("reservations", []):
-                print(f"Reserved {r['path']} (expires in {_format_expiry(r.get('expires_in_seconds'))})")
+                label = "[resource] " if r.get("kind") == "resource" else ""
+                print(f"Reserved {label}{r['path']} (expires in {_format_expiry(r.get('expires_in_seconds'))})")
+            for victim in res.get("notified", []):
+                print(f"Displaced holder notified by mail: {victim}")
         return 0
     except ValueError as e:
         _print_error(str(e), "invalid_argument")
@@ -441,14 +455,15 @@ def _cmd_renew_or_release(args: argparse.Namespace, client: InboxClient, action:
     try:
         _, _, address = derive_identity()
         project = derive_project()
-        if not args.all and not args.paths:
-            _print_error(f"Provide paths or --all to {action}", "invalid_argument")
+        keys = list(args.paths or []) + [f"res://{r}" for r in (args.resource or [])]
+        if not args.all and not keys:
+            _print_error(f"Provide paths, --resource, or --all to {action}", "invalid_argument")
             return 1
         if action == "renew":
-            res = client.renew_reservations(project, address, paths=args.paths or None, renew_all=args.all)
+            res = client.renew_reservations(project, address, paths=keys or None, renew_all=args.all)
             done_key, verb = "renewed", "Renewed"
         else:
-            res = client.release_reservations(project, address, paths=args.paths or None, release_all=args.all)
+            res = client.release_reservations(project, address, paths=keys or None, release_all=args.all)
             done_key, verb = "released", "Released"
         if args.json:
             print(json.dumps(res, indent=2))
@@ -485,19 +500,27 @@ def cmd_reservations(args: argparse.Namespace, client: InboxClient) -> int:
         holder = None
         if args.mine:
             _, _, holder = derive_identity()
-        reservations = client.list_reservations(project, holder=holder)
+        payload = client.list_reservations(project, holder=holder, history=args.history)
+        reservations = payload.get("reservations", [])
         if args.json:
-            print(json.dumps({"reservations": reservations}, indent=2))
+            print(json.dumps(payload, indent=2))
         else:
             if not reservations:
                 print(f"No active reservations in '{project}'.")
-                return 0
-            print(f"Active reservations ({project}):")
-            for r in reservations:
-                sess = f" (session {r['session']})" if r.get("session") else ""
-                reason = f" — {r['reason']}" if r.get("reason") else ""
-                print(f"• {r['path']}: {r['holder']}{sess}{reason} "
-                      f"(expires in {_format_expiry(r.get('expires_in_seconds'))})")
+            else:
+                print(f"Active reservations ({project}):")
+                for r in reservations:
+                    label = "[resource] " if r.get("kind") == "resource" else ""
+                    sess = f" (session {r['session']})" if r.get("session") else ""
+                    reason = f" — {r['reason']}" if r.get("reason") else ""
+                    print(f"• {label}{r['path']}: {r['holder']}{sess}{reason} "
+                          f"(expires in {_format_expiry(r.get('expires_in_seconds'))})")
+            if args.history:
+                history = payload.get("history", [])
+                print(f"\nHistory ({len(history)} finished):")
+                for h in history:
+                    label = "[resource] " if h.get("kind") == "resource" else ""
+                    print(f"• {label}{h['path']}: {h['holder']} — {h['released_by']} at {h['released_at']}")
         return 0
     except InboxError as e:
         _print_error(e.message, e.code)
@@ -746,8 +769,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_read.add_argument("--json", action="store_true", help="Output JSON")
 
     # reserve / renew / release / reservations (NB-7 advisory file leases)
-    p_reserve = subparsers.add_parser("reserve", help="Reserve file paths (advisory lease, all-or-nothing)")
-    p_reserve.add_argument("paths", nargs="+", help="Repo-relative paths; trailing / reserves a directory")
+    p_reserve = subparsers.add_parser("reserve", help="Reserve file paths or named resources (advisory lease, all-or-nothing)")
+    p_reserve.add_argument("paths", nargs="*", help="Repo-relative paths; trailing / reserves a directory")
+    p_reserve.add_argument("--resource", action="append", help="Named resource lease (e.g. release:pages); repeatable; not mixable with paths")
     p_reserve.add_argument("--reason", help="Why you are reserving (shown to conflicting agents)")
     p_reserve.add_argument("--ttl", help="Lease TTL: 90s, 15m (default), or up to 2h")
     p_reserve.add_argument("--wait", action="store_true", help="Wait until the paths are free, then acquire")
@@ -757,17 +781,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_renew = subparsers.add_parser("renew", help="Renew held reservations (extends by each lease's TTL)")
     p_renew.add_argument("paths", nargs="*", help="Paths to renew")
+    p_renew.add_argument("--resource", action="append", help="Named resource lease to renew (repeatable)")
     p_renew.add_argument("--all", action="store_true", help="Renew everything you hold in this project")
     p_renew.add_argument("--json", action="store_true", help="Output JSON")
 
     p_release = subparsers.add_parser("release", help="Release held reservations")
     p_release.add_argument("paths", nargs="*", help="Paths to release")
+    p_release.add_argument("--resource", action="append", help="Named resource lease to release (repeatable)")
     p_release.add_argument("--all", action="store_true", help="Release everything you hold in this project")
     p_release.add_argument("--json", action="store_true", help="Output JSON")
 
     p_rsv = subparsers.add_parser("reservations", help="List active file reservations")
     p_rsv.add_argument("--project", help="Project slug (defaults to current project)")
     p_rsv.add_argument("--mine", action="store_true", help="Only reservations held by this agent")
+    p_rsv.add_argument("--history", action="store_true", help="Also show finished (released/expired/forced) audit rows")
     p_rsv.add_argument("--json", action="store_true", help="Output JSON")
 
     # watch
@@ -821,7 +848,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Every CLI interaction identifies its agent session so the service can
     # distinguish concurrent same-family agents sharing one inbox address.
-    client = InboxClient(session_id=derive_session())
+    client = InboxClient(session_id=derive_session(), repo_key=derive_repo_key())
 
     if args.command == "whoami":
         return cmd_whoami(args, client)

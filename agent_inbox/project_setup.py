@@ -34,7 +34,8 @@ Send mail for cross-session requests, blockers, handoffs, decisions that change 
 File reservations (advisory leases, not locks):
 - Before editing files another agent plausibly touches: `agent-inbox reserve <paths> --reason "..."` (15m default TTL). On conflict, don't edit — wait (`--wait`), work elsewhere, or mail the holder.
 - If your task runs long, `agent-inbox renew --all` at your mail checkpoints. Run `agent-inbox release --all` at handoff.
-- Reservations expire on their own and are never permission to skip coordination mail. Never `--force` without messaging the holder. A message about a file is not a lock, and a reservation is not a message.
+- Reservations expire on their own and are never permission to skip coordination mail. A forced takeover (`--force`) auto-mails the displaced holder, but still message them yourself with context. A message about a file is not a lock, and a reservation is not a message.
+- Named resource leases guard shared non-file resources. Before a guarded release: `agent-inbox reserve --resource release:pages --reason "<commit>"`; release it (`agent-inbox release --resource release:pages`) after completion. The 60s announce mail stays as courtesy, but the lease is the arbiter.
 
 Core commands:
 `eval "$(agent-inbox claim)"` (concurrent same-family agents, at session start)
