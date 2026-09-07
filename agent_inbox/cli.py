@@ -164,7 +164,7 @@ def cmd_reply(args: argparse.Namespace, client: InboxClient) -> int:
             if not emails:
                 _print_error("Thread has no emails to reply to.", "invalid_argument")
                 return 1
-            email_id = emails[-1]["id"]
+            email_id = emails[-1]["email_id"]
         declared = getattr(args, "subject", None)
         if declared is not None:
             if thread_subject is None:
@@ -193,7 +193,7 @@ def cmd_reply(args: argparse.Namespace, client: InboxClient) -> int:
                 cc_list.extend([x.strip() for x in c.split(",") if x.strip()])
 
         res = client.reply_email(
-            email_id=args.email_id,
+            email_id=email_id,
             from_addr=from_addr,
             body_markdown=body,
             to_addrs=to_list,
@@ -858,7 +858,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif args.command == "hooks":
         return cmd_hooks(args)
     elif args.command == "hook-check":
-        stdin_text = "" if sys.stdin.isatty() else sys.stdin.read()
+        # Read hook stdin defensively: some runtimes pipe JSON and close, but a
+        # runtime (or shell) that leaves the pipe open must never hang the hook.
+        stdin_text = ""
+        if args.hc_format == "json" and not sys.stdin.isatty():
+            import select
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+                if ready:
+                    stdin_text = sys.stdin.read()
+            except Exception:
+                pass
         return run_hook_check(args.hc_format, stdin_text)
     elif args.command == "claim":
         return cmd_claim(args, client)
