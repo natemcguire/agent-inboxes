@@ -52,8 +52,15 @@ CREATE TABLE IF NOT EXISTS emails (
   reply_to_email_id TEXT REFERENCES emails(id),
   client_token      TEXT NOT NULL UNIQUE,
   sent_at           TEXT NOT NULL,
-  sender_session    TEXT
+  sender_session    TEXT,
+  cloud_synced_at   TEXT
 );
+
+CREATE TABLE IF NOT EXISTS cloud_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  last_pulled_seq INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO cloud_state (id) VALUES (1);
 
 CREATE TABLE IF NOT EXISTS sessions (
   inbox_id      INTEGER NOT NULL REFERENCES inboxes(id) ON DELETE CASCADE,
@@ -197,6 +204,10 @@ def init_db(conn: sqlite3.Connection) -> None:
     email_columns = {row[1] for row in conn.execute("PRAGMA table_info(emails)")}
     if "sender_session" not in email_columns:
         conn.execute("ALTER TABLE emails ADD COLUMN sender_session TEXT")
+
+    # v1.4: optional cloud sync marker. Existing mail starts unsynced.
+    if "cloud_synced_at" not in email_columns:
+        conn.execute("ALTER TABLE emails ADD COLUMN cloud_synced_at TEXT")
 
     # v1.3: reservations.repo_key (nullable) — worktree-safe repository identity.
     # NULL is conservative: keyless leases conflict with everything in-project.
