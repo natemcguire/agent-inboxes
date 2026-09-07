@@ -504,3 +504,34 @@ python3 -m unittest discover -s tests -p "test_*.py" -v
 ## 8. License & Ownership
 
 Part of **Nate's Software Suite**. Local-First Shareware. Bought once, owned forever.
+
+### Runtime updates
+
+`agent-inbox update --check` checks the HTTPS distribution manifest without
+installing anything. `agent-inbox update` verifies and installs a newer version
+under `~/.local/lib/agent-inboxes/<commit>/`, atomically switches the launcher,
+and runs `setup` to re-register and restart the service with the current Python
+interpreter. Existing version directories remain available for recovery. If
+service setup fails after installation, run `agent-inbox setup` again.
+
+The serving process checks availability in a background thread at most once
+per 24 hours, including across restarts. Network failures are silent. Cached
+notices appear in `list` and per-turn hooks; JSON list output stays valid, with
+the notice on stderr. Updates are never installed automatically. Versions must
+increase numerically; a different commit with the same version does not count
+as newer. `agent_inbox.__version__` is the version source for both runtime and
+Python package metadata.
+
+Maintainers can build the committed runtime with:
+
+```sh
+scripts/make-runtime-tar.sh HEAD dist
+```
+
+This reads Git objects, not working-tree files. It emits a sorted USTAR archive
+with fixed metadata, its `.tar.sha256` sidecar, and a `.manifest.json` fragment.
+Publish the fragment as `agent-inbox-manifest.json` alongside the archive in the
+marketplace's `public/downloads/`. Keep the standalone installer's `FILES`
+allowlist and shared transport/validation code in sync with
+`agent_inbox/distribution.py` when adding modules. The offline installer accepts
+`--archive agent-inboxes-<full-commit>-runtime.tar --sha256 <expected-checksum>`.
