@@ -11,12 +11,11 @@ silent and fast (no output, exit 0).
 """
 
 import json
-import re
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from agent_inbox.config import get_data_dir
+from agent_inbox.db import get_connection
 
 RE_NAG_SECONDS = 5 * 60
 HOOK_TIMEOUT_SECONDS = 2.0
@@ -27,63 +26,40 @@ HOOK_MARKER = "agent-inbox hook-check"
 # hook-check
 # ---------------------------------------------------------------------------
 
-def _stamp_path(address: str) -> Path:
-    safe = re.sub(r"[^a-z0-9@._-]", "_", address.lower())
-    return get_data_dir() / "hook_stamps" / f"{safe}.json"
-
-
-def _read_stamp(address: str) -> dict:
-    try:
-        return json.loads(_stamp_path(address).read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _write_stamp(address: str, stamp: dict) -> None:
-    try:
-        path = _stamp_path(address)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(stamp), encoding="utf-8")
-    except Exception:
-        pass
-
-
 def build_notice(address: str, threads: List[dict], now: Optional[float] = None) -> Optional[str]:
-    """Decide whether to speak. Pure function over the unread thread list and the
-    stamp file; updates the stamp when it emits. Returns the one-liner or None."""
+    """Atomically deduplicate local delivery activity in the backed-up database."""
     now = now if now is not None else time.time()
-    if not threads:
-        # Inbox drained: clear the stamp so the very next new mail emits at once.
-        try:
-            _stamp_path(address).unlink(missing_ok=True)
-        except Exception:
-            pass
-        return None
-
-    newest_activity = max(str(t.get("last_email_at") or "") for t in threads)
-    stamp = _read_stamp(address)
-    seen_activity = str(stamp.get("seen_activity") or "")
-    last_emit = float(stamp.get("last_emit") or 0)
-
-    is_new = newest_activity > seen_activity
-    is_stale_nag = (now - last_emit) > RE_NAG_SECONDS
-    if not is_new and not is_stale_nag:
-        return None
-
-    count = len(threads)
-    newest = max(threads, key=lambda t: str(t.get("last_email_at") or ""))
-    subject = str(newest.get("subject") or "").strip()
-    if len(subject) > 60:
-        subject = subject[:57] + "…"
-    when = str(newest.get("last_email_at") or "")
-    hhmm = when[11:16] if len(when) >= 16 else when
-    plural = "" if count == 1 else "s"
-    line = (
-        f"[agent-inbox] {count} unread thread{plural} for {address}: "
-        f"'{subject}' (newest {hhmm}). Run: agent-inbox list --unread"
-    )
-    _write_stamp(address, {"seen_activity": newest_activity, "last_emit": now})
-    return line
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if not threads:
+            conn.execute("DELETE FROM hook_stamps WHERE address=?", (address,))
+            conn.commit()
+            return None
+        newest = max(threads, key=lambda t: int(t.get("activity_id") or 0))
+        activity = int(newest.get("activity_id") or 0)
+        row = conn.execute("SELECT * FROM hook_stamps WHERE address=?", (address,)).fetchone()
+        if row and activity <= row["seen_activity"] and now - row["last_emit"] <= RE_NAG_SECONDS:
+            conn.commit()
+            return None
+        subject = str(newest.get("subject") or "").strip()
+        if len(subject) > 60:
+            subject = subject[:57] + "…"
+        when = str(newest.get("last_email_at") or "")
+        hhmm = when[11:16] if len(when) >= 16 else when
+        count = len(threads)
+        plural = "" if count == 1 else "s"
+        line = (f"[agent-inbox] {count} unread thread{plural} for {address}: "
+                f"'{subject}' (newest {hhmm}). Run: agent-inbox list --unread")
+        conn.execute("INSERT INTO hook_stamps VALUES (?,?,?) ON CONFLICT(address) DO UPDATE SET seen_activity=excluded.seen_activity,last_emit=excluded.last_emit",
+                     (address, max(activity, row["seen_activity"] if row else 0), now))
+        conn.commit()
+        return line
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def run_hook_check(output_format: str = "plain", stdin_text: str = "") -> int:

@@ -41,6 +41,30 @@ def derive_project(cwd: Optional[Union[str, Path]] = None) -> str:
     3. Git common worktree or repository root directory name.
     4. Fallback to current working directory name.
     """
+    from agent_inbox.cloudsync import enabled, map_project, repository_identity
+    if enabled():
+        from agent_inbox.db import get_connection
+        working = Path(cwd).resolve() if cwd else Path.cwd().resolve()
+        try:
+            result = subprocess.run(["git", "config", "--get", "remote.origin.url"], cwd=working,
+                                    capture_output=True, text=True, timeout=2, check=False)
+            raw_repo = result.stdout.strip() or str(working)
+        except (OSError, subprocess.TimeoutExpired):
+            raw_repo = str(working)
+        repo = repository_identity(raw_repo)
+        conn = get_connection()
+        try:
+            explicit = os.environ.get("AGENT_INBOX_PROJECT")
+            if explicit:
+                map_project(conn, raw_repo, normalize_slug(explicit))
+            row = conn.execute("SELECT slug FROM project_mappings WHERE repo_identity=?", (repo,)).fetchone()
+            if row is not None:
+                return row[0]
+            # Unmapped local work still works offline. Export is held with an
+            # unresolved_project_mapping reason until explicitly resolved.
+        finally:
+            conn.close()
+
     env_project = os.environ.get("AGENT_INBOX_PROJECT")
     if env_project and env_project.strip():
         return normalize_slug(env_project.strip())

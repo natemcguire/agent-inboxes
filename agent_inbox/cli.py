@@ -121,7 +121,7 @@ def cmd_send(args: argparse.Namespace, client: InboxClient) -> int:
         if args.json:
             print(json.dumps(res, indent=2))
         else:
-            print(f"Sent email {res['email_id']} in thread {res['thread_id']}")
+            print(f"Sent email {res['email_id']} in thread {res['thread_id']} ({res.get('delivery_status', 'local only')})")
         return 0
     except ValueError as e:
         _print_error(str(e), "invalid_argument")
@@ -212,7 +212,7 @@ def cmd_reply(args: argparse.Namespace, client: InboxClient) -> int:
                     thread_subject = ""
             if thread_subject:
                 print(f"Replying in thread: '{thread_subject}'")
-            print(f"Sent reply {res['email_id']} in thread {res['thread_id']}")
+            print(f"Sent reply {res['email_id']} in thread {res['thread_id']} ({res.get('delivery_status', 'local only')})")
         return 0
     except ValueError as e:
         _print_error(str(e), "invalid_argument")
@@ -376,6 +376,27 @@ def _print_reservation_conflicts(conflicts: list) -> None:
 
 
 def cmd_reserve(args: argparse.Namespace, client: InboxClient) -> int:
+    from agent_inbox.cloudsync import enabled, LOCAL_WARNING
+    import contextlib
+    import io
+    if not enabled():
+        return _cmd_reserve(args, client)
+    if not args.json:
+        print(LOCAL_WARNING)
+        return _cmd_reserve(args, client)
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        code = _cmd_reserve(args, client)
+    try:
+        result = json.loads(output.getvalue())
+    except ValueError:
+        result = {"success": False}
+    result["warnings"] = list(dict.fromkeys(result.get("warnings", []) + [LOCAL_WARNING]))
+    print(json.dumps(result, indent=2))
+    return code
+
+
+def _cmd_reserve(args: argparse.Namespace, client: InboxClient) -> int:
     """Acquire advisory reservations: file paths OR named resources (all-or-nothing)."""
     try:
         _, _, address = derive_identity()
@@ -709,31 +730,45 @@ def cmd_hooks(args: argparse.Namespace) -> int:
 
 
 def cmd_cloud(args: argparse.Namespace, client: InboxClient) -> int:
-    """Configure cloud sync without exposing the Bearer token."""
+    """Manage the binding in the selected local database; never accept argv secrets."""
+    from agent_inbox.cloudsync import login, replay, retry_message, sync_status, map_project
+    from agent_inbox.db import get_connection
+    import getpass
     try:
-        if args.cloud_action == "login":
-            cloud = CloudClient(args.url, args.token)
-            cloud.pull(0, limit=1)
-            save_config({"url": cloud.url, "token": args.token, "enabled": True})
-            print("Cloud sync enabled. The service will pick it up within 30 seconds.")
-        elif args.cloud_action == "off":
+        if args.cloud_action == "off":
             config = load_config()
             if config is not None:
                 config["enabled"] = False
                 save_config(config)
             print("Cloud sync disabled. Any in-flight sync may finish.")
-        else:
-            status = client.cloud_status()
-            if args.json:
-                print(json.dumps(status, indent=2))
+            return 0
+        conn = get_connection(args.db)
+        try:
+            if args.cloud_action == "login":
+                secret = sys.stdin.readline().rstrip("\r\n") if args.credential_stdin else getpass.getpass("Website session credential: ")
+                login(conn, args.url, secret)
+                print("Cloud sync enabled. The service will pick it up within 30 seconds.")
+            elif args.cloud_action == "replay":
+                replay(conn)
+                print("Cloud replay queued; local read state is preserved.")
+            elif args.cloud_action == "retry":
+                retry_message(conn, args.message_id)
+                print("Unchanged envelope queued for retry.")
+            elif args.cloud_action == "map":
+                map_project(conn, args.repo, args.project)
+                print("Repository mapping saved.")
             else:
-                print(f"Enabled: {str(status['enabled']).lower()}")
-                print(f"URL: {status['url'] or '(not configured)'}")
-                print(f"Unsynced: {status['unsynced_count']}")
-                print(f"Cursor: {status['last_pulled_seq']}")
+                status = sync_status(conn)
+                if args.json:
+                    print(json.dumps(status, indent=2))
+                else:
+                    for key, value in status.items():
+                        print(f"{key}: {value}")
+        finally:
+            conn.close()
         return 0
-    except InboxError as exc:
-        _print_error(exc.message, exc.code)
+    except (InboxError, ValueError) as exc:
+        _print_error(exc.message if isinstance(exc, InboxError) else str(exc))
         return 1
     except Exception:
         _print_error("Cloud command failed; check cloud configuration and file permissions")
@@ -757,11 +792,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_cloud = subparsers.add_parser("cloud", help="Configure optional cloud mail sync")
     cloud_commands = p_cloud.add_subparsers(dest="cloud_action", required=True)
     p_login = cloud_commands.add_parser("login", help="Verify and save a cloud session token")
-    p_login.add_argument("--token", required=True)
+    p_login.add_argument("--credential-stdin", action="store_true", help="Read website credential from stdin")
     p_login.add_argument("--url", default=DEFAULT_URL)
     p_status = cloud_commands.add_parser("status", help="Show cloud settings and local sync counters")
     p_status.add_argument("--json", action="store_true")
     cloud_commands.add_parser("off", help="Disable cloud sync")
+    p_replay = cloud_commands.add_parser("replay", help="Replay the bound stream")
+    p_retry = cloud_commands.add_parser("retry", help="Retry an unchanged rejected envelope")
+    p_retry.add_argument("message_id")
+    p_map = cloud_commands.add_parser("map", help="Resolve a repository identity to an explicit cloud project slug")
+    p_map.add_argument("--repo", required=True)
+    p_map.add_argument("--project", required=True)
+    for command in (p_login, p_status, p_replay, p_retry, p_map):
+        command.add_argument("--db", help="Local database (defaults to service database)")
 
     # whoami
     p_whoami = subparsers.add_parser("whoami", help="Derive and auto-create active inbox address")

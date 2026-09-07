@@ -84,6 +84,9 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _send_json(self, status: int, data: Dict[str, Any]) -> None:
+        from agent_inbox.cloudsync import enabled, LOCAL_WARNING
+        if self.command == "POST" and self.path.split("?")[0].endswith("/reservations") and enabled():
+            data["warnings"] = [LOCAL_WARNING]
         """Send JSON response with appropriate headers."""
         body = json.dumps(data).encode("utf-8")
         self.send_response(status)
@@ -418,6 +421,8 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     client_token=idempotency_key,
                     sender_session=sender_session,
                 )
+                from agent_inbox.cloudsync import enabled
+                res["delivery_status"] = "queued locally" if enabled() else "local only"
                 self.server.nudge_cloud_sync()
                 if from_addr:
                     self._touch_session(service, from_addr)
@@ -445,6 +450,8 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     cc_addrs=cc_addrs,
                     sender_session=sender_session,
                 )
+                from agent_inbox.cloudsync import enabled
+                res["delivery_status"] = "queued locally" if enabled() else "local only"
                 self.server.nudge_cloud_sync()
                 if from_addr:
                     self._touch_session(service, from_addr)

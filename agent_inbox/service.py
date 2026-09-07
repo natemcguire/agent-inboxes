@@ -421,6 +421,8 @@ class InboxService:
             raise ValidationError("missing_idempotency_key", "Idempotency-Key header is required")
 
         client_token = client_token.strip()
+        if client_token.startswith("cloud-import:v1:"):
+            raise ValidationError("reserved_client_token", "cloud-import:v1: is reserved for cloud imports")
 
         # Check existing idempotency
         existing = self.conn.execute(
@@ -533,7 +535,7 @@ class InboxService:
             all_participant_ids = {from_inbox_id} | {i_id for _, i_id in to_inbox_ids} | {i_id for _, i_id in cc_inbox_ids}
             for p_id in all_participant_ids:
                 self.conn.execute(
-                    "INSERT OR IGNORE INTO thread_inboxes (thread_id, inbox_id, joined_at) VALUES (?, ?, ?)",
+                    "INSERT INTO thread_inboxes (thread_id, inbox_id, joined_at) VALUES (?, ?, ?) ON CONFLICT(thread_id,inbox_id) DO UPDATE SET joined_at=MIN(joined_at,excluded.joined_at)",
                     (thread_id, p_id, sent_at),
                 )
 
@@ -566,6 +568,8 @@ class InboxService:
             raise ValidationError("missing_idempotency_key", "Idempotency-Key header is required")
 
         client_token = client_token.strip()
+        if client_token.startswith("cloud-import:v1:"):
+            raise ValidationError("reserved_client_token", "cloud-import:v1: is reserved for cloud imports")
 
         # Check existing idempotency
         existing = self.conn.execute(
@@ -775,11 +779,11 @@ class InboxService:
             all_participant_ids = {from_inbox_id} | {i_id for _, i_id in to_inbox_ids} | {i_id for _, i_id in cc_inbox_ids}
             for p_id in all_participant_ids:
                 self.conn.execute(
-                    "INSERT OR IGNORE INTO thread_inboxes (thread_id, inbox_id, joined_at) VALUES (?, ?, ?)",
+                    "INSERT INTO thread_inboxes (thread_id, inbox_id, joined_at) VALUES (?, ?, ?) ON CONFLICT(thread_id,inbox_id) DO UPDATE SET joined_at=MIN(joined_at,excluded.joined_at)",
                     (thread_id, p_id, sent_at),
                 )
 
-            self.conn.execute("UPDATE threads SET last_email_at = ? WHERE id = ?", (sent_at, thread_id))
+            self.conn.execute("UPDATE threads SET last_email_at = MAX(last_email_at, ?) WHERE id = ?", (sent_at, thread_id))
 
             self.conn.commit()
             return {
@@ -806,11 +810,11 @@ class InboxService:
         # Find threads joined by this inbox
         thread_rows = self.conn.execute(
             """
-            SELECT t.id, t.subject, t.created_at, t.last_email_at
+            SELECT t.id, t.subject, t.created_at, t.last_email_at, t.activity_id
             FROM threads t
             JOIN thread_inboxes ti ON t.id = ti.thread_id
             WHERE ti.inbox_id = ?
-            ORDER BY t.last_email_at DESC, t.id DESC
+            ORDER BY t.activity_id DESC, t.id DESC
             """,
             (inbox_id,),
         ).fetchall()
@@ -864,6 +868,7 @@ class InboxService:
                 "subject": t["subject"],
                 "participants": participants,
                 "last_email_at": t["last_email_at"],
+                "activity_id": t["activity_id"],
                 "unread_count": unread_count,
             })
 

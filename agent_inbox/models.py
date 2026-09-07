@@ -4,8 +4,8 @@ import datetime
 import re
 import uuid
 
-SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
-ADDRESS_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}@[a-z0-9][a-z0-9-]{0,62}$")
+SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+ADDRESS_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}@[a-z0-9][a-z0-9._-]{0,127}$")
 
 
 class InboxError(Exception):
@@ -55,35 +55,37 @@ class ServerNotRunningError(InboxError):
 
 
 def is_valid_slug(slug: str) -> bool:
-    """Return True if slug matches [a-z0-9][a-z0-9-]{0,62}."""
+    """Return True if slug matches [a-z0-9][a-z0-9._-]{0,127}."""
     if not isinstance(slug, str):
         return False
-    return bool(SLUG_PATTERN.match(slug.lower()))
+    return bool(SLUG_PATTERN.fullmatch(slug.lower()))
 
 
 def is_valid_address(address: str) -> bool:
     """Return True if address matches <agent-slug>@<project-slug>."""
     if not isinstance(address, str):
         return False
-    return bool(ADDRESS_PATTERN.match(address.lower()))
+    return bool(ADDRESS_PATTERN.fullmatch(address.lower()))
 
 
 def normalize_slug(raw: str) -> str:
     """
     Sanitize and canonicalize a raw string into a valid slug.
-    Lowercases, replaces spaces/underscores/dots with dashes, trims leading dashes,
-    removes disallowed chars, and caps length at 63.
+    Preserves canonical dots and underscores, lowercases, replaces spaces with
+    dashes, removes disallowed chars, and caps length at 128.
     """
     if not raw:
         return "unknown"
     s = raw.lower().strip()
-    s = re.sub(r"[\s_.]+", "-", s)
-    s = re.sub(r"[^a-z0-9-]", "", s)
+    if SLUG_PATTERN.fullmatch(s):
+        return s
+    s = re.sub(r"\s+", "-", s)
+    s = re.sub(r"[^a-z0-9._-]", "", s)
     s = re.sub(r"-+", "-", s)
-    s = s.strip("-")
+    s = s.strip("-._")
     if not s or not s[0].isalnum():
         s = f"a{s}"
-    s = s[:63]
+    s = s[:128]
     return s
 
 
@@ -92,7 +94,7 @@ def normalize_address(raw: str) -> str:
     if not raw or not isinstance(raw, str):
         raise ValidationError("invalid_address", "Address must be a non-empty string")
     clean = raw.strip().lower()
-    if not ADDRESS_PATTERN.match(clean):
+    if not ADDRESS_PATTERN.fullmatch(clean):
         raise ValidationError("invalid_address", f"Address '{raw}' is invalid. Must match <agent-slug>@<project-slug>")
     return clean
 
