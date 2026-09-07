@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -18,14 +19,14 @@ from agent_inbox.config import (
     get_port,
     get_server_url,
 )
-from agent_inbox.identity import derive_identity, derive_project
+from agent_inbox.identity import derive_agent, derive_identity, derive_project, derive_session
 from agent_inbox.launchagent import (
     install_launchagent,
     load_launchagent,
     uninstall_launchagent,
 )
 from agent_inbox.models import InboxError, ServerNotRunningError
-from agent_inbox.project_setup import setup_project
+from agent_inbox.project_setup import ONBOARDING_PROMPT, copy_to_clipboard, setup_global, setup_project
 from agent_inbox.server import run_server
 
 
@@ -52,7 +53,7 @@ def _read_body(body_arg: Optional[str], body_file_arg: Optional[str]) -> str:
 
 
 def cmd_whoami(args: argparse.Namespace, client: InboxClient) -> int:
-    """Print and auto-create the derived inbox address."""
+    """Print and auto-create the derived inbox address and session id."""
     try:
         _, _, address = derive_identity()
         res = client.put_inbox(address)
@@ -60,6 +61,16 @@ def cmd_whoami(args: argparse.Namespace, client: InboxClient) -> int:
             print(json.dumps(res, indent=2))
         else:
             print(address)
+            session_id = res.get("session_id") or client.session_id
+            if session_id:
+                print(f"session: {session_id}")
+            others = (res.get("active_sessions") or 1) - 1
+            if others > 0:
+                plural = "s are" if others != 1 else " is"
+                print(
+                    f"note: {others} other session{plural} currently active on {address} — "
+                    f"you are not the only agent at this address."
+                )
         return 0
     except InboxError as e:
         _print_error(e.message, e.code)
@@ -216,8 +227,10 @@ def cmd_read(args: argparse.Namespace, client: InboxClient) -> int:
                 to_str = ", ".join(eml["to"])
                 cc_str = f" | CC: {', '.join(eml['cc'])}" if eml["cc"] else ""
                 read_status = "" if eml["read"] else " [UNREAD]"
+                sess = eml.get("sender_session")
+                from_str = f"{eml['from']} (session {sess})" if sess else eml["from"]
                 print(f"Email ID: {eml['email_id']}{read_status}")
-                print(f"From:     {eml['from']}")
+                print(f"From:     {from_str}")
                 print(f"To:       {to_str}{cc_str}")
                 print(f"Date:     {eml['sent_at']}")
                 print("-" * 60)
@@ -257,8 +270,59 @@ def cmd_inboxes(args: argparse.Namespace, client: InboxClient) -> int:
             print(f"Inboxes ({project or 'all'}):")
             for ib in inboxes:
                 name_str = f" ({ib['display_name']})" if ib["display_name"] else ""
-                print(f"• {ib['address']}{name_str} [last seen: {ib['last_seen_at'] or 'never'}]")
+                n_sessions = ib.get("active_sessions") or 0
+                sess_str = f" [{n_sessions} active session{'s' if n_sessions != 1 else ''}]" if n_sessions > 0 else ""
+                print(f"• {ib['address']}{name_str}{sess_str} [last seen: {ib['last_seen_at'] or 'never'}]")
         return 0
+    except InboxError as e:
+        _print_error(e.message, e.code)
+        return 1
+    except Exception as e:
+        _print_error(str(e))
+        return 1
+
+
+def cmd_watch(args: argparse.Namespace, client: InboxClient) -> int:
+    """Block until new unread mail arrives (long-poll), then print a summary.
+
+    Designed to run as a background task whose exit wakes a coding agent:
+    exit 0 = mail arrived, exit 3 = timed out with no mail, exit 1 = error.
+    """
+    try:
+        address = args.for_addr
+        if not address:
+            _, _, address = derive_identity()
+
+        overall = max(1.0, float(args.timeout))
+        deadline = time.monotonic() + overall
+        res = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # Each long-poll leg is capped at the server max (300s).
+            leg = min(60.0, remaining)
+            res = client.watch(address, timeout=leg, after=args.after)
+            if res.get("changed"):
+                break
+
+        if res and res.get("changed"):
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                latest = res.get("latest") or {}
+                print(f"New mail for {address}: {res.get('unread_count', 0)} unread")
+                if latest:
+                    print(f"Latest: {latest.get('subject')} — from {latest.get('from')} "
+                          f"(thread {latest.get('thread_id')}, {latest.get('sent_at')})")
+                print(f"Run: agent-inbox list --unread")
+            return 0
+
+        if args.json:
+            print(json.dumps(res or {"changed": False}, indent=2))
+        else:
+            print(f"No new mail for {address} within {int(overall)}s.")
+        return 3
     except InboxError as e:
         _print_error(e.message, e.code)
         return 1
@@ -286,6 +350,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
         else:
             print("LaunchAgent plist installed. If not running on macOS, launch with `agent-inbox serve`.")
 
+        for runtime, target, status in setup_global():
+            print(f"Global instructions [{runtime}] {target}: {status}")
+
         # Test healthz
         client = InboxClient()
         try:
@@ -307,7 +374,65 @@ def cmd_setup_project(args: argparse.Namespace) -> int:
         updated = setup_project(target_dir)
         for f in updated:
             print(f"Updated instructions in {f}")
+        if getattr(args, "copy", False):
+            if copy_to_clipboard(ONBOARDING_PROMPT):
+                print("Onboarding prompt copied to clipboard.", file=sys.stderr)
+            else:
+                print("Clipboard copy unavailable on this platform.", file=sys.stderr)
         return 0
+    except Exception as e:
+        _print_error(str(e))
+        return 1
+
+
+def cmd_setup_global(args: argparse.Namespace) -> int:
+    """Insert or update the managed block in the user-global instruction files."""
+    try:
+        for runtime, target, status in setup_global():
+            print(f"Global instructions [{runtime}] {target}: {status}")
+        return 0
+    except Exception as e:
+        _print_error(str(e))
+        return 1
+
+
+def cmd_prompt(args: argparse.Namespace) -> int:
+    """Print (and optionally copy) the compact agent onboarding prompt."""
+    print(ONBOARDING_PROMPT)
+    if getattr(args, "copy", False):
+        if copy_to_clipboard(ONBOARDING_PROMPT):
+            print("Copied to clipboard.", file=sys.stderr)
+        else:
+            print("Clipboard copy unavailable on this platform.", file=sys.stderr)
+    return 0
+
+
+def cmd_claim(args: argparse.Namespace, client: InboxClient) -> int:
+    """Claim (or release) a unique agent slot for concurrent same-family agents.
+
+    Success prints exactly `export AGENT_INBOX_AGENT=<slot>` on stdout so callers
+    can `eval "$(agent-inbox claim)"`; human commentary goes to stderr.
+    """
+    try:
+        project = derive_project()
+        if getattr(args, "release", False):
+            agent = derive_agent()
+            result = client.release_lease(agent, project)
+            verb = "Released" if result.get("released") else "No active lease for"
+            print(f"{verb} {agent}@{project}.", file=sys.stderr)
+            return 0
+        family = args.family or derive_agent()
+        # A family like "claude-2" from an inherited env var collapses to its base
+        # so re-claiming from a stale shell still yields the lowest free slot.
+        base = family.rsplit("-", 1)[0] if family.rsplit("-", 1)[-1].isdigit() else family
+        result = client.claim_lease(base, project)
+        slot = result["agent"]
+        print(f"export AGENT_INBOX_AGENT={slot}")
+        print(f"Claimed {slot}@{project} (lease expires after 2h idle; release with `agent-inbox claim --release`).", file=sys.stderr)
+        return 0
+    except InboxError as e:
+        _print_error(str(e))
+        return 1
     except Exception as e:
         _print_error(str(e))
         return 1
@@ -373,6 +498,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_read.add_argument("--no-mark-read", action="store_true", help="Do not mark emails as read")
     p_read.add_argument("--json", action="store_true", help="Output JSON")
 
+    # watch
+    p_watch = subparsers.add_parser("watch", help="Block until new unread mail arrives (long-poll push subscription)")
+    p_watch.add_argument("--timeout", type=float, default=300.0, help="Overall seconds to wait before exiting 3 (default: 300)")
+    p_watch.add_argument("--for", dest="for_addr", help="Inbox address to watch (defaults to derived identity)")
+    p_watch.add_argument("--after", type=int, default=None, help="Only wake for mail newer than this cursor (from a previous watch response)")
+    p_watch.add_argument("--json", action="store_true", help="Output JSON")
+
     # inboxes
     p_inboxes = subparsers.add_parser("inboxes", help="List registered inboxes")
     p_inboxes.add_argument("--project", help="Filter by project slug (defaults to current project)")
@@ -380,11 +512,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_inboxes.add_argument("--json", action="store_true", help="Output JSON")
 
     # setup
-    subparsers.add_parser("setup", help="Set up data directory and register macOS LaunchAgent")
+    p_setup = subparsers.add_parser("setup", help="Set up data directory, register macOS LaunchAgent, and install global agent instructions")
+    p_setup.add_argument("--global", dest="global_only", action="store_true", help="Only install the managed block into ~/.claude/CLAUDE.md")
 
     # setup-project
     p_proj = subparsers.add_parser("setup-project", help="Add instruction block to AGENTS.md / CLAUDE.md")
     p_proj.add_argument("--dir", help="Target project root directory (default: current directory)")
+    p_proj.add_argument("--copy", action="store_true", help="Also copy the onboarding prompt to the clipboard")
+
+    # prompt
+    p_prompt = subparsers.add_parser("prompt", help="Print the compact agent onboarding prompt")
+    p_prompt.add_argument("--copy", action="store_true", help="Also copy the prompt to the clipboard (macOS)")
+
+    # claim
+    p_claim = subparsers.add_parser("claim", help="Claim a unique agent slot for concurrent same-family agents; use with eval \"$(agent-inbox claim)\"")
+    p_claim.add_argument("family", nargs="?", default=None, help="Runtime family to claim (default: detected family)")
+    p_claim.add_argument("--release", action="store_true", help="Release this agent's lease")
 
     return parser
 
@@ -398,7 +541,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         parser.print_help(sys.stderr)
         return 1
 
-    client = InboxClient()
+    # Every CLI interaction identifies its agent session so the service can
+    # distinguish concurrent same-family agents sharing one inbox address.
+    client = InboxClient(session_id=derive_session())
 
     if args.command == "whoami":
         return cmd_whoami(args, client)
@@ -412,12 +557,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_list(args, client)
     elif args.command == "read":
         return cmd_read(args, client)
+    elif args.command == "watch":
+        return cmd_watch(args, client)
     elif args.command == "inboxes":
         return cmd_inboxes(args, client)
     elif args.command == "setup":
+        if getattr(args, "global_only", False):
+            return cmd_setup_global(args)
         return cmd_setup(args)
     elif args.command == "setup-project":
         return cmd_setup_project(args)
+    elif args.command == "prompt":
+        return cmd_prompt(args)
+    elif args.command == "claim":
+        return cmd_claim(args, client)
 
     return 0
 

@@ -51,7 +51,17 @@ CREATE TABLE IF NOT EXISTS emails (
   body_markdown     TEXT NOT NULL,
   reply_to_email_id TEXT REFERENCES emails(id),
   client_token      TEXT NOT NULL UNIQUE,
-  sent_at           TEXT NOT NULL
+  sent_at           TEXT NOT NULL,
+  sender_session    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  inbox_id      INTEGER NOT NULL REFERENCES inboxes(id) ON DELETE CASCADE,
+  session_id    TEXT NOT NULL,
+  pid           INTEGER,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at  TEXT NOT NULL,
+  PRIMARY KEY (inbox_id, session_id)
 );
 
 CREATE TABLE IF NOT EXISTS email_recipients (
@@ -71,9 +81,18 @@ CREATE TABLE IF NOT EXISTS email_references (
   UNIQUE (email_id, referenced_email_id)
 );
 
+CREATE TABLE IF NOT EXISTS agent_leases (
+  agent_slug   TEXT NOT NULL COLLATE NOCASE,
+  project_slug TEXT NOT NULL COLLATE NOCASE,
+  claimed_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  last_seen    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (agent_slug, project_slug)
+);
+
 CREATE INDEX IF NOT EXISTS idx_emails_thread_sent ON emails(thread_id, sent_at, id);
 CREATE INDEX IF NOT EXISTS idx_recipients_unread ON email_recipients(inbox_id, read_at, email_id);
 CREATE INDEX IF NOT EXISTS idx_threads_activity ON threads(last_email_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions(last_seen_at);
 """
 
 
@@ -145,5 +164,17 @@ def get_connection(db_path: Union[str, Path, None] = None) -> sqlite3.Connection
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """Initialize database tables and indexes."""
+    """Initialize database tables and indexes, then apply in-place upgrades.
+
+    ``SCHEMA_SQL`` uses ``CREATE ... IF NOT EXISTS`` throughout, so a database
+    created by an older version keeps its existing tables. Columns added after
+    v1 are applied via guarded ``ALTER TABLE`` so existing databases upgrade in
+    place; fresh databases already contain them from the schema above.
+    """
     conn.executescript(SCHEMA_SQL)
+
+    # v1.1: emails.sender_session (nullable) — stamps which agent session sent
+    # an email when several same-family agents share one inbox address.
+    email_columns = {row[1] for row in conn.execute("PRAGMA table_info(emails)")}
+    if "sender_session" not in email_columns:
+        conn.execute("ALTER TABLE emails ADD COLUMN sender_session TEXT")

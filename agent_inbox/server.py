@@ -2,9 +2,11 @@
 
 import json
 import sqlite3
+import threading
+import time
 import urllib.parse
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 
 from agent_inbox import __version__
@@ -114,13 +116,53 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
             raise ValidationError("missing_idempotency_key", "Idempotency-Key header is required")
         return key.strip()
 
+    def _touch_actor(self) -> None:
+        """Refresh the caller's agent lease from the X-Agent-Address header.
+        Best-effort: only updates existing leases, never fails a request."""
+        try:
+            addr = self.headers.get("X-Agent-Address", "").strip()
+            if addr and "@" in addr:
+                agent, project = addr.split("@", 1)
+                self._get_service().touch_lease(agent, project)
+        except Exception:
+            pass
+
     def _get_service(self) -> InboxService:
-        """Get InboxService attached to server's DB connection."""
-        return InboxService(self.server.db_conn)
+        """Get InboxService attached to this request thread's DB connection."""
+        return InboxService(self.server.get_thread_connection())
+
+    def _get_session_id(self) -> Optional[str]:
+        """Optional X-Agent-Session header identifying the calling agent session."""
+        sid = self.headers.get("X-Agent-Session")
+        if sid and sid.strip():
+            return sid.strip()[:64]
+        return None
+
+    def _get_session_pid(self) -> Optional[int]:
+        """Optional X-Agent-Pid header (best-effort, informational)."""
+        raw = self.headers.get("X-Agent-Pid")
+        if raw:
+            try:
+                return int(raw.strip())
+            except ValueError:
+                pass
+        return None
+
+    def _touch_session(self, service: InboxService, address: str) -> Optional[str]:
+        """Record session activity for the acting address if a session header
+        is present. Returns the session id (or None). Never fails the request."""
+        sid = self._get_session_id()
+        if sid:
+            try:
+                service.touch_session(address, sid, pid=self._get_session_pid())
+            except InboxError:
+                return None
+        return sid
 
     def do_GET(self) -> None:
         """Route GET requests."""
         try:
+            self._touch_actor()
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
             query = urllib.parse.parse_qs(parsed.query)
@@ -129,7 +171,7 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
             if path == "/healthz":
                 # Check DB responsiveness
                 try:
-                    self.server.db_conn.execute("SELECT 1").fetchone()
+                    self.server.get_thread_connection().execute("SELECT 1").fetchone()
                     db_status = "ok"
                 except Exception:
                     db_status = "error"
@@ -153,9 +195,38 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
             if len(parts) >= 3 and parts[0] == "v1" and parts[1] == "inboxes":
                 address = parts[2]
                 
+                # /v1/inboxes/{address}/watch — long-poll for new unread mail.
+                # Blocks this request's worker thread only (the server is
+                # threaded with per-thread DB connections), polling SQLite
+                # about once per second until new unread mail newer than the
+                # `after` cursor arrives or the timeout elapses.
+                if len(parts) == 4 and parts[3] == "watch":
+                    service = self._get_service()
+                    try:
+                        timeout = float(query.get("timeout", ["60"])[0])
+                    except ValueError:
+                        timeout = 60.0
+                    timeout = max(0.0, min(timeout, 300.0))
+                    try:
+                        after = int(query.get("after", ["0"])[0])
+                    except ValueError:
+                        after = 0
+
+                    self._touch_session(service, address)
+                    deadline = time.monotonic() + timeout
+                    while True:
+                        state = service.watch_state(address, after=after)
+                        remaining = deadline - time.monotonic()
+                        if state["changed"] or remaining <= 0:
+                            break
+                        time.sleep(min(1.0, remaining))
+                    self._send_json(HTTPStatus.OK, state)
+                    return
+
                 # /v1/inboxes/{address}/threads
                 if len(parts) == 4 and parts[3] == "threads":
                     service = self._get_service()
+                    self._touch_session(service, address)
                     unread_val = query.get("unread", ["false"])[0].lower()
                     unread_only = unread_val in ("true", "1", "yes")
                     limit_str = query.get("limit", ["50"])[0]
@@ -171,6 +242,7 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                 if len(parts) == 5 and parts[3] == "threads":
                     thread_id = parts[4]
                     service = self._get_service()
+                    self._touch_session(service, address)
                     thread_data = service.get_thread(address, thread_id)
                     self._send_json(HTTPStatus.OK, thread_data)
                     return
@@ -187,6 +259,7 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:
         """Route PUT requests."""
         try:
+            self._touch_actor()
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
             parts = [urllib.parse.unquote(p) for p in path.strip("/").split("/")]
@@ -198,6 +271,10 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                 display_name = body.get("display_name")
                 service = self._get_service()
                 result = service.ensure_inbox(address, display_name=display_name)
+                sid = self._touch_session(service, address)
+                if sid:
+                    result["session_id"] = sid
+                    result["active_sessions"] = len(service.active_sessions(address))
                 status = HTTPStatus.CREATED if result["created"] else HTTPStatus.OK
                 self._send_json(status, result)
                 return
@@ -214,9 +291,24 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         """Route POST requests."""
         try:
+            self._touch_actor()
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
             parts = [urllib.parse.unquote(p) for p in path.strip("/").split("/")]
+
+            # POST /v1/leases/claim | /v1/leases/release
+            if path == "/v1/leases/claim":
+                body = self._read_json_body()
+                service = self._get_service()
+                result = service.claim_agent(body.get("family", ""), body.get("project", ""))
+                self._send_json(HTTPStatus.OK, result)
+                return
+            if path == "/v1/leases/release":
+                body = self._read_json_body()
+                service = self._get_service()
+                result = service.release_agent(body.get("agent", ""), body.get("project", ""))
+                self._send_json(HTTPStatus.OK, result)
+                return
 
             # POST /v1/emails
             if path == "/v1/emails":
@@ -229,6 +321,7 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                 body_markdown = body.get("body_markdown", "")
 
                 service = self._get_service()
+                sender_session = self._get_session_id()
                 res = service.send_email(
                     from_addr=from_addr,
                     to_addrs=to_addrs,
@@ -236,7 +329,10 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     subject=subject,
                     body_markdown=body_markdown,
                     client_token=idempotency_key,
+                    sender_session=sender_session,
                 )
+                if from_addr:
+                    self._touch_session(service, from_addr)
                 self._send_json(HTTPStatus.CREATED, res)
                 return
 
@@ -251,6 +347,7 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                 cc_addrs = body.get("cc")
 
                 service = self._get_service()
+                sender_session = self._get_session_id()
                 res = service.reply_email(
                     reply_to_email_id=email_id,
                     from_addr=from_addr,
@@ -258,7 +355,10 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     client_token=idempotency_key,
                     to_addrs=to_addrs,
                     cc_addrs=cc_addrs,
+                    sender_session=sender_session,
                 )
+                if from_addr:
+                    self._touch_session(service, from_addr)
                 self._send_json(HTTPStatus.CREATED, res)
                 return
 
@@ -267,6 +367,7 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                 address = parts[2]
                 thread_id = parts[4]
                 service = self._get_service()
+                self._touch_session(service, address)
                 count = service.mark_thread_read(address, thread_id)
                 self._send_json(HTTPStatus.OK, {
                     "thread_id": thread_id,
@@ -284,13 +385,48 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
             })
 
 
-class AgentInboxServer(HTTPServer):
-    """Custom HTTPServer maintaining SQLite connection."""
+class AgentInboxServer(ThreadingHTTPServer):
+    """Threaded HTTP server with one SQLite connection per request thread.
+
+    The server must be threaded so a blocked long-poll ``watch`` request cannot
+    freeze other requests. SQLite connections are NOT safe for interleaved
+    transactions across threads, so each request thread lazily opens its own
+    connection (``threading.local``) to the same database file; WAL mode plus
+    the 5000ms busy timeout make concurrent readers/writers safe. The ``db_conn``
+    passed by the caller is kept for lifecycle compatibility (tests/serve close
+    it) and to resolve the database file path.
+    """
+
+    daemon_threads = True
 
     def __init__(self, server_address: Tuple[str, int], db_conn: sqlite3.Connection, verbose: bool = False):
         super().__init__(server_address, InboxRequestHandler)
         self.db_conn = db_conn
         self.verbose = verbose
+        # Resolve the backing database file so per-thread connections can be
+        # opened against it. PRAGMA database_list reports (seq, name, file).
+        db_file = None
+        for row in db_conn.execute("PRAGMA database_list").fetchall():
+            if row[1] == "main":
+                db_file = row[2]
+                break
+        self.db_path = db_file if db_file else None
+        self._thread_db = threading.local()
+
+    def get_thread_connection(self) -> sqlite3.Connection:
+        """Return this thread's SQLite connection, opening it on first use.
+
+        Falls back to the shared ``db_conn`` only for a non-file (in-memory)
+        database, where a second connection would not see the same data.
+        Per-thread connections are closed by GC when their request thread dies.
+        """
+        if not self.db_path:
+            return self.db_conn
+        conn = getattr(self._thread_db, "conn", None)
+        if conn is None:
+            conn = get_connection(self.db_path)
+            self._thread_db.conn = conn
+        return conn
 
 
 # The service is unauthenticated by design and MUST stay on the loopback

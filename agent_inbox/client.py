@@ -1,6 +1,7 @@
 """HTTP client library for Agent Inboxes communicating over loopback."""
 
 import json
+import os
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -20,8 +21,12 @@ from agent_inbox.models import (
 class InboxClient:
     """Client for interacting with local Agent Inboxes service via HTTP."""
 
-    def __init__(self, base_url: Optional[str] = None):
+    def __init__(self, base_url: Optional[str] = None, session_id: Optional[str] = None):
         self.base_url = (base_url or get_server_url()).rstrip("/")
+        # Optional short session slug identifying THIS agent session; sent as
+        # X-Agent-Session so the service can distinguish concurrent same-family
+        # agents sharing one inbox address.
+        self.session_id = session_id
 
     def _request(
         self,
@@ -30,6 +35,7 @@ class InboxClient:
         body: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
         query: Optional[Dict[str, Any]] = None,
+        timeout: float = 10.0,
     ) -> Dict[str, Any]:
         """Perform HTTP request and return parsed JSON response."""
         full_path = path
@@ -42,6 +48,13 @@ class InboxClient:
         req_headers = {
             "Accept": "application/json",
         }
+        # Identify the calling agent so the server can refresh its lease. Best-effort:
+        # identity derivation must never block a request.
+        try:
+            from agent_inbox.identity import derive_identity
+            req_headers["X-Agent-Address"] = derive_identity()[2]
+        except Exception:
+            pass
         if headers:
             req_headers.update(headers)
 
@@ -53,7 +66,7 @@ class InboxClient:
         req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
 
         try:
-            with urllib.request.urlopen(req, timeout=10.0) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 resp_body = resp.read().decode("utf-8")
                 if not resp_body.strip():
                     return {}
@@ -83,6 +96,14 @@ class InboxClient:
                 f"Local agent-inbox service is not reachable at {self.base_url}. "
                 "Start it with `agent-inbox serve` or `agent-inbox setup`."
             ) from e
+
+    def claim_lease(self, family: str, project: str) -> Dict[str, Any]:
+        """Claim the lowest free agent slot for a runtime family in a project."""
+        return self._request("POST", "/v1/leases/claim", body={"family": family, "project": project})
+
+    def release_lease(self, agent: str, project: str) -> Dict[str, Any]:
+        """Release this agent's lease so the slot frees immediately."""
+        return self._request("POST", "/v1/leases/release", body={"agent": agent, "project": project})
 
     def healthz(self) -> Dict[str, Any]:
         """Check service health."""
@@ -163,6 +184,25 @@ class InboxClient:
         """Fetch complete thread details without mutating read state."""
         encoded_addr = urllib.parse.quote(address, safe="@")
         return self._request("GET", f"/v1/inboxes/{encoded_addr}/threads/{thread_id}")
+
+    def watch(
+        self,
+        address: str,
+        timeout: float = 60.0,
+        after: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Long-poll for new unread mail. Blocks up to ``timeout`` seconds
+        (server clamps to 0–300) and returns the watch state either way."""
+        encoded_addr = urllib.parse.quote(address, safe="@")
+        query: Dict[str, Any] = {"timeout": int(timeout)}
+        if after is not None:
+            query["after"] = int(after)
+        return self._request(
+            "GET",
+            f"/v1/inboxes/{encoded_addr}/watch",
+            query=query,
+            timeout=timeout + 10.0,
+        )
 
     def mark_thread_read(self, address: str, thread_id: str) -> Dict[str, Any]:
         """Mark every email in thread as read for the inbox."""

@@ -10,7 +10,9 @@ END_MARKER = "<!-- agent-inboxes:end -->"
 MANAGED_BLOCK = """<!-- agent-inboxes:start -->
 ## Agent Inboxes
 
-Use the local `agent-inbox` CLI for durable coordination with agents in other sessions, worktrees, or projects. Your address is `<agent>@<project>`: the project is derived from Git, and the agent name comes from `AGENT_INBOX_AGENT` or your runtime family. Run `agent-inbox whoami` before using it. Concurrent agents of the same family in one project must be launched with unique names such as `AGENT_INBOX_AGENT=codex-worker1`.
+If the `agent-inbox` command is not installed on this machine, ignore this section.
+
+Use the local `agent-inbox` CLI for durable coordination with agents in other sessions, worktrees, or projects. Your address is `<agent>@<project>`: the project is derived from Git, and the agent name comes from `AGENT_INBOX_AGENT` or your runtime family. Run `agent-inbox whoami` before using it. When several agents of the same family may run concurrently in one project, claim a unique slot at session start with `eval "$(agent-inbox claim)"` — it assigns the lowest free name (`claude`, `claude-2`, `claude-3`, ...) and the lease expires after 2 hours idle.
 
 Polling checkpoints:
 - At session start, run `agent-inbox list --unread` and handle relevant mail before new work.
@@ -28,6 +30,7 @@ Send mail for cross-session requests, blockers, handoffs, decisions that change 
 Agent Inboxes never reserves files or grants permission to edit them. Use the separate NB-7 file reservation system for write-lock coordination; a message about a file is not a lock.
 
 Core commands:
+`eval "$(agent-inbox claim)"` (concurrent same-family agents, at session start)
 `agent-inbox send --to <address> --subject "<topic>" --body-file <path-or->`
 `agent-inbox list --unread`
 `agent-inbox read <thread-id>`
@@ -76,3 +79,63 @@ def setup_project(target_dir: Optional[Union[str, Path]] = None) -> List[Path]:
             updated.append(f)
 
     return updated
+
+
+def inject_into_file(path: Path) -> bool:
+    """Idempotently ensure one file carries the managed block. Creates the file
+    (and parent directory) when missing. Returns True when the file changed."""
+    path = Path(path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    orig = path.read_text(encoding="utf-8") if path.exists() else ""
+    new_content = inject_or_replace_block(orig)
+    if new_content != orig:
+        path.write_text(new_content, encoding="utf-8")
+        return True
+    return False
+
+
+# Global instruction-file conventions per agent runtime. A runtime participates
+# when its config directory exists on this machine; the instructions file is
+# created inside it when missing. The block text is runtime-neutral.
+GLOBAL_INSTRUCTION_TARGETS = (
+    ("Claude Code", Path.home() / ".claude", "CLAUDE.md"),
+    ("Codex CLI", Path.home() / ".codex", "AGENTS.md"),
+    ("Gemini CLI", Path.home() / ".gemini", "GEMINI.md"),
+)
+
+
+def setup_global() -> List[tuple]:
+    """Ensure every installed agent runtime's global instruction file carries the
+    managed block, so all projects pick up the mailbox protocol without per-repo
+    setup. Returns (runtime, path, status) tuples; status is 'updated',
+    'unchanged', or 'skipped' (config directory absent)."""
+    results: List[tuple] = []
+    for runtime, config_dir, filename in GLOBAL_INSTRUCTION_TARGETS:
+        if not config_dir.is_dir():
+            results.append((runtime, config_dir / filename, "skipped"))
+            continue
+        changed = inject_into_file(config_dir / filename)
+        results.append((runtime, config_dir / filename, "updated" if changed else "unchanged"))
+    return results
+
+
+ONBOARDING_PROMPT = """This machine runs Agent Inboxes, a local mail service for coding agents (http://127.0.0.1:8791).
+Your address is <agent>@<project>, derived automatically - run `agent-inbox whoami` to see and create it.
+If agents of your family may run concurrently in this project, first run `eval "$(agent-inbox claim)"` to take a unique slot (claude, claude-2, ...; lease expires after 2h idle).
+Protocol: run `agent-inbox list --unread` at session start and before any task over ~10 minutes; handle relevant mail first.
+Send cross-session requests, blockers, handoffs and completion notices with
+`agent-inbox send --to <address> --subject "<topic>" --body-file -` and use `agent-inbox reply <email-id> --body-file -` on existing threads.
+Do not send routine progress chatter. A message about a file is not a write lock."""
+
+
+def copy_to_clipboard(text: str) -> bool:
+    """Copy text to the macOS clipboard. Best-effort; returns success."""
+    import subprocess
+    import sys as _sys
+    if _sys.platform != "darwin":
+        return False
+    try:
+        subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True, timeout=5)
+        return True
+    except Exception:
+        return False

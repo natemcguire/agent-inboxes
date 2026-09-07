@@ -1,5 +1,6 @@
 """Identity derivation for Agent Inboxes."""
 
+import hashlib
 import os
 import subprocess
 from pathlib import Path
@@ -109,6 +110,58 @@ def derive_agent() -> str:
         return "claude"
 
     return "agent"
+
+
+# Environment variables that carry a runtime-provided session identifier.
+# Checked in order after the explicit AGENT_INBOX_SESSION override.
+_RUNTIME_SESSION_ENV_KEYS = (
+    "CLAUDE_SESSION_ID",
+    "CODEX_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "ORCA_SESSION_ID",
+    "ORCA_TASK_ID",
+)
+
+
+def _short_session_hash(value: str) -> str:
+    """Stable short lowercase session slug of the form s-3f9a1c2b."""
+    return "s-" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+
+
+def derive_session() -> str:
+    """
+    Derive a short session identifier distinguishing concurrent agents that
+    share the same inbox address (e.g. two Claude sessions in one project):
+    1. AGENT_INBOX_SESSION environment variable if set (normalized slug).
+    2. A runtime session env var (CLAUDE_SESSION_ID, CODEX_SESSION_ID, ...),
+       hashed to a stable short slug.
+    3. Stable per-process-tree fallback: hash of the parent PID plus its
+       process start time, so every CLI call from one agent session agrees.
+    """
+    env_session = os.environ.get("AGENT_INBOX_SESSION")
+    if env_session and env_session.strip():
+        return normalize_slug(env_session.strip())[:32]
+
+    for key in _RUNTIME_SESSION_ENV_KEYS:
+        val = os.environ.get(key)
+        if val and val.strip():
+            return _short_session_hash(f"{key}:{val.strip()}")
+
+    ppid = os.getppid()
+    start_time = ""
+    try:
+        res = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(ppid)],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        if res.returncode == 0:
+            start_time = res.stdout.strip()
+    except Exception:
+        pass
+    return _short_session_hash(f"ppid:{ppid}:{start_time}")
 
 
 def derive_identity(cwd: Optional[Union[str, Path]] = None) -> Tuple[str, str, str]:

@@ -1,5 +1,6 @@
 """Core domain and transactional database operations for Agent Inboxes."""
 
+import datetime
 import sqlite3
 from typing import List, Optional, Tuple
 
@@ -15,12 +16,102 @@ from agent_inbox.models import (
     utc_now_iso,
 )
 
+# A session counts as "active" if it interacted within this window.
+SESSION_ACTIVE_WINDOW_SECONDS = 30 * 60
+
+
+def _session_active_cutoff_iso() -> str:
+    """RFC 3339 UTC cutoff; timestamps at/after it are 'active'. Same format as
+    utc_now_iso(), so lexicographic string comparison in SQL is correct."""
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        seconds=SESSION_ACTIVE_WINDOW_SECONDS
+    )
+    return cutoff.strftime("%Y-%m-%dT%H:%M:%S.") + f"{cutoff.microsecond // 1000:03d}Z"
+
 
 class InboxService:
     """Encapsulates transactional operations on the SQLite database."""
 
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
+
+
+    # ------------------------------------------------------------------
+    # Agent leases: lowest-free-slot claiming for concurrent same-family
+    # agents (claude, claude-2, claude-3, ...). A lease is free when it has
+    # never been claimed or its last_seen is older than LEASE_EXPIRY_SECONDS.
+    # ------------------------------------------------------------------
+
+    LEASE_EXPIRY_SECONDS = 2 * 60 * 60
+
+    def _lease_expiry_cutoff(self) -> str:
+        from datetime import datetime, timedelta, timezone
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=self.LEASE_EXPIRY_SECONDS)
+        return cutoff.strftime("%Y-%m-%dT%H:%M:%S.") + f"{cutoff.microsecond // 1000:03d}Z"
+
+    def claim_agent(self, family: str, project_slug: str) -> dict:
+        """Atomically claim the lowest free slot for a runtime family in a project."""
+        family = normalize_slug(family)
+        project_slug = normalize_slug(project_slug)
+        if not family or not project_slug:
+            raise ValidationError("invalid_lease", "family and project are required")
+        cutoff = self._lease_expiry_cutoff()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            slot = None
+            for n in range(1, 100):
+                candidate = family if n == 1 else f"{family}-{n}"
+                row = self.conn.execute(
+                    "SELECT last_seen FROM agent_leases WHERE agent_slug = ? COLLATE NOCASE AND project_slug = ? COLLATE NOCASE",
+                    (candidate, project_slug),
+                ).fetchone()
+                if row is None or row["last_seen"] < cutoff:
+                    slot = candidate
+                    break
+            if slot is None:
+                raise ConflictError("lease_exhausted", f"No free slot for {family} in {project_slug} (99 concurrent leases)")
+            self.conn.execute(
+                """
+                INSERT INTO agent_leases (agent_slug, project_slug)
+                VALUES (?, ?)
+                ON CONFLICT(agent_slug, project_slug) DO UPDATE SET
+                  claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                  last_seen  = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                (slot, project_slug),
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            try:
+                self.conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        return {"agent": slot, "project": project_slug, "address": f"{slot}@{project_slug}"}
+
+    def release_agent(self, agent_slug: str, project_slug: str) -> dict:
+        """Free a lease so the slot can be reclaimed immediately."""
+        agent_slug = normalize_slug(agent_slug)
+        project_slug = normalize_slug(project_slug)
+        cur = self.conn.execute(
+            "DELETE FROM agent_leases WHERE agent_slug = ? COLLATE NOCASE AND project_slug = ? COLLATE NOCASE",
+            (agent_slug, project_slug),
+        )
+        return {"released": cur.rowcount > 0, "agent": agent_slug, "project": project_slug}
+
+    def touch_lease(self, agent_slug: str, project_slug: str) -> None:
+        """Refresh last_seen for an EXISTING lease; never creates one."""
+        try:
+            self.conn.execute(
+                """
+                UPDATE agent_leases
+                SET last_seen = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE agent_slug = ? COLLATE NOCASE AND project_slug = ? COLLATE NOCASE
+                """,
+                (normalize_slug(agent_slug), normalize_slug(project_slug)),
+            )
+        except Exception:
+            pass
 
     def _get_inbox_id(self, address: str) -> Optional[int]:
         """Look up inbox ID by address."""
@@ -120,28 +211,71 @@ class InboxService:
             "last_seen_at": now,
         }
 
+    def touch_session(self, address: str, session_id: str, pid: Optional[int] = None) -> None:
+        """Record activity for one agent session on an inbox (upsert last_seen_at).
+
+        Called alongside the existing inbox last_seen touch whenever an
+        identified session interacts. A no-op for missing/blank session ids.
+        """
+        if not session_id or not isinstance(session_id, str) or not session_id.strip():
+            return
+        session_id = session_id.strip()[:64]
+        norm_addr = normalize_address(address)
+        self.ensure_inbox(norm_addr)
+        inbox_id = self._get_inbox_id(norm_addr)
+        now = utc_now_iso()
+        self.conn.execute(
+            """
+            INSERT INTO sessions (inbox_id, session_id, pid, first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(inbox_id, session_id) DO UPDATE SET
+              last_seen_at = excluded.last_seen_at,
+              pid = COALESCE(excluded.pid, sessions.pid)
+            """,
+            (inbox_id, session_id, pid, now, now),
+        )
+
+    def active_sessions(self, address: str) -> List[dict]:
+        """List sessions seen on this inbox within the active window."""
+        norm_addr = normalize_address(address)
+        inbox_id = self._get_inbox_id(norm_addr)
+        if inbox_id is None:
+            return []
+        cutoff = _session_active_cutoff_iso()
+        rows = self.conn.execute(
+            """
+            SELECT session_id, pid, last_seen_at FROM sessions
+            WHERE inbox_id = ? AND last_seen_at >= ?
+            ORDER BY last_seen_at DESC
+            """,
+            (inbox_id, cutoff),
+        ).fetchall()
+        return [
+            {"session_id": r["session_id"], "pid": r["pid"], "last_seen_at": r["last_seen_at"]}
+            for r in rows
+        ]
+
     def list_inboxes(self, project_slug: Optional[str] = None) -> List[dict]:
         """List inboxes, optionally filtered by project slug."""
+        cutoff = _session_active_cutoff_iso()
+        base_query = """
+            SELECT i.id AS inbox_id, i.local_part, p.slug as project_slug, i.display_name,
+                   i.created_at, i.last_seen_at,
+                   (SELECT COUNT(*) FROM sessions s
+                    WHERE s.inbox_id = i.id AND s.last_seen_at >= ?) AS active_sessions
+            FROM inboxes i
+            JOIN projects p ON i.project_id = p.id
+        """
         if project_slug:
             canonical_project = normalize_slug(project_slug)
             rows = self.conn.execute(
-                """
-                SELECT i.local_part, p.slug as project_slug, i.display_name, i.created_at, i.last_seen_at
-                FROM inboxes i
-                JOIN projects p ON i.project_id = p.id
-                WHERE p.slug = ? COLLATE NOCASE
-                ORDER BY i.local_part ASC
-                """,
-                (canonical_project,),
+                base_query + " WHERE p.slug = ? COLLATE NOCASE ORDER BY i.local_part ASC",
+                (cutoff, canonical_project),
             ).fetchall()
         else:
             rows = self.conn.execute(
-                """
-                SELECT i.local_part, p.slug as project_slug, i.display_name, i.created_at, i.last_seen_at
-                FROM inboxes i
-                JOIN projects p ON i.project_id = p.id
-                ORDER BY p.slug ASC, i.local_part ASC
-                """
+                base_query + " ORDER BY p.slug ASC, i.local_part ASC",
+                (cutoff,),
             ).fetchall()
 
         return [
@@ -152,6 +286,7 @@ class InboxService:
                 "display_name": r["display_name"],
                 "created_at": r["created_at"],
                 "last_seen_at": r["last_seen_at"],
+                "active_sessions": r["active_sessions"],
             }
             for r in rows
         ]
@@ -164,6 +299,7 @@ class InboxService:
         subject: str,
         body_markdown: str,
         client_token: str,
+        sender_session: Optional[str] = None,
     ) -> dict:
         """
         Start a thread and send its first email atomically.
@@ -259,10 +395,10 @@ class InboxService:
             # Insert email
             self.conn.execute(
                 """
-                INSERT INTO emails (id, thread_id, from_inbox_id, subject, body_markdown, reply_to_email_id, client_token, sent_at)
-                VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+                INSERT INTO emails (id, thread_id, from_inbox_id, subject, body_markdown, reply_to_email_id, client_token, sent_at, sender_session)
+                VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)
                 """,
-                (email_id, thread_id, from_inbox_id, subject.strip(), body_markdown, client_token, sent_at),
+                (email_id, thread_id, from_inbox_id, subject.strip(), body_markdown, client_token, sent_at, sender_session),
             )
 
             # Insert recipients
@@ -307,6 +443,7 @@ class InboxService:
         client_token: str,
         to_addrs: Optional[List[str]] = None,
         cc_addrs: Optional[List[str]] = None,
+        sender_session: Optional[str] = None,
     ) -> dict:
         """
         Reply to an existing email in a thread.
@@ -493,10 +630,10 @@ class InboxService:
             # Insert email
             self.conn.execute(
                 """
-                INSERT INTO emails (id, thread_id, from_inbox_id, subject, body_markdown, reply_to_email_id, client_token, sent_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO emails (id, thread_id, from_inbox_id, subject, body_markdown, reply_to_email_id, client_token, sent_at, sender_session)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (email_id, thread_id, from_inbox_id, subject, body_markdown, reply_to_email_id, client_token, sent_at),
+                (email_id, thread_id, from_inbox_id, subject, body_markdown, reply_to_email_id, client_token, sent_at, sender_session),
             )
 
             # Insert recipients
@@ -648,6 +785,7 @@ class InboxService:
         email_rows = self.conn.execute(
             """
             SELECT e.id, e.from_inbox_id, e.subject, e.body_markdown, e.reply_to_email_id, e.sent_at,
+                   e.sender_session,
                    i.local_part AS from_local_part, p.slug AS from_project_slug
             FROM emails e
             JOIN inboxes i ON e.from_inbox_id = i.id
@@ -706,12 +844,76 @@ class InboxService:
                 "reply_to_email_id": e["reply_to_email_id"],
                 "references": references,
                 "read": is_read,
+                "sender_session": e["sender_session"],
             })
 
         return {
             "thread_id": thread_id,
             "subject": thread_row["subject"],
             "emails": email_dicts,
+        }
+
+    def watch_state(self, address: str, after: int = 0) -> dict:
+        """One non-blocking check of the long-poll watch condition.
+
+        The cursor is the max SQLite rowid over emails delivered to this inbox.
+        ``changed`` is True when an UNREAD delivered email exists with rowid
+        greater than ``after``; ``latest`` then describes the newest such email.
+        """
+        norm_addr = normalize_address(address)
+        self.ensure_inbox(norm_addr)
+        inbox_id = self._get_inbox_id(norm_addr)
+        after = max(0, int(after or 0))
+
+        cursor_row = self.conn.execute(
+            """
+            SELECT COALESCE(MAX(e.rowid), 0) AS cursor
+            FROM emails e JOIN email_recipients er ON er.email_id = e.id
+            WHERE er.inbox_id = ?
+            """,
+            (inbox_id,),
+        ).fetchone()
+        cursor = cursor_row["cursor"]
+
+        unread_row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS unread_count
+            FROM email_recipients er
+            WHERE er.inbox_id = ? AND er.read_at IS NULL
+            """,
+            (inbox_id,),
+        ).fetchone()
+        unread_count = unread_row["unread_count"]
+
+        latest_row = self.conn.execute(
+            """
+            SELECT e.thread_id, e.subject, e.sent_at,
+                   i.local_part AS from_local_part, p.slug AS from_project_slug
+            FROM emails e
+            JOIN email_recipients er ON er.email_id = e.id
+            JOIN inboxes i ON e.from_inbox_id = i.id
+            JOIN projects p ON i.project_id = p.id
+            WHERE er.inbox_id = ? AND er.read_at IS NULL AND e.rowid > ?
+            ORDER BY e.rowid DESC
+            LIMIT 1
+            """,
+            (inbox_id, after),
+        ).fetchone()
+
+        latest = None
+        if latest_row:
+            latest = {
+                "thread_id": latest_row["thread_id"],
+                "subject": latest_row["subject"],
+                "from": f"{latest_row['from_local_part']}@{latest_row['from_project_slug']}",
+                "sent_at": latest_row["sent_at"],
+            }
+
+        return {
+            "changed": latest is not None,
+            "unread_count": unread_count,
+            "cursor": cursor,
+            "latest": latest,
         }
 
     def mark_thread_read(self, address: str, thread_id: str) -> int:
