@@ -192,12 +192,14 @@ class TestRepoKeysResourcesAndTakeoverMail(unittest.TestCase):
             "proj", ["src/app.ts"], "a@proj", "s-aaaa",
             client_token=_tok(), repo_key="aaaaaaaaaaaa",
         )
-        # Different repo key -> different repository sharing a basename: free.
+        # Different repo key does NOT exempt: repo_key is client-supplied and
+        # unverifiable, so an invented key must not bypass a lease (v1.4
+        # adversarial review, finding 2). Overlapping paths always conflict.
         res_other_repo = self.svc.acquire_reservations(
             "proj", ["src/app.ts"], "b@proj", "s-bbbb",
             client_token=_tok(), repo_key="bbbbbbbbbbbb",
         )
-        self.assertNotIn("conflicts", res_other_repo)
+        self.assertIn("conflicts", res_other_repo)
 
         # Same repo key -> conflicts with A's lease.
         res_same_repo = self.svc.acquire_reservations(
@@ -206,12 +208,23 @@ class TestRepoKeysResourcesAndTakeoverMail(unittest.TestCase):
         )
         self.assertIn("conflicts", res_same_repo)
 
-        # NULL requester key stays conservative: conflicts with BOTH keyed leases.
+        # NULL requester key stays conservative: conflicts with A's keyed
+        # lease (B's bypass attempt above acquired nothing).
         res_null_req = self.svc.acquire_reservations(
             "proj", ["src/app.ts"], "d@proj", "s-dddd", client_token=_tok(),
         )
         self.assertIn("conflicts", res_null_req)
-        self.assertEqual(len(res_null_req["conflicts"]), 2)
+        self.assertEqual(len(res_null_req["conflicts"]), 1)
+
+        # Unicode canonical equivalence: NFD form of the same path conflicts
+        # with an NFC reservation (v1.4 adversarial review, finding 3).
+        self.svc.acquire_reservations(
+            "proj", ["caf\u00e9/app.ts"], "a@proj", "s-aaaa", client_token=_tok(),
+        )
+        res_nfd = self.svc.acquire_reservations(
+            "proj", ["cafe\u0301/app.ts"], "b@proj", "s-bbbb", client_token=_tok(),
+        )
+        self.assertIn("conflicts", res_nfd)
 
         # NULL row key stays conservative too: keyed requester on a keyless lease.
         self.svc.acquire_reservations(

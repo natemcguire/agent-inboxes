@@ -3,6 +3,7 @@
 import datetime
 import re
 import sqlite3
+import unicodedata
 import uuid
 from typing import List, Optional, Tuple
 
@@ -97,11 +98,13 @@ def normalize_reservation_path(raw) -> str:
     Rejects absolute paths, empty paths, and any `..` segment. Strips `./`
     segments and duplicate slashes. A trailing `/` is preserved: it marks a
     directory reservation, semantically distinct from a file path. Storage is
-    case-preserving; comparisons are case-insensitive.
+    case-preserving; comparisons are case-insensitive. Paths are Unicode
+    NFC-normalized before store and compare so canonically-equivalent forms
+    (e.g. NFC vs NFD 'é' on APFS) cannot dodge conflicts.
     """
     if not raw or not isinstance(raw, str) or not raw.strip():
         raise ValidationError("validation_error", "Reservation path must be a non-empty string")
-    p = raw.strip().replace("\\", "/")
+    p = unicodedata.normalize("NFC", raw.strip()).replace("\\", "/")
     if p.startswith("/"):
         raise ValidationError("validation_error", f"Reservation path must be repo-relative, not absolute: '{raw}'")
     is_dir = p.endswith("/")
@@ -119,8 +122,10 @@ def reservation_paths_conflict(a: str, b: str) -> bool:
     File paths overlap on the same path, an ancestor directory reservation, or
     a descendant of a requested directory. Resource keys ('res://…') never
     prefix-conflict: they match exactly or not at all, and never against files.
+    Comparison NFC-normalizes both sides (defends rows stored before v1.5.1).
     """
-    la, lb = a.lower(), b.lower()
+    la = unicodedata.normalize("NFC", a).lower()
+    lb = unicodedata.normalize("NFC", b).lower()
     if is_resource_key(la) or is_resource_key(lb):
         return la == lb
     if la == lb:
@@ -1159,18 +1164,13 @@ class InboxService:
     def _repo_compatible_conflict(req_key: str, req_repo_key: Optional[str], row: sqlite3.Row) -> bool:
         """Whether an overlapping active row actually conflicts, given repo keys.
 
-        Resources are project-wide — repo identity never exempts them. For file
-        paths, two leases conflict only when either side lacks a repo key
-        (NULL stays conservative so legacy/keyless clients still conflict
-        rather than silently bypass) or the keys are equal. Different keys mean
-        different repositories that merely share a directory basename.
+        Always. repo_key is client-supplied and unverifiable over loopback, so
+        it must never exempt a conflict: an invented key would let any caller
+        bypass another agent's lease on the same path (v1.4 adversarial review,
+        finding 2). Keys are still stored and surfaced for audit/display, but
+        overlapping active paths conflict regardless of repo identity.
         """
-        if is_resource_key(req_key) or is_resource_key(row["path"]):
-            return True
-        row_key = row["repo_key"]
-        if req_repo_key is None or row_key is None:
-            return True
-        return req_repo_key == row_key
+        return True
 
     def _find_conflicts(
         self,

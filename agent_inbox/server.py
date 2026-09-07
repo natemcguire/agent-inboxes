@@ -144,8 +144,9 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
         return None
 
     def _get_repo_key(self) -> Optional[str]:
-        """Optional X-Repo-Key header: worktree-safe repository identity for
-        file reservations. Absent (None) stays conservative."""
+        """Optional X-Repo-Key header: client-reported repository identity,
+        recorded on file reservations for audit/display only. It is
+        unverifiable, so it never exempts a conflict."""
         key = self.headers.get("X-Repo-Key")
         if key and key.strip():
             return key.strip()[:64]
