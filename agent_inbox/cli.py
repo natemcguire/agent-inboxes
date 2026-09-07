@@ -10,6 +10,7 @@ from typing import List, Optional
 
 from agent_inbox import __version__
 from agent_inbox.client import InboxClient
+from agent_inbox.cloudsync import DEFAULT_URL, CloudClient, load_config, save_config
 from agent_inbox.config import (
     DIR_MODE,
     LAUNCH_AGENT_PLIST,
@@ -707,6 +708,38 @@ def cmd_hooks(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_cloud(args: argparse.Namespace, client: InboxClient) -> int:
+    """Configure cloud sync without exposing the Bearer token."""
+    try:
+        if args.cloud_action == "login":
+            cloud = CloudClient(args.url, args.token)
+            cloud.pull(0, limit=1)
+            save_config({"url": cloud.url, "token": args.token, "enabled": True})
+            print("Cloud sync enabled. The service will pick it up within 30 seconds.")
+        elif args.cloud_action == "off":
+            config = load_config()
+            if config is not None:
+                config["enabled"] = False
+                save_config(config)
+            print("Cloud sync disabled. Any in-flight sync may finish.")
+        else:
+            status = client.cloud_status()
+            if args.json:
+                print(json.dumps(status, indent=2))
+            else:
+                print(f"Enabled: {str(status['enabled']).lower()}")
+                print(f"URL: {status['url'] or '(not configured)'}")
+                print(f"Unsynced: {status['unsynced_count']}")
+                print(f"Cursor: {status['last_pulled_seq']}")
+        return 0
+    except InboxError as exc:
+        _print_error(exc.message, exc.code)
+        return 1
+    except Exception:
+        _print_error("Cloud command failed; check cloud configuration and file permissions")
+        return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build command-line parser."""
     parser = argparse.ArgumentParser(
@@ -720,6 +753,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Sub-commands")
+
+    p_cloud = subparsers.add_parser("cloud", help="Configure optional cloud mail sync")
+    cloud_commands = p_cloud.add_subparsers(dest="cloud_action", required=True)
+    p_login = cloud_commands.add_parser("login", help="Verify and save a cloud session token")
+    p_login.add_argument("--token", required=True)
+    p_login.add_argument("--url", default=DEFAULT_URL)
+    p_status = cloud_commands.add_parser("status", help="Show cloud settings and local sync counters")
+    p_status.add_argument("--json", action="store_true")
+    cloud_commands.add_parser("off", help="Disable cloud sync")
 
     # whoami
     p_whoami = subparsers.add_parser("whoami", help="Derive and auto-create active inbox address")
@@ -850,7 +892,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # distinguish concurrent same-family agents sharing one inbox address.
     client = InboxClient(session_id=derive_session(), repo_key=derive_repo_key())
 
-    if args.command == "whoami":
+    if args.command == "cloud":
+        return cmd_cloud(args, client)
+    elif args.command == "whoami":
         return cmd_whoami(args, client)
     elif args.command == "serve":
         return cmd_serve(args)

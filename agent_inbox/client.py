@@ -122,6 +122,10 @@ class InboxClient:
         """Release this agent's lease so the slot frees immediately."""
         return self._request("POST", "/v1/leases/release", body={"agent": agent, "project": project})
 
+    def cloud_status(self) -> Dict[str, Any]:
+        """Read cloud counters from the serving process database."""
+        return self._request("GET", "/v1/cloud/status")
+
     def healthz(self) -> Dict[str, Any]:
         """Check service health."""
         return self._request("GET", "/healthz")

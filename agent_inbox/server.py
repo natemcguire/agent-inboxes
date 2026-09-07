@@ -1,6 +1,7 @@
 """Loopback HTTP Server implementation for Agent Inboxes."""
 
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -10,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 
 from agent_inbox import __version__
+from agent_inbox.cloudsync import SYNC_INTERVAL, SyncWorker, load_config, sync_status
 from agent_inbox.config import get_db_path, get_host, get_port
 from agent_inbox.db import get_connection
 from agent_inbox.models import (
@@ -199,6 +201,10 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     "db": db_status,
                     "version": __version__,
                 })
+                return
+
+            if path == "/v1/cloud/status":
+                self._send_json(HTTPStatus.OK, sync_status(self.server.get_thread_connection()))
                 return
 
             # /v1/inboxes
@@ -412,6 +418,7 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     client_token=idempotency_key,
                     sender_session=sender_session,
                 )
+                self.server.nudge_cloud_sync()
                 if from_addr:
                     self._touch_session(service, from_addr)
                 self._send_json(HTTPStatus.CREATED, res)
@@ -438,6 +445,7 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     cc_addrs=cc_addrs,
                     sender_session=sender_session,
                 )
+                self.server.nudge_cloud_sync()
                 if from_addr:
                     self._touch_session(service, from_addr)
                 self._send_json(HTTPStatus.CREATED, res)
@@ -548,6 +556,41 @@ class AgentInboxServer(ThreadingHTTPServer):
                 break
         self.db_path = db_file if db_file else None
         self._thread_db = threading.local()
+        self._cloud_worker = None
+        self._cloud_check_at = 0.0
+
+    def nudge_cloud_sync(self) -> None:
+        if self._cloud_worker is not None:
+            self._cloud_worker.wake.set()
+        # Also discover newly enabled config on the next server loop iteration.
+        self._cloud_check_at = 0.0
+
+    def service_actions(self) -> None:
+        # No cloud thread or DB connection when signed out. Checking config on
+        # the serving thread lets login/off take effect without a restart.
+        if time.monotonic() < self._cloud_check_at:
+            return
+        self._cloud_check_at = time.monotonic() + SYNC_INTERVAL
+        try:
+            config = load_config()
+            enabled = config and config.get("enabled") is True
+            worker = self._cloud_worker
+            if not enabled:
+                if worker is not None:
+                    worker.stop()
+                return
+            if self.db_path and (worker is None or not worker.is_alive()):
+                self._cloud_worker = SyncWorker(self.db_path)
+                self._cloud_worker.start()
+        except Exception as exc:
+            logging.getLogger(__name__).debug("Cloud config unavailable (%s)", type(exc).__name__)
+
+    def server_close(self) -> None:
+        if self._cloud_worker is not None:
+            self._cloud_worker.stop()
+            self._cloud_worker.join(timeout=35)
+        super().server_close()
+
 
     def get_thread_connection(self) -> sqlite3.Connection:
         """Return this thread's SQLite connection, opening it on first use.
@@ -585,6 +628,8 @@ def run_server(host: Optional[str] = None, port: Optional[int] = None, db_path: 
             f"Remove --host / AGENT_INBOX_HOST or set it to 127.0.0.1."
         )
 
+    if verbose:
+        logging.basicConfig(level=logging.DEBUG)
     conn = get_connection(db_path)
     
     server = AgentInboxServer((target_host, target_port), conn, verbose=verbose)
