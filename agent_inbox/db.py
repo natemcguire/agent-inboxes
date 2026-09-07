@@ -12,6 +12,12 @@ PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 PRAGMA busy_timeout = 5000;
 
+CREATE TABLE IF NOT EXISTS update_state (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    checked_at REAL NOT NULL,
+    manifest TEXT
+);
+
 CREATE TABLE IF NOT EXISTS projects (
   id         INTEGER PRIMARY KEY,
   slug       TEXT NOT NULL COLLATE NOCASE UNIQUE,

@@ -644,10 +644,14 @@ def run_server(host: Optional[str] = None, port: Optional[int] = None, db_path: 
     print(f"Database: {get_db_path() if not db_path else db_path}")
     print("Press Ctrl+C to stop.")
 
+    from agent_inbox.updates import UpdateWorker
+    updates = UpdateWorker(server.db_path)
+    updates.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping server...")
     finally:
+        updates.stopped.set()
         server.server_close()
         conn.close()

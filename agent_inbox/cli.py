@@ -240,6 +240,10 @@ def cmd_list(args: argparse.Namespace, client: InboxClient) -> int:
             if not threads:
                 status = "unread " if args.unread else ""
                 print(f"No {status}threads found for {inbox}.")
+                from agent_inbox.updates import update_notice
+                notice = update_notice()
+                if notice:
+                    print(notice)
                 return 0
 
             print(f"Threads for {inbox}:")
@@ -249,6 +253,10 @@ def cmd_list(args: argparse.Namespace, client: InboxClient) -> int:
                 print(f"• {t['thread_id']} - {t['subject']}{unread_flag}")
                 print(f"  Participants: {parts}")
                 print(f"  Last active: {t['last_email_at']}\n")
+        from agent_inbox.updates import update_notice
+        notice = update_notice()
+        if notice:
+            print(notice, file=sys.stderr if args.json else sys.stdout)
         return 0
     except InboxError as e:
         _print_error(e.message, e.code)
@@ -895,6 +903,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_inboxes.add_argument("--all", action="store_true", help="List all inboxes across all projects")
     p_inboxes.add_argument("--json", action="store_true", help="Output JSON")
 
+    p_update = subparsers.add_parser("update", help="Check for and install a verified runtime update")
+    p_update.add_argument("--check", action="store_true", help="Only report availability; do not install")
+
     # setup
     p_setup = subparsers.add_parser("setup", help="Set up data directory, register macOS LaunchAgent, and install global agent instructions")
     p_setup.add_argument("--global", dest="global_only", action="store_true", help="Only install the managed block into ~/.claude/CLAUDE.md")
@@ -930,6 +941,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.command:
         parser.print_help(sys.stderr)
         return 1
+
+    if args.command == "update":
+        from agent_inbox.updates import run_update
+        return run_update(args.check)
 
     # Every CLI interaction identifies its agent session so the service can
     # distinguish concurrent same-family agents sharing one inbox address.

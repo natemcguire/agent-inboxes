@@ -73,6 +73,8 @@ def run_hook_check(output_format: str = "plain", stdin_text: str = "") -> int:
         client = InboxClient(timeout=HOOK_TIMEOUT_SECONDS)
         threads = client.list_threads(address, unread=True, limit=50)
         line = build_notice(address, threads)
+        from agent_inbox.updates import update_notice
+        line = "\n".join(filter(None, (line, update_notice())))
         if not line:
             return 0
         if output_format == "json":
