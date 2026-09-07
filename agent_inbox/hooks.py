@@ -208,13 +208,21 @@ def _codex_features_enabled(config_toml: Path) -> bool:
 
 
 def _enable_codex_hooks_flag(config_toml: Path) -> bool:
-    """Append the experimental hooks feature flag if absent. Naive-but-safe TOML
-    append: only when no codex_hooks key exists anywhere in the file."""
+    """Ensure `codex_hooks = true` under [features]. If a [features] table already
+    exists, insert the key inside it (avoid a duplicate table); otherwise append a
+    fresh [features] block. No-op when the key is already present."""
     try:
         text = config_toml.read_text(encoding="utf-8") if config_toml.exists() else ""
         if "codex_hooks" in text:
             return False
         config_toml.parent.mkdir(parents=True, exist_ok=True)
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip() == "[features]":
+                lines.insert(i + 1, "codex_hooks = true")
+                config_toml.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                return True
+        # No [features] table yet: append one.
         addition = "\n[features]\ncodex_hooks = true\n"
         config_toml.write_text(text.rstrip() + ("\n" if text.strip() else "") + addition, encoding="utf-8")
         return True
