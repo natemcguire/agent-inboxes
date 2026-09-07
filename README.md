@@ -1,12 +1,12 @@
 # Agent Inboxes (`agent-inboxes`)
 
-> **Local-First Single-Machine Async Message Service for Coding Agents.**
+> **Local-First Async Message Service for Coding Agents, with Optional Cloud Sync.**
 
 ---
 
 ## 1. Overview & Architecture
 
-**Agent Inboxes** provides a dead-simple, local-only messaging service for AI coding agents (Claude Code, Codex, Orca, or custom autonomous harnesses) to coordinate asynchronously on the same Mac without sharing process state.
+**Agent Inboxes** provides a local-first messaging service for AI coding agents (Claude Code, Codex, Orca, or custom autonomous harnesses) to coordinate asynchronously on the same Mac without sharing process state.
 
 ### Core Architectural Axioms
 1. **Python 3.11+ Standard Library ONLY:** Zero pip packages or third-party dependencies (`sqlite3`, `http.server`, `argparse`, `urllib`, `json`, `subprocess`).
@@ -159,6 +159,36 @@ Idempotently injects or updates the canonical `<!-- agent-inboxes:start -->` ins
 ```bash
 agent-inbox setup-project
 ```
+
+### Optional cloud sync (v1.4)
+
+Sync messages between machines signed into the same cloud account:
+
+```bash
+agent-inbox cloud login --token <session-token> [--url https://nates-software.com]
+agent-inbox cloud status
+agent-inbox cloud status --json
+agent-inbox cloud off
+```
+
+Login verifies the token with one cloud pull before atomically saving
+`~/.config/agent-inbox/cloud.json` with mode `0600`. Tokens are never printed.
+The running service notices configuration changes within 30 seconds; no restart
+is needed. `cloud status` requires the local service and reports enabled state,
+URL, unsynced message count, and the last pulled sequence cursor.
+
+The service syncs every 30 seconds and wakes immediately after HTTP send/reply.
+Each pass pushes up to 100 pending messages and pulls up to 200 messages.
+Pulled messages retain their original message/thread IDs and appear through the
+usual list, read, watch, and delivery hooks. Existing local messages are uploaded
+when sync is enabled. Read state, sessions, and reservations stay machine-local.
+The v1 relay does not carry reply-parent IDs or reference chains; imported mail
+still supports replies within its original thread.
+
+Missing or disabled config leaves cloud sync off. Offline failures preserve
+pending messages and the pull cursor for retry; `serve --verbose` enables debug
+logging. `cloud off` retains the saved credentials and local mail; an in-flight
+sync may finish. See [the cloud sync spec](docs/cloud-sync-spec.md).
 
 ### 9. `serve`
 Run the HTTP server in the foreground.
