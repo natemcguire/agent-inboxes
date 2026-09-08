@@ -17,7 +17,7 @@ MAX_BYTES = 4 * 1024 * 1024
 FILES = {'bin/agent-inbox'} | {f'agent_inbox/{name}.py' for name in (
     '__init__', 'cli', 'client', 'config', 'db', 'identity', 'launchagent',
     'models', 'project_setup', 'server', 'service', 'hooks', 'cloud_protocol',
-    'cloudsync', 'distribution', 'updates')}
+    'cloudsync', 'distribution', 'updates', 'operations', 'recovery')}
 
 
 def check_url(url):

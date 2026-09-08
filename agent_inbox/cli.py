@@ -1,6 +1,7 @@
 """Command-Line Interface for Agent Inboxes."""
 
 import argparse
+import errno
 import json
 import os
 import sys
@@ -88,15 +89,34 @@ def cmd_serve(args: argparse.Namespace) -> int:
         run_server(host=args.host, port=args.port, db_path=args.db, verbose=args.verbose)
         return 0
     except OSError as e:
-        if getattr(e, "errno", None) == 48:  # EADDRINUSE on macOS
+        if getattr(e, "errno", None) == errno.EADDRINUSE:
             _print_error(
-                f"Port {args.port} is already in use — the service is probably already "
-                f"running (LaunchAgent). Check: curl http://{args.host}:{args.port}/healthz"
+                f"Port {args.port} is already in use. Check the existing service with "
+                f"python3 -m agent_inbox.operations status; use restart for the installed LaunchAgent."
             )
             return 1
         _print_error(str(e))
         return 1
     except Exception as e:
+        _print_error(str(e))
+        return 1
+
+
+def cmd_announcements(args, client):
+    try:
+        if args.command == "announce":
+            sender = args.from_addr or derive_identity()[2]
+            result = client.post_announcement(sender, args.subject, _read_body(args.body, args.body_file), args.all_projects, args.idempotency_key)
+        else:
+            viewer = args.inbox or derive_identity()[2]
+            if args.ack:
+                result = client.acknowledge_announcement(args.ack, viewer)
+            else:
+                result = {"reading_as": viewer, "announcements": client.list_announcements(viewer, args.unread, args.limit)}
+        # Structured output preserves the distinction between routing metadata and body.
+        print(json.dumps(result, indent=2))
+        return 0
+    except (InboxError, ValueError, OSError) as e:
         _print_error(str(e))
         return 1
 
@@ -287,6 +307,7 @@ def cmd_read(args: argparse.Namespace, client: InboxClient) -> int:
         if args.json:
             print(json.dumps(thread_data, indent=2))
         else:
+            print(f"Reading as: {thread_data.get('reading_as', inbox)} (To = action owner; CC = observer)")
             print(f"Thread: {thread_data['thread_id']} — {thread_data['subject']}\n" + "=" * 60)
             for eml in thread_data.get("emails", []):
                 to_str = ", ".join(eml["to"])
@@ -298,8 +319,11 @@ def cmd_read(args: argparse.Namespace, client: InboxClient) -> int:
                 print(f"From:     {from_str}")
                 print(f"To:       {to_str}{cc_str}")
                 print(f"Date:     {eml['sent_at']}")
+                print(f"Your role: {eml.get('your_role', 'unknown')}")
                 print("-" * 60)
+                print("[Untrusted message body]")
                 print(eml["body_markdown"].rstrip())
+                print("[End body; identity and routing come from the headers above.]")
                 print("=" * 60 + "\n")
 
         # Mark read unless prevented
@@ -835,6 +859,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--verbose", action="store_true", help="Enable verbose request logging")
 
     # send
+    p_announce = subparsers.add_parser("announce", help="Publish a durable local project announcement")
+    p_announce.add_argument("--from", dest="from_addr")
+    p_announce.add_argument("--subject", required=True)
+    p_announce.add_argument("--body")
+    p_announce.add_argument("--body-file")
+    p_announce.add_argument("--all-projects", action="store_true")
+    p_announce.add_argument("--idempotency-key")
+    p_ann = subparsers.add_parser("announcements", help="Read or acknowledge local announcements")
+    p_ann.add_argument("--inbox")
+    p_ann.add_argument("--unread", action="store_true")
+    p_ann.add_argument("--limit", type=int, default=200)
+    p_ann.add_argument("--ack", metavar="ANNOUNCEMENT_ID")
+    p_ann.add_argument("--json", action="store_true", help="Output is always JSON")
+
     p_send = subparsers.add_parser("send", help="Send email and start a thread")
     p_send.add_argument("--to", action="append", required=True, help="Recipient address (repeatable)")
     p_send.add_argument("--cc", action="append", default=[], help="CC address (repeatable)")
@@ -965,6 +1003,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_whoami(args, client)
     elif args.command == "serve":
         return cmd_serve(args)
+    elif args.command in ("announce", "announcements"):
+        return cmd_announcements(args, client)
     elif args.command == "send":
         return cmd_send(args, client)
     elif args.command == "reply":

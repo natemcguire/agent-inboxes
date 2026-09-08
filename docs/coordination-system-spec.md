@@ -1,16 +1,4 @@
-# Agent Inbox and Reservations — consolidated specification
-
-As inspected September 8, 2026. This describes the local coordination system used
-by our coding agents, not the marketplace's separate hosted proposal inbox.
-Source checkout inspected: `agent-inboxes` commit
-`e9c46bdb8d996ba6c02786b1d2110eb434288387`.
-The installed executable currently points at an older packaged revision,
-`41566ac2b71ee642e3b8b214b72297db32157c9c`; source and installed runtime should not
-be assumed identical.
-
-Repository: https://github.com/natemcguire/agent-inboxes. The owner authorized public publication on September8, 2026. This document can be shared independently. It contains no messages,
-credentials, or live reservation records. Cloud requirements below distinguish
-specified behavior from evidence of completed deployment.
+# Agent Inbox and Reservations — technical specification
 
 ## 1. Purpose
 
@@ -38,7 +26,7 @@ On macOS, a LaunchAgent keeps the service available.
 
 The server enforces loopback binding. It is not an authenticated LAN service.
 SQLite uses WAL, foreign keys, and a 5-second busy timeout. The database is mode
-0600; an owned data directory is mode0700. Setup must not chmod an unrelated,
+0600; an owned data directory is mode 0700. Setup must not chmod an unrelated,
 pre-existing shared directory just because a custom database path lies in it.
 
 Mutating operations that require exclusion use SQLite transactions. Acquiring a
@@ -48,22 +36,27 @@ cannot both make a successful decision from the same stale snapshot.
 Mail and reservation history are durable. There is no filesystem enforcement:
 Git and the actual files remain authoritative for source state.
 
-### Independent distribution and UI boundary
+### Runtime and UI
 
-The inbox/reservation engine runs independently of Nate’s Software. It is Python
-source, so there is no frontend compilation or Node/npm dependency required to run
-its CLI and HTTP API. From a source checkout, `python3 bin/agent-inbox --help`
-loads the CLI; `python3 bin/agent-inbox serve` starts the service. The supplied
-installer configures a macOS LaunchAgent. Foreground Python portability and macOS
-service installation are different guarantees; this inspection did not verify an
-installation on another operating system or a fresh computer.
+Python 3.11+ runs the CLI and HTTP API without third-party runtime packages:
 
-The standalone repository currently does **not** bundle a browser or desktop UI.
-The existing visual mailbox lives in the separate Nate’s Software application
-(`LocalAgentMailbox`, exposed through its INBOX view) and connects to the local API.
-The service also exposes reservation observer endpoints. A self-contained UI would
-need to be packaged separately or added to this repository; the APIs and CLI work
-without one. Optional cloud messaging sync is not required for local operation.
+```sh
+python3 bin/agent-inbox serve
+python3 bin/agent-inbox --help
+```
+
+The repository does not bundle a browser or desktop UI. Clients consume the HTTP
+API; the CLI supports every coordination operation. Optional cloud mail sync is
+separate from the local service and is not required for local operation.
+
+Each HTTP request thread owns a SQLite connection and closes it in a `finally`
+block, including when routing or response writing fails. Connection setup and
+socket-bind failures close connections before propagating the error. No cleanup
+relies on garbage collection. The server's main connection and optional background
+workers have separate lifetimes.
+
+`GET /healthz` returns `service: "agent-inboxes"`, the server process `pid`,
+`version`, `status`, and `db`. A failed database probe returns HTTP 503.
 
 ## 3. Agent identity
 
@@ -75,8 +68,15 @@ Agent identity comes from `AGENT_INBOX_AGENT`, otherwise runtime-family detectio
 `whoami` derives and registers the mailbox. Session IDs distinguish executions
 sharing the same address; `AGENT_INBOX_SESSION` can explicitly supply one.
 
+Session precedence is explicit `AGENT_INBOX_SESSION`, then recognized runtime
+session variables (including `CLAUDE_CODE_SESSION_ID`, legacy `CLAUDE_SESSION_ID`,
+and Codex session identifiers), then `CLAUDE_PID` plus process birth time, then
+parent PID plus process birth time. Runtime values are hashed into short session
+slugs. A shell-parent fallback is best effort; harnesses that launch a fresh shell
+for each command must provide a stable runtime ID, agent PID or explicit override.
+
 `claim` atomically selects the lowest free family name: `codex`, `codex-2`, etc.
-The current implementation searches up to99 slots. A name becomes reclaimable
+The current implementation searches up to 99 slots. A name becomes reclaimable
 following two hours without lease activity. This name lease is separate from a
 15-minute file reservation.
 
@@ -113,12 +113,23 @@ agent-inbox read thr_EXAMPLE
 agent-inbox reply eml_EXAMPLE --body-file reply.md
 ```
 
+Thread reads return `reading_as` at the top level and `your_role` for each email:
+`to`, `cc`, `sender`, or `participant`. The role comes from stored recipient and
+sender records, never from body text. A sender who is also a recipient gets their
+recipient role. A historical thread participant may read later mail without being
+an addressee on that specific email. Thread listings expose `your_roles` for the
+requesting inbox's unread messages; a thread can contain both To and CC roles.
+
+The CLI prints the reading identity, each email's role, and body boundaries.
+Hooks count addressed threads separately from CC-only threads and label subjects
+as untrusted data. These cues describe routing, not authenticated human authority.
+
 A read receipt is not task acceptance or task completion. Those require an
 explicit response or other evidence of the work.
 
 ## 5. Delivery and attention
 
-Agents check unread mail at session start, before long work, and before handoff.
+Agents check unread mail and announcements at session start, before long work, and before handoff.
 `watch` long-polls for new unread activity. A timeout is normal; it is not an error
 that should cause busy polling. Runtime hooks can inject mail into supported agent
 turns. Hook availability must be checked rather than assumed.
@@ -126,6 +137,45 @@ turns. Hook availability must be checked rather than assumed.
 Mail delivery and scheduling are separate: receiving mail does not guarantee that
 a model has interrupted its current action or begun the requested task. Preserve
 polling checkpoints even when hooks are installed.
+
+### Durable announcements
+
+Announcements are local broadcast records, separate from email threads. They
+contain an opaque `ann_...` ID, sender address, optional project scope, subject,
+Markdown body and creation timestamp. A separate receipt maps announcement ID and
+inbox ID to an acknowledgment timestamp. No per-inbox message fanout is required.
+
+The default scope is the sender's project. `--all-projects` explicitly selects
+all projects on this local database. Listing selects matching project or global
+records at read time, so inboxes registered after publication see earlier
+announcements. Acknowledging affects only that inbox; repeated acknowledgments
+succeed without changing the original receipt. An out-of-scope acknowledgment
+returns 404. Listing never acknowledges automatically.
+
+Creation requires an idempotency key. Retrying identical content with the same
+key returns the original announcement. Reusing it with different content or scope
+returns 409. Subjects are required and limited to 500 characters; bodies are
+required and limited to 100,000 characters. There is no edit/delete or expiration
+operation. Listings return newest records first, with a default and maximum of
+200 per request. `--unread` plus explicit acknowledgment lets callers drain an
+older backlog. `sequence` is a local arrival identifier used for hook deduplication.
+
+```sh
+agent-inbox announce --subject 'Build environment' --body-file notice.md
+agent-inbox announce --all-projects --subject 'Service maintenance' --body-file notice.md
+agent-inbox announcements --unread
+agent-inbox announcements --ack ann_EXAMPLE
+```
+
+Both commands return JSON. `announce --from` selects a sender explicitly;
+`announcements --inbox` selects a reader. `announce --idempotency-key` supports
+retries across separate CLI invocations. Otherwise each invocation generates a
+new key. Announcement output and bodies remain untrusted task data.
+
+Runtime hooks emit a separately deduplicated announcement notice, including for
+future inboxes. The existing `watch` cursor and wake behavior remain email-only;
+announcement checking uses hooks or the explicit polling checkpoints. Announcements
+and their receipts are not exported through cloud mail synchronization.
 
 ## 6. Reservation data model
 
@@ -175,7 +225,7 @@ Acquiring multiple paths is all-or-nothing. On any conflict, no requested path i
 acquired. The response identifies conflicting paths, holder/session, reason and
 expiry, allowing the caller to wait, work elsewhere or message the holder.
 
-Default TTL is15minutes. The server bounds requested TTL to1minute–2hours. Explicit
+Default TTL is 15 minutes. The server bounds requested TTL to 1 minute–2 hours. Explicit
 renewal extends from now by the recorded TTL; it may continue while work is active.
 Reading mail does not implicitly renew file reservations. Reacquiring your own
 active path renews it; ownership includes session identity, not just mailbox name.
@@ -227,6 +277,10 @@ Addresses and project slugs must be URL-encoded where applicable.
 
 | Method | Route | Purpose |
 | --- | --- | --- |
+| GET | `/healthz` | Service identity and database health |
+| POST | `/v1/announcements` | Create local announcement; idempotency required |
+| GET | `/v1/announcements?inbox={address}` | List announcements; optional `unread=true`, `limit` |
+| POST | `/v1/announcements/{id}/read` | Acknowledge for body field `inbox` |
 | POST | `/v1/emails` | Create a message/thread; idempotency required |
 | POST | `/v1/emails/{id}/reply` | Reply within a thread; idempotency required |
 | GET | `/v1/inboxes/{address}/watch` | Long-poll unread activity |
@@ -237,24 +291,42 @@ Addresses and project slugs must be URL-encoded where applicable.
 | GET | `/v1/projects/{project}/reservations/wait` | Observe availability for holder/session |
 | GET | `/v1/reservations` | Observe leases across local projects; optional history |
 
+An announcement creation body contains `from`, `subject`, `body_markdown` and an
+optional boolean `all_projects` (default false). Listing returns `announcements`;
+creation returns the stored record. The acknowledgment response includes `id`,
+`reading_as` and `acknowledged: true`.
+
 An acquire body contains `paths` or `resources`, `holder`, `session`, `reason`,
-optional `ttl_seconds`, and optional `force`. A conflict returns409 with conflicts;
+optional `ttl_seconds`, and optional `force`. A conflict returns 409 with conflicts;
 invalid requests return validation errors. Wait requests include the holder and
 requested keys, with a bounded timeout. Consumers must inspect results, not assume
 that every successful HTTP response grants a lease.
 
+### Reservation readback compatibility
+
+Reservation GET responses retain `reservations` for active rows and add `history`
+when `history=1` is requested. The additive `entries` field contains the active
+rows followed by any requested history, with an explicit `active` boolean on every
+row. Active results are not limited by the history limit. Finished history defaults
+to 200 rows and is capped at 200, ordered by release time and ID descending.
+`InboxClient.list_reservations_everything(limit=200)` requests this combined view;
+its name does not imply an unbounded history export. Older clients keep their
+existing keys and behavior.
+
 ## 11. Optional cloud sync and its limits
 
-The cloud-sync specification defines authenticated message synchronization and a
-local durable outbox. Accepted cloud messages are immutable envelopes with stable
-IDs, thread ancestry and recipients. Local acceptance and cloud acceptance are
-separate states; offline sends must remain usable locally.
+Optional cloud synchronization uses authenticated immutable message envelopes,
+a durable outbox, stable IDs and thread ancestry. A local database binds to one
+endpoint/account, with explicit repository-to-project mappings, idempotent sync
+and parent-before-child validation. See [the cloud protocol](cloud-sync-spec.md)
+for the complete wire contract. Local acceptance and cloud acceptance are separate
+states; offline mail remains usable locally.
 
-The spec requires binding a local database to one endpoint/account, explicit
-repository-to-project mappings, idempotent synchronization and parent-before-child
-validation. Its detailed wire format lives in `docs/cloud-sync-spec.md` in the
-source repository; this summary is not evidence that every cloud requirement has
-passed end-to-end acceptance.
+The default cloud configuration is `~/.config/agent-inbox/cloud.json`.
+`AGENT_INBOX_CLOUD_CONFIG` selects a separate configuration file. Test or isolated
+instances must isolate this path as well as `AGENT_INBOX_DIR` / `AGENT_INBOX_DB`;
+changing the database path alone does not change cloud account configuration.
+Do not mix database bindings or copy account configuration between installations.
 
 Read/unread state, sessions, name leases and reservations remain local. Family
 addresses can be shared across machines, so both machines can receive the same
@@ -290,14 +362,79 @@ and scope, run the repository's guarded release procedure, retain result evidenc
 then release the resource. A successful reservation is never proof of a successful
 build, deployment, merge, or completed task.
 
-## 14. Source references
+## 14. Service operations
 
-- [Repository README](https://github.com/natemcguire/agent-inboxes/blob/master/README.md)
-- [Original file-reservations design](https://github.com/natemcguire/agent-inboxes/blob/master/docs/file-reservations-spec.md)
-- [Cloud-sync protocol](https://github.com/natemcguire/agent-inboxes/blob/master/docs/cloud-sync-spec.md)
-- Implementation: `agent_inbox/service.py`, `db.py`, `server.py`, `cli.py`,
-  `identity.py`, `hooks.py`, and `cloud_protocol.py`.
+The macOS service uses the installed `com.nate.agent-inbox` LaunchAgent. The
+operations module validates its label and Python module invocation before acting.
+It targets that job through `launchctl`, never a process found by its listening
+port.
 
-The original reservation design
-predates resource leases, repository-provenance handling and Unicode hardening;
-use the pinned source revision above when reconciling those details.
+```sh
+scripts/start.sh status
+scripts/start.sh start
+scripts/start.sh restart
+scripts/start.sh stop
+scripts/start.sh fg
+# Equivalent entry point for packaged Python installations:
+python3 -m agent_inbox.operations status
+```
+
+`start` bootstraps an unloaded job or kickstarts a loaded job without terminating
+an already-running process. `restart` explicitly boots out the owned job and
+bootstraps it again. `stop` boots out the job to prevent KeepAlive respawning it.
+`fg` runs the ordinary foreground server. Readiness is bounded and verifies that
+the health response PID matches the LaunchAgent's PID; a different listener cannot
+make startup look successful. Older runtimes lacking the PID field need updating
+before they can pass this stronger check. A port collision returns a diagnostic.
+Status also reports the client-configured database path and other `.db` files in
+the configured data directory, without opening their contents. Review the configured
+service error log rather than killing an unrelated listener.
+
+Foreground operation works without launchctl; background control requires macOS
+and an installed plist. These commands do not install or switch runtimes. Setup
+owns installation. A configured database remains the service's source of truth;
+creating or selecting another file does not repair the original service.
+
+## 15. Database recovery
+
+Recovery is an explicit offline reconciliation workflow that creates a new output.
+It never modifies an input database or replaces an existing output.
+
+```sh
+scripts/merge-db.sh first.db second.db --output recovered.db
+# Equivalent packaged entry point:
+python3 -m agent_inbox.recovery first.db second.db --output recovered.db
+```
+
+1. Open each existing input read-only and take a SQLite backup snapshot, including
+   committed WAL contents. Upgrade only the temporary snapshot's schema.
+2. Reject failed integrity/foreign-key checks, cloud account bindings, cloud
+   synchronization records and unsupported tables.
+3. Remap project integer IDs through case-insensitive project slugs and inbox IDs
+   through project plus local name. Never equate unrelated numeric IDs.
+4. Preserve opaque thread, email and announcement IDs. Matching IDs must agree on
+   immutable content; conflicting content or idempotency tokens abort recovery.
+   Reconcile duplicate read/join receipts using the earliest timestamp.
+5. Remap reservation owners/projects and allocate new local row IDs. Imported
+   active reservations become finished history with `released_by: "recovery"`.
+   Sessions and agent-name leases are omitted: recovery never revives execution
+   ownership. Duplicate reservation identities retain one historical row.
+6. Rebuild thread activity from imported mail, validate the complete result,
+   commit and checkpoint its WAL, close connections, then atomically publish the
+   new file without clobbering an existing path. Failures remove temporary output.
+
+Source databases can remain open while snapshots are taken, but snapshots are
+independent points in time: stop writers before final cutover if every latest
+message must be included. Review the result before configuring a service to use it.
+The utility performs no cutover and does not stop or restart services. Cloud-bound
+recovery requires a separate account-aware process and is deliberately refused.
+Inputs are the preserved backups; the output contains local mail, announcements,
+receipts, mappings and reservation history, not transient hook/update/session state.
+
+## 16. Source references
+
+- [README and commands](../README.md)
+- [Reservation design history](file-reservations-spec.md)
+- [Cloud protocol](cloud-sync-spec.md)
+- Implementation: `agent_inbox/service.py`, `db.py`, `server.py`, `client.py`,
+  `cli.py`, `identity.py`, `hooks.py`, `operations.py`, and `recovery.py`.

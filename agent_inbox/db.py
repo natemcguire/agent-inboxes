@@ -34,6 +34,23 @@ CREATE TABLE IF NOT EXISTS inboxes (
   UNIQUE (project_id, local_part)
 );
 
+CREATE TABLE IF NOT EXISTS announcements (
+  id TEXT PRIMARY KEY,
+  project TEXT COLLATE NOCASE,
+  sender TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  body_markdown TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  client_token TEXT NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_announcements_created ON announcements(created_at DESC, id);
+CREATE TABLE IF NOT EXISTS announcement_receipts (
+  announcement_id TEXT NOT NULL REFERENCES announcements(id) ON DELETE CASCADE,
+  inbox_id INTEGER NOT NULL REFERENCES inboxes(id),
+  read_at TEXT NOT NULL,
+  PRIMARY KEY (announcement_id, inbox_id)
+);
+
 CREATE TABLE IF NOT EXISTS threads (
   id              TEXT PRIMARY KEY,
   home_project_id INTEGER NOT NULL REFERENCES projects(id),
@@ -181,16 +198,21 @@ def get_connection(db_path: Union[str, Path, None] = None) -> sqlite3.Connection
     )
     conn.row_factory = sqlite3.Row
 
-    # Enforce pragmas
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.execute("PRAGMA journal_mode = WAL;")
-    conn.execute("PRAGMA busy_timeout = 5000;")
+    try:
+        # Enforce pragmas
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA busy_timeout = 5000;")
 
-    # Ensure permissions after creation
-    ensure_permissions(target_path, chmod_parent=own_parent)
+        # Ensure permissions after creation
+        ensure_permissions(target_path, chmod_parent=own_parent)
 
-    # Initialize schema
-    init_db(conn)
+        # Initialize schema
+        init_db(conn)
+
+    except BaseException:
+        conn.close()
+        raise
 
     return conn
 

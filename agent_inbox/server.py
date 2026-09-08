@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -159,9 +160,9 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
     @staticmethod
     def _history_limit(query: Dict[str, list]) -> int:
         try:
-            return int(query.get("limit", ["50"])[0])
+            return int(query.get("limit", ["200"])[0])
         except ValueError:
-            return 50
+            return 200
 
     def _get_session_pid(self) -> Optional[int]:
         """Optional X-Agent-Pid header (best-effort, informational)."""
@@ -192,6 +193,14 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
             path = parsed.path
             query = urllib.parse.parse_qs(parsed.query)
 
+            if path == "/v1/announcements":
+                rows = self._get_service().list_announcements(
+                    query.get("inbox", [""])[0],
+                    unread=query.get("unread", ["false"])[0] == "true",
+                    limit=self._history_limit(query))
+                self._send_json(HTTPStatus.OK, {"announcements": rows})
+                return
+
             # /healthz
             if path == "/healthz":
                 # Check DB responsiveness
@@ -200,8 +209,10 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     db_status = "ok"
                 except Exception:
                     db_status = "error"
-                self._send_json(HTTPStatus.OK, {
-                    "status": "ok",
+                self._send_json(HTTPStatus.OK if db_status == "ok" else HTTPStatus.SERVICE_UNAVAILABLE, {
+                    "status": "ok" if db_status == "ok" else "error",
+                    "service": "agent-inboxes",
+                    "pid": os.getpid(),
                     "db": db_status,
                     "version": __version__,
                 })
@@ -285,6 +296,7 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     payload["history"] = service.reservation_history(
                         None, limit=self._history_limit(query)
                     )
+                payload["entries"] = payload["reservations"] + payload.get("history", [])
                 self._send_json(HTTPStatus.OK, payload)
                 return
 
@@ -301,6 +313,7 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                         payload["history"] = service.reservation_history(
                             project, limit=self._history_limit(query)
                         )
+                    payload["entries"] = payload["reservations"] + payload.get("history", [])
                     self._send_json(HTTPStatus.OK, payload)
                     return
 
@@ -399,6 +412,18 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                 service = self._get_service()
                 result = service.release_agent(body.get("agent", ""), body.get("project", ""))
                 self._send_json(HTTPStatus.OK, result)
+                return
+
+            if path == "/v1/announcements":
+                body = self._read_json_body()
+                result = self._get_service().post_announcement(
+                    body.get("from"), body.get("subject"), body.get("body_markdown"),
+                    self._get_idempotency_key(), body.get("all_projects", False))
+                self._send_json(HTTPStatus.CREATED, result)
+                return
+            if len(parts) == 4 and parts[:2] == ["v1", "announcements"] and parts[3] == "read":
+                body = self._read_json_body()
+                self._send_json(HTTPStatus.OK, self._get_service().acknowledge_announcement(parts[2], body.get("inbox")))
                 return
 
             # POST /v1/emails
@@ -603,12 +628,23 @@ class AgentInboxServer(ThreadingHTTPServer):
         super().server_close()
 
 
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            conn = getattr(self._thread_db, "conn", None)
+            if conn is not None:
+                try:
+                    conn.close()
+                finally:
+                    del self._thread_db.conn
+
     def get_thread_connection(self) -> sqlite3.Connection:
         """Return this thread's SQLite connection, opening it on first use.
 
         Falls back to the shared ``db_conn`` only for a non-file (in-memory)
         database, where a second connection would not see the same data.
-        Per-thread connections are closed by GC when their request thread dies.
+        The owning request thread closes its connection in a finally block.
         """
         if not self.db_path:
             return self.db_conn
@@ -643,7 +679,11 @@ def run_server(host: Optional[str] = None, port: Optional[int] = None, db_path: 
         logging.basicConfig(level=logging.DEBUG)
     conn = get_connection(db_path)
     
-    server = AgentInboxServer((target_host, target_port), conn, verbose=verbose)
+    try:
+        server = AgentInboxServer((target_host, target_port), conn, verbose=verbose)
+    except BaseException:
+        conn.close()
+        raise
     print(f"Agent Inboxes service listening on http://{target_host}:{target_port}")
     print(f"Database: {get_db_path() if not db_path else db_path}")
     print("Press Ctrl+C to stop.")

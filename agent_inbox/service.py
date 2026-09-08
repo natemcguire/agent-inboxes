@@ -149,6 +149,57 @@ def _session_active_cutoff_iso() -> str:
 class InboxService:
     """Encapsulates transactional operations on the SQLite database."""
 
+    def post_announcement(self, sender, subject, body_markdown, client_token, all_projects=False):
+        sender = normalize_address(sender)
+        if not isinstance(all_projects, bool):
+            raise ValidationError("validation_error", "all_projects must be boolean")
+        for name, value, limit in (("subject", subject, 500), ("body_markdown", body_markdown, 100000), ("client_token", client_token, 200)):
+            if not isinstance(value, str) or not value.strip() or len(value) > limit:
+                raise ValidationError("validation_error", f"Invalid {name}")
+        project = None if all_projects else parse_address(sender)[1]
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            old = self.conn.execute("SELECT * FROM announcements WHERE client_token=?", (client_token,)).fetchone()
+            if old:
+                if any(old[k] != v for k, v in (("sender", sender), ("project", project), ("subject", subject), ("body_markdown", body_markdown))):
+                    raise ConflictError("idempotency_conflict", "Announcement key was used for different content")
+                result = dict(old)
+            else:
+                self.ensure_inbox(sender)
+                result = dict(id="ann_" + uuid.uuid4().hex, project=project, sender=sender,
+                              subject=subject, body_markdown=body_markdown,
+                              created_at=utc_now_iso(), client_token=client_token)
+                self.conn.execute("INSERT INTO announcements VALUES (:id,:project,:sender,:subject,:body_markdown,:created_at,:client_token)", result)
+            self.conn.execute("COMMIT")
+            result.pop("client_token", None)
+            return result
+        except BaseException:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def list_announcements(self, viewer, unread=False, limit=200):
+        viewer = normalize_address(viewer)
+        project = parse_address(viewer)[1]
+        self.ensure_inbox(viewer)
+        inbox_id = self._get_inbox_id(viewer)
+        rows = self.conn.execute("""SELECT a.rowid AS sequence,a.id,a.project,a.sender,a.subject,a.body_markdown,a.created_at,r.read_at
+            FROM announcements a LEFT JOIN announcement_receipts r
+            ON r.announcement_id=a.id AND r.inbox_id=?
+            WHERE (a.project IS NULL OR a.project=?) AND (?=0 OR r.read_at IS NULL)
+            ORDER BY a.created_at DESC,a.id DESC LIMIT ?""",
+            (inbox_id, project, int(unread), max(1,min(int(limit),200)))).fetchall()
+        return [dict(row) for row in rows]
+
+    def acknowledge_announcement(self, announcement_id, viewer):
+        viewer = normalize_address(viewer)
+        project = parse_address(viewer)[1]
+        row = self.conn.execute("SELECT id FROM announcements WHERE id=? AND (project IS NULL OR project=?)", (announcement_id, project)).fetchone()
+        if row is None:
+            raise NotFoundError("not_found", "Announcement not found in this inbox")
+        self.ensure_inbox(viewer)
+        self.conn.execute("INSERT OR IGNORE INTO announcement_receipts VALUES (?,?,?)", (announcement_id,self._get_inbox_id(viewer),utc_now_iso()))
+        return {"id": announcement_id, "reading_as": viewer, "acknowledged": True}
+
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
 
@@ -868,7 +919,12 @@ class InboxService:
                 if addr not in participants:
                     participants.append(addr)
 
+            roles = [r[0] for r in self.conn.execute(
+                "SELECT DISTINCT er.kind FROM email_recipients er JOIN emails e ON e.id=er.email_id "
+                "WHERE e.thread_id=? AND er.inbox_id=? AND er.read_at IS NULL",
+                (thread_id, inbox_id))]
             results.append({
+                "your_roles": roles,
                 "thread_id": thread_id,
                 "subject": t["subject"],
                 "participants": participants,
@@ -967,11 +1023,14 @@ class InboxService:
                 "references": references,
                 "read": is_read,
                 "sender_session": e["sender_session"],
+                "your_role": (rec_entry["kind"] if rec_entry is not None else
+                              "sender" if e["from_inbox_id"] == inbox_id else "participant"),
             })
 
         return {
             "thread_id": thread_id,
             "subject": thread_row["subject"],
+            "reading_as": norm_addr,
             "emails": email_dicts,
         }
 
@@ -1093,7 +1152,7 @@ class InboxService:
 
     def _finished_reservations(self, project_id: Optional[int], limit: int) -> List[sqlite3.Row]:
         """Finished (released/expired/forced) audit rows, newest first."""
-        limit = max(1, min(int(limit or 50), 200))
+        limit = max(1, min(int(limit or 200), 200))
         if project_id is None:
             return self.conn.execute(
                 self._RESERVATION_SELECT
@@ -1131,6 +1190,7 @@ class InboxService:
             "holder": f"{row['local_part']}@{row['project_slug']}",
             "session": row["holder_session"],
             "reason": row["reason"],
+            "active": row["released_at"] is None and row["expires_at"] > now,
             "ttl_seconds": row["ttl_seconds"],
             "created_at": row["created_at"],
             "expires_at": row["expires_at"],
@@ -1151,6 +1211,7 @@ class InboxService:
             "reason": row["reason"],
             "created_at": row["created_at"],
             "expires_at": row["expires_at"],
+            "active": False,
             "released_at": row["released_at"],
             "released_by": row["released_by"],
         }
@@ -1480,7 +1541,7 @@ class InboxService:
             result = [r for r in result if r["holder"] == norm]
         return result
 
-    def reservation_history(self, project_slug: Optional[str] = None, limit: int = 50) -> List[dict]:
+    def reservation_history(self, project_slug: Optional[str] = None, limit: int = 200) -> List[dict]:
         """Finished (released/expired/forced) audit rows, newest first.
 
         Per-project when a slug is given, machine-wide otherwise. The lazy

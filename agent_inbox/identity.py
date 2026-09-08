@@ -139,6 +139,7 @@ def derive_agent() -> str:
 # Environment variables that carry a runtime-provided session identifier.
 # Checked in order after the explicit AGENT_INBOX_SESSION override.
 _RUNTIME_SESSION_ENV_KEYS = (
+    "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_SESSION_ID",
     "CODEX_SESSION_ID",
     "CODEX_THREAD_ID",
@@ -157,10 +158,11 @@ def derive_session() -> str:
     Derive a short session identifier distinguishing concurrent agents that
     share the same inbox address (e.g. two Claude sessions in one project):
     1. AGENT_INBOX_SESSION environment variable if set (normalized slug).
-    2. A runtime session env var (CLAUDE_SESSION_ID, CODEX_SESSION_ID, ...),
+    2. A runtime session env var (CLAUDE_CODE_SESSION_ID, CODEX_SESSION_ID, ...),
        hashed to a stable short slug.
-    3. Stable per-process-tree fallback: hash of the parent PID plus its
-       process start time, so every CLI call from one agent session agrees.
+    3. CLAUDE_PID plus process start time, when supplied by the harness.
+    4. Parent PID plus process start time as a best-effort fallback; separate
+       tool shells require a runtime session ID or stable harness PID.
     """
     env_session = os.environ.get("AGENT_INBOX_SESSION")
     if env_session and env_session.strip():
@@ -171,7 +173,10 @@ def derive_session() -> str:
         if val and val.strip():
             return _short_session_hash(f"{key}:{val.strip()}")
 
-    ppid = os.getppid()
+    # A harness may invoke each CLI command through a different shell. Prefer
+    # its stable agent PID to that shell's PPID, and include process birth time.
+    claude_pid = os.environ.get("CLAUDE_PID", "")
+    ppid = int(claude_pid) if claude_pid.isdigit() and int(claude_pid) > 0 else os.getppid()
     start_time = ""
     try:
         res = subprocess.run(

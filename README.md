@@ -550,3 +550,34 @@ marketplace's `public/downloads/`. Keep the standalone installer's `FILES`
 allowlist and shared transport/validation code in sync with
 `agent_inbox/distribution.py` when adding modules. The offline installer accepts
 `--archive agent-inboxes-<full-commit>-runtime.tar --sha256 <expected-checksum>`.
+
+## Announcements and reliability tools
+
+Project announcements reach existing and future local inboxes. Add `--all-projects`
+for a machine-wide notice; acknowledgment is per inbox and explicit.
+
+```sh
+agent-inbox announce --subject 'Build setup' --body-file notice.md
+agent-inbox announcements --unread
+agent-inbox announcements --ack ann_EXAMPLE
+agent-inbox reservations --history --json
+scripts/start.sh status                 # start / stop / restart / fg also available
+scripts/merge-db.sh a.db b.db --output recovered.db
+```
+
+Reservation responses include combined `entries` with explicit `active` state;
+legacy `reservations` and `history` keys remain available. Thread reads identify
+`reading_as` and each message's `your_role`, separating To owners from CC observers.
+Runtime session IDs include `CLAUDE_CODE_SESSION_ID`, with `CLAUDE_PID` as a stable
+process fallback. HTTP request threads close their SQLite connections explicitly.
+
+Recovery writes a new validated database, remaps integer IDs and retires imported
+active reservations. It refuses cloud-bound inputs and never performs a service
+cutover. The service controller targets the installed LaunchAgent and verifies its
+PID; it does not kill arbitrary port holders. Neither command switches runtimes.
+
+For isolated instances, set `AGENT_INBOX_DIR`, `AGENT_INBOX_DB`, and
+`AGENT_INBOX_CLOUD_CONFIG` to separate paths. The last variable defaults to
+`~/.config/agent-inbox/cloud.json`; changing the database alone does not isolate
+cloud configuration. See the [technical specification](docs/coordination-system-spec.md)
+for scope, API fields, delivery behavior, operations and recovery semantics.

@@ -144,6 +144,17 @@ class InboxClient:
         res = self._request("GET", "/v1/inboxes", query=query)
         return res.get("inboxes", [])
 
+    def post_announcement(self, from_addr, subject, body_markdown, all_projects=False, client_token=None):
+        return self._request("POST", "/v1/announcements",
+            body={"from": from_addr, "subject": subject, "body_markdown": body_markdown, "all_projects": all_projects},
+            headers={"Idempotency-Key": client_token or str(uuid.uuid4())})
+
+    def list_announcements(self, inbox, unread=False, limit=200):
+        return self._request("GET", "/v1/announcements", query={"inbox": inbox, "unread": str(unread).lower(), "limit": limit})["announcements"]
+
+    def acknowledge_announcement(self, announcement_id, inbox):
+        return self._request("POST", f"/v1/announcements/{urllib.parse.quote(announcement_id, safe='')}/read", body={"inbox": inbox})
+
     def send_email(
         self,
         from_addr: str,
@@ -287,7 +298,7 @@ class InboxClient:
         return self._reservation_action("release", project, holder, session, paths, release_all)
 
     def list_reservations(self, project: str, holder: Optional[str] = None,
-                          history: bool = False, limit: int = 50) -> Dict[str, Any]:
+                          history: bool = False, limit: int = 200) -> Dict[str, Any]:
         """Active reservations for a project; add finished audit rows with
         history=True. Returns the full payload dict ({'reservations', 'history'?})."""
         query: Dict[str, Any] = {}
@@ -301,13 +312,19 @@ class InboxClient:
             query=query or None,
         )
 
-    def list_reservations_global(self, history: bool = False, limit: int = 50) -> Dict[str, Any]:
+    def list_reservations_global(self, history: bool = False, limit: int = 200) -> Dict[str, Any]:
         """Machine-wide reservations across projects (observer/web-UI view)."""
         query: Dict[str, Any] = {}
         if history:
             query["history"] = "1"
             query["limit"] = int(limit)
         return self._request("GET", "/v1/reservations", query=query or None)
+
+    def list_reservations_everything(self, limit: int = 200) -> List[dict]:
+        """Active and finished rows together, retaining explicit active state."""
+        result = self.list_reservations_global(history=True, limit=limit)
+        return result.get("entries", [dict(row, active=True) for row in result.get("reservations", [])] +
+                          [dict(row, active=False) for row in result.get("history", [])])
 
     def wait_reservations(
         self, project: str, paths: List[str], holder: str,

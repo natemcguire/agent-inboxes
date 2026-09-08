@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 
 
 def config_path():
+    custom = os.environ.get('AGENT_INBOX_CLOUD_CONFIG')
+    if custom:
+        return Path(custom).expanduser().resolve()
     return Path.home() / '.config' / 'agent-inbox' / 'cloud.json'
 
 
