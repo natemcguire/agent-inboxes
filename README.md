@@ -1,6 +1,6 @@
 # Agent Inboxes (`agent-inboxes`)
 
-> **Local-First Async Message Service for Coding Agents, with Optional Cloud Sync.**
+> **Agent Experience: durable context, work queues, messaging and reservations with built-in MQTT and NATS.**
 
 ---
 
@@ -9,7 +9,7 @@
 **Agent Inboxes** provides a local-first messaging service for AI coding agents (Claude Code, Codex, Orca, or custom autonomous harnesses) to coordinate asynchronously on the same Mac without sharing process state.
 
 ### Core Architectural Axioms
-1. **Python 3.11+ Standard Library ONLY:** Zero pip packages or third-party dependencies (`sqlite3`, `http.server`, `argparse`, `urllib`, `json`, `subprocess`).
+1. **Python 3.11+ plus a managed native broker:** Python code uses the standard library without pip runtime packages. Setup downloads a pinned, checksum-verified NATS server; both NATS and MQTT listeners are built in.
 2. **Loopback Only (`127.0.0.1:8791`):** Strictly binds to IPv4 localhost. Because the service is unauthenticated, this is enforced, not just a default: `serve` refuses to start and raises an error if `--host` or `AGENT_INBOX_HOST` is set to anything other than `127.0.0.1`/`localhost` (e.g. `0.0.0.0` or a LAN address). It never rebinds silently. Port `8791` was chosen to avoid collisions with standard local services (Codey `3456`, ntfy `8082`, WhatsApp bridge `8085`, webhook listener `8086`, Miniwatcher `8585`, TinyCam `8788`).
 3. **Transactional SQLite (`~/.agent-inboxes/inbox.db`):** WAL mode enabled (`PRAGMA journal_mode = WAL`), foreign keys enforced (`PRAGMA foreign_keys = ON`), 5000ms busy timeout (`PRAGMA busy_timeout = 5000`).
 4. **Strict Local Permissions:** The database file is always locked to mode `0600` (`rw-------`). A directory the service creates for its data — the default `~/.agent-inboxes/` — is set to `0700` (`rwx------`). If you point `--db`/`AGENT_INBOX_DB` at a file inside a **pre-existing shared directory** (e.g. `/tmp`), the service leaves that directory's permissions untouched rather than rewriting a directory it does not own. Only the loopback server opens the database directly; CLI clients interact via HTTP.
@@ -24,12 +24,12 @@
 [Read the consolidated inbox, identity, reservation and resource-lease specification](docs/coordination-system-spec.md).
 
 The CLI and local HTTP service run independently with Python3.11+ and its standard
-library. No Node build, marketplace account, paid API or cloud connection is needed
+library, plus the managed NATS binary. No Node build, marketplace account, paid API or cloud connection is needed
 for local messaging and reservations. The setup script installs a macOS LaunchAgent;
 foreground startup is also available below. Keep cloud sync disabled for local-only use.
 
 The server bundles a standalone browser UI at **http://127.0.0.1:8791/**.
-Run `python3 bin/agent-inbox serve`, then open that address. No frontend build,
+Run `python3 bin/agent-inbox ae setup` once, then `python3 bin/agent-inbox serve`, then open that address. No frontend build,
 CDN, marketplace login or separate UI server is required. The same UI is included
 in the downloadable runtime archive.
 
@@ -61,10 +61,87 @@ agent-inbox setup
 ### Method 3: Foreground Development Server
 To run the server in the foreground with verbose logs:
 ```bash
+agent-inbox ae setup
 agent-inbox serve --verbose
 ```
 
 ---
+
+## Agent Experience (2.0)
+
+[Detailed AE specification and implementation checklist](docs/agent-experience-spec.md).
+
+Start each session with `agent-inbox ae context`. It combines current assignments,
+ready work, blocked dependencies, unread mail with To/CC roles, announcements,
+decisions, subscriptions, file reservations and actions requiring attention.
+Returned excerpts are bounded; retrieve full tasks, history and mail when needed.
+
+```sh
+agent-inbox ae context
+agent-inbox ae task create --title 'Verify release' --path src/
+# Use the returned task ID and latest version in each subsequent command.
+agent-inbox ae task claim TASK_ID --version 1
+agent-inbox reserve src/ --reason 'Verify release'
+agent-inbox ae task complete TASK_ID --version 2 --result 'Checks passed; see report'
+agent-inbox ae task history TASK_ID
+agent-inbox ae decision record --title 'Release policy' --body 'Require a healthy build' --source-ref docs/release.md
+agent-inbox ae subscribe task TASK_ID
+# SOURCE and CURSOR come from context or the previous events response.
+agent-inbox ae events --source SOURCE --after CURSOR --wait 60
+agent-inbox ae ack EVENT_SEQUENCE --source SOURCE
+```
+
+Create dependencies with repeated `--depends-on TASK_ID`; target an agent with
+`--target agent@project`. Blocking requires `task block ... --version N --note ...`;
+recovery uses `task resume ... --version N --note ...`. Handoff uses
+`task handoff ... --version N --target agent@project --note ...`. The receiving
+agent claims the returned version and keeps the handoff note. Replacement runtime
+sessions explicitly resume their own address's assignment. File leases remain
+separate: handoff does not release them, and task ownership does not authorize edits.
+
+For explicit identity or retry control, put `--actor`, `--session` and
+`--request-id` immediately after `ae`, before the subcommand. Reuse a request ID
+only for an identical mutation; changed content is rejected. Event acknowledgment,
+mail read receipts, task acceptance and task completion are separate actions.
+
+### Built-in transports and hook removal
+
+Normal `serve` starts HTTP/UI on 8791, NATS on 8792 and MQTT 3.1.1 on 8793,
+all on loopback. `ae status` reports readiness. Setup installs NATS 2.14.6 for
+macOS/Linux on arm64/amd64. Initial setup downloads the verified binary from GitHub;
+subsequent startup uses the local copy. Missing binaries fail startup explicitly.
+Broker state and mode-0600 credentials live in `<database-path>.ae/`.
+No work account, cloud broker or remote machine is connected by setup.
+
+Agents use the same commands and event IDs through HTTP, NATS or MQTT. SQLite is
+the work and replay authority. A live broker notification is not proof of agent
+execution or durable processing: persist the source/cursor, deduplicate events,
+and replay after reconnect. MQTT sessions use JetStream; there is no second AE
+history store. See the specification for envelopes, subjects and response topics.
+
+Runtime delivery hooks are removed. `hook-check` is a silent compatibility no-op;
+`hooks install` is unavailable. Running `setup` or `hooks uninstall` removes only
+legacy Agent Inbox hook entries, preserving unrelated hooks. Use context at session
+boundaries and event subscriptions/long polling while working. The service does
+not inject turns or run an agent automatically.
+
+### Verification and upgrade boundaries
+
+`python3 scripts/verify-ae.py` runs an isolated real server/CLI/broker smoke test,
+including context, handoff, history, the bundled UI route and broker shutdown.
+It provisions its own temporary broker binary and disables only the unrelated
+update worker. The unit suite includes claim races, ownership/version enforcement,
+dependencies, restart reconstruction, event replay and real MQTT/NATS traffic when
+the test prerequisites above are installed. Use temporary `AGENT_INBOX_DIR`,
+`AGENT_INBOX_DB` and `AGENT_INBOX_CLOUD_CONFIG` for isolated testing.
+
+Provision the broker before switching an existing installation to 2.0. Back up the
+SQLite database and broker state together. The generic database merge tool refuses
+nonempty AE work state rather than silently discarding it. AE state is local to one
+authoritative service; cloud mail sync does not synchronize task claims or turn
+file reservations into cross-machine locks. Broker clients share a same-user trust
+boundary. The bundled browser UI remains the mail/announcements/reservations UI;
+AE task management is exposed through the CLI and APIs.
 
 ## 3. Data Model & Identity Derivation
 
@@ -217,7 +294,7 @@ Pull is independent of push backoff and imports each page atomically. Read state
 sessions, leases, and reservations remain local. Family addresses are shared
 mailboxes across machines; coordinate task ownership in `Claim:` threads. Every
 cloud-enabled reservation reports its local scope. Pulled old-timestamp mail
-triggers hooks using local delivery counters.
+records local delivery counters and AE journal events.
 
 `cloud replay` rereads the bound stream without deleting read state or repeating
 arrival notifications. Server generation changes trigger replay before retained
@@ -504,7 +581,7 @@ When the local service is running (`running: true`):
 
 ## 7. Automated Testing & Verification
 
-The test suite requires Python 3.11+ and uses `unittest` (standard library only).
+The test suite requires Python 3.11+ and uses `unittest`. The real MQTT/NATS acceptance test additionally needs `paho-mqtt` in the test environment and the provisioned broker; otherwise that test skips. These are distinct from controlled API tests.
 
 ```bash
 # Run all tests
@@ -537,7 +614,7 @@ service setup fails after installation, run `agent-inbox setup` again.
 
 The serving process checks availability in a background thread at most once
 per 24 hours, including across restarts. Network failures are silent. Cached
-notices appear in `list` and per-turn hooks; JSON list output stays valid, with
+notices appear in `list`; JSON list output stays valid, with
 the notice on stderr. Updates are never installed automatically. Versions must
 increase numerically; a different commit with the same version does not count
 as newer. `agent_inbox.__version__` is the version source for both runtime and

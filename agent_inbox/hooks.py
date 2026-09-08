@@ -1,14 +1,4 @@
-"""Layer-2 mail delivery: per-turn harness hooks for agent runtimes.
-
-`hook-check` is wired into runtime hook systems (Claude Code, Codex CLI,
-Gemini CLI) so an ACTIVE agent has unread mail injected into its context on
-every prompt/tool turn, instead of waiting for the slow checkpoint cadence.
-The emit-dedup stamp keeps it quiet: it speaks only when there is NEW unread
-activity, or unread mail is still pending and the last nag is >5 minutes old.
-
-A broken mailbox must never break an agent's session: every path here fails
-silent and fast (no output, exit 0).
-"""
+"""Legacy hook cleanup and notification-stamp compatibility. Delivery is retired."""
 
 import json
 import time
@@ -86,42 +76,7 @@ def build_notice(address: str, threads: List[dict], now: Optional[float] = None,
 
 
 def run_hook_check(output_format: str = "plain", stdin_text: str = "") -> int:
-    """Entry point for `agent-inbox hook-check`. Always exits 0; prints at most
-    one payload. `json` format wraps the line for Gemini's JSON-only stdout."""
-    try:
-        from agent_inbox.client import InboxClient
-        from agent_inbox.identity import derive_identity
-
-        _, _, address = derive_identity()
-        client = InboxClient(timeout=HOOK_TIMEOUT_SECONDS)
-        threads = client.list_threads(address, unread=True, limit=50)
-        line = build_notice(address, threads)
-        try:
-            announcements = client.list_announcements(address, unread=True)
-            projected = [dict(activity_id=a["sequence"], subject=a["subject"]) for a in announcements]
-            line = "\n".join(filter(None, (line, build_notice(address, projected, announcement=True))))
-        except Exception:
-            pass  # Older servers may not expose announcements yet.
-        from agent_inbox.updates import update_notice
-        line = "\n".join(filter(None, (line, update_notice())))
-        if not line:
-            return 0
-        if output_format == "json":
-            event = "UserPromptSubmit"
-            try:
-                event = json.loads(stdin_text).get("hookEventName") or event
-            except Exception:
-                pass
-            print(json.dumps({
-                "hookSpecificOutput": {
-                    "hookEventName": event,
-                    "additionalContext": line,
-                }
-            }))
-        else:
-            print(line)
-    except Exception:
-        pass
+    """Silent compatibility no-op for already-installed legacy hook commands."""
     return 0
 
 
@@ -248,29 +203,8 @@ def hooks_targets() -> List[Tuple[str, Path, List[str], str]]:
 
 
 def install_hooks() -> List[Tuple[str, str]]:
-    """Wire hook-check into every runtime whose config dir exists.
-    Returns (runtime, status) tuples."""
-    results: List[Tuple[str, str]] = []
-    base = launcher_command()
-    for runtime, path, events, fmt in hooks_targets():
-        if not path.parent.is_dir():
-            results.append((runtime, "skipped (not installed)"))
-            continue
-        command = f"{base} hook-check" + (" --format=json" if fmt == "json" else "")
-        config = _load_json(path)
-        changed = _merge_hooks_config(config, events, command)
-        if changed:
-            _save_json(path, config)
-        status = "installed" if changed else "already installed"
-        if runtime == "Codex CLI":
-            flag = Path.home() / ".codex" / "config.toml"
-            if not _codex_features_enabled(flag):
-                if _enable_codex_hooks_flag(flag):
-                    status += " (+enabled [features] codex_hooks in config.toml)"
-                else:
-                    status += " (NOTE: enable [features] codex_hooks = true in ~/.codex/config.toml)"
-        results.append((runtime, status))
-    return results
+    """Runtime hooks have been replaced by the explicit AE event interface."""
+    raise RuntimeError("Runtime hooks were removed. Use agent-inbox ae context and ae events.")
 
 
 def uninstall_hooks() -> List[Tuple[str, str]]:
@@ -303,7 +237,7 @@ def hooks_status() -> List[Tuple[str, str]]:
         if not path.parent.is_dir():
             results.append((runtime, "not installed"))
         elif wired:
-            results.append((runtime, "active: " + ", ".join(wired)))
+            results.append((runtime, "legacy wiring (delivery disabled): " + ", ".join(wired)))
         else:
             results.append((runtime, "not wired"))
     return results

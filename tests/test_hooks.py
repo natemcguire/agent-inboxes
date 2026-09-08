@@ -64,44 +64,26 @@ class TestBuildNotice(unittest.TestCase):
 
 
 class TestHooksWiring(unittest.TestCase):
+    def test_retired_hook_is_silent_and_cannot_be_installed(self):
+        import io
+        from agent_inbox.cli import main
+        with mock.patch("sys.stdout",io.StringIO()) as stdout, mock.patch("agent_inbox.hooks.get_connection",side_effect=AssertionError("No DB access")):
+            self.assertEqual(hooks.run_hook_check("json","{}"),0)
+            self.assertEqual(main(["hook-check","--format=json"]),0)
+            self.assertEqual(stdout.getvalue(),"")
+        with self.assertRaises(RuntimeError):hooks.install_hooks()
 
-    def _run(self, home):
-        with mock.patch.object(Path, "home", classmethod(lambda cls: home)):
-            return {
-                "install": dict(hooks.install_hooks()),
-                "status": dict(hooks.hooks_status()),
-            }
-
-    def test_install_is_idempotent_and_preserves_existing_hooks(self):
+    def test_cleanup_preserves_other_hooks_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            (home / ".claude").mkdir()
-            settings = home / ".claude" / "settings.json"
-            settings.write_text(json.dumps({
-                "hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "echo keep"}]}]}
-            }), encoding="utf-8")
-
-            with mock.patch.object(Path, "home", classmethod(lambda cls: home)):
-                self.assertEqual(dict(hooks.install_hooks())["Claude Code"], "installed")
-                self.assertEqual(dict(hooks.install_hooks())["Claude Code"], "already installed")
-                cfg = json.loads(settings.read_text())
-                ups = cfg["hooks"]["UserPromptSubmit"]
-                self.assertEqual(len(ups), 2)  # existing + ours
-                self.assertIn("PostToolUse", cfg["hooks"])
-                # Uninstall removes only ours, keeps the pre-existing hook.
-                hooks.uninstall_hooks()
-                cfg2 = json.loads(settings.read_text())
-                self.assertEqual(
-                    cfg2["hooks"]["UserPromptSubmit"],
-                    [{"hooks": [{"type": "command", "command": "echo keep"}]}],
-                )
-
-    def test_absent_runtime_is_skipped(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)  # no runtime config dirs
-            with mock.patch.object(Path, "home", classmethod(lambda cls: home)):
-                res = dict(hooks.install_hooks())
-            self.assertIn("skipped", res["Claude Code"])
+            home=Path(tmp);(home/".claude").mkdir()
+            settings=home/".claude"/"settings.json"
+            keep={"hooks":[{"type":"command","command":"echo keep"}]}
+            ours={"hooks":[{"type":"command","command":"agent-inbox hook-check"}]}
+            settings.write_text(json.dumps({"hooks":{"UserPromptSubmit":[keep,ours]}}))
+            with mock.patch.object(Path,"home",classmethod(lambda cls:home)):
+                self.assertEqual(dict(hooks.uninstall_hooks())["Claude Code"],"removed")
+                self.assertEqual(json.loads(settings.read_text())["hooks"]["UserPromptSubmit"],[keep])
+                self.assertEqual(dict(hooks.uninstall_hooks())["Claude Code"],"nothing to remove")
 
 
 if __name__ == "__main__":

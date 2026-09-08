@@ -14,6 +14,9 @@ class RecoveryError(ValueError):
 
 
 def _check(conn):
+    for table in ("ae_tasks", "ae_decisions", "ae_subscriptions", "ae_requests"):
+        if conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+            raise RecoveryError("AE work state requires preserving its source database; generic merge is refused")
     if conn.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
         raise RecoveryError('Database integrity check failed')
     if conn.execute('PRAGMA foreign_key_check').fetchone():

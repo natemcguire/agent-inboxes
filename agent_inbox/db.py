@@ -209,6 +209,8 @@ def get_connection(db_path: Union[str, Path, None] = None) -> sqlite3.Connection
 
         # Initialize schema
         init_db(conn)
+        from agent_inbox.ae import initialize
+        initialize(conn)
 
     except BaseException:
         conn.close()

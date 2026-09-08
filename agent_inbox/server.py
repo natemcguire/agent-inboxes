@@ -193,6 +193,39 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
             path = parsed.path
             query = urllib.parse.parse_qs(parsed.query)
 
+            if path.startswith("/v1/ae/"):
+                from agent_inbox.ae import AgentExperience
+                ae = AgentExperience(self.server.get_thread_connection())
+                actor = query.get("actor", [""])[0]
+                try:
+                    if path == "/v1/ae/context":
+                        result = ae.context(actor, query.get("session", [""])[0], int(query.get("limit", ["20"])[0]))
+                    elif path == "/v1/ae/events":
+                        after = int(query.get("after", ["0"])[0])
+                        source = query.get("source", [None])[0]
+                        deadline = time.monotonic() + max(0, min(float(query.get("wait", ["0"])[0]), 60))
+                        while True:
+                            result = ae.events(actor, after, int(query.get("limit", ["100"])[0]), source)
+                            if result["events"] or time.monotonic() >= deadline:
+                                break
+                            after, source = result["cursor"], result["source"]
+                            time.sleep(.1)
+                    elif path == "/v1/ae/status":
+                        bus = getattr(self.server, "ae_bus", None)
+                        result = {"source": ae.source, "transport": bus.status() if bus else {"connected": False, "error": "Managed AE runtime is not started"}}
+                    elif path.startswith("/v1/ae/decisions/"):
+                        result = ae.decision(urllib.parse.unquote(path.removeprefix("/v1/ae/decisions/")), actor)
+                    elif path.startswith("/v1/ae/task-history/"):
+                        result = ae.history(urllib.parse.unquote(path.removeprefix("/v1/ae/task-history/")), actor, int(query.get("after", ["0"])[0]), int(query.get("limit", ["100"])[0]))
+                    elif path.startswith("/v1/ae/tasks/"):
+                        result = ae.task(urllib.parse.unquote(path.removeprefix("/v1/ae/tasks/")), actor)
+                    else:
+                        raise NotFoundError("not_found", "Unknown AE route")
+                except (ValueError, IndexError) as exc:
+                    raise ValidationError("invalid_ae_request", str(exc))
+                self._send_json(HTTPStatus.OK, result)
+                return
+
             from agent_inbox.ui import ASSETS
             if path in ASSETS:
                 content_type, content = ASSETS[path]
@@ -223,8 +256,11 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     db_status = "ok"
                 except Exception:
                     db_status = "error"
-                self._send_json(HTTPStatus.OK if db_status == "ok" else HTTPStatus.SERVICE_UNAVAILABLE, {
-                    "status": "ok" if db_status == "ok" else "error",
+                bus = getattr(self.server, "ae_bus", None)
+                healthy = db_status == "ok" and (bus is None or bus.connected)
+                self._send_json(HTTPStatus.OK if healthy else HTTPStatus.SERVICE_UNAVAILABLE, {
+                    "status": "ok" if healthy else "error",
+                    "ae_transport": bus.status() if bus else None,
                     "service": "agent-inboxes",
                     "pid": os.getpid(),
                     "db": db_status,
@@ -413,6 +449,12 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
             parts = [urllib.parse.unquote(p) for p in path.strip("/").split("/")]
+
+            if path == "/v1/ae/command":
+                from agent_inbox.ae import AgentExperience
+                result = AgentExperience(self.server.get_thread_connection()).command(self._read_json_body())
+                self._send_json(HTTPStatus.OK, result)
+                return
 
             # POST /v1/leases/claim | /v1/leases/release
             if path == "/v1/leases/claim":
@@ -702,6 +744,15 @@ def run_server(host: Optional[str] = None, port: Optional[int] = None, db_path: 
     print(f"Database: {get_db_path() if not db_path else db_path}")
     print("Press Ctrl+C to stop.")
 
+    from agent_inbox.ae_bus import AgentBus
+    server.ae_bus = AgentBus(server.db_path, int(os.environ.get("AGENT_INBOX_AE_NATS_PORT", "8792")), int(os.environ.get("AGENT_INBOX_AE_MQTT_PORT", "8793")))
+    server.ae_bus.start()
+    if not server.ae_bus.ready.wait(12) or not server.ae_bus.connected:
+        server.ae_bus.stop()
+        server.server_close()
+        conn.close()
+        raise RuntimeError(server.ae_bus.error or "AE broker startup timed out")
+
     from agent_inbox.updates import UpdateWorker
     updates = UpdateWorker(server.db_path)
     updates.start()
@@ -711,5 +762,6 @@ def run_server(host: Optional[str] = None, port: Optional[int] = None, db_path: 
         print("\nStopping server...")
     finally:
         updates.stopped.set()
+        server.ae_bus.stop()
         server.server_close()
         conn.close()

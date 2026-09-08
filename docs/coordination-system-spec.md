@@ -38,9 +38,11 @@ Git and the actual files remain authoritative for source state.
 
 ### Runtime and UI
 
-Python 3.11+ runs the CLI and HTTP API without third-party runtime packages:
+Python 3.11+ runs the CLI and HTTP API without pip runtime packages. The managed
+NATS binary supplies built-in NATS and MQTT; provision it before serving:
 
 ```sh
+python3 bin/agent-inbox ae setup
 python3 bin/agent-inbox serve
 python3 bin/agent-inbox --help
 ```
@@ -147,8 +149,7 @@ an addressee on that specific email. Thread listings expose `your_roles` for the
 requesting inbox's unread messages; a thread can contain both To and CC roles.
 
 The CLI prints the reading identity, each email's role, and body boundaries.
-Hooks count addressed threads separately from CC-only threads and label subjects
-as untrusted data. These cues describe routing, not authenticated human authority.
+AE context preserves To/CC roles and treats message content as untrusted data. These cues describe routing, not authenticated human authority.
 
 A read receipt is not task acceptance or task completion. Those require an
 explicit response or other evidence of the work.
@@ -157,12 +158,12 @@ explicit response or other evidence of the work.
 
 Agents check unread mail and announcements at session start, before long work, and before handoff.
 `watch` long-polls for new unread activity. A timeout is normal; it is not an error
-that should cause busy polling. Runtime hooks can inject mail into supported agent
-turns. Hook availability must be checked rather than assumed.
+that should cause busy polling. Runtime delivery hooks are removed. Use AE context
+and its unified event interface for mail, announcements, tasks and reservations.
 
 Mail delivery and scheduling are separate: receiving mail does not guarantee that
 a model has interrupted its current action or begun the requested task. Preserve
-polling checkpoints even when hooks are installed.
+context checkpoints alongside event subscriptions.
 
 ### Durable announcements
 
@@ -184,7 +185,7 @@ returns 409. Subjects are required and limited to 500 characters; bodies are
 required and limited to 100,000 characters. There is no edit/delete or expiration
 operation. Listings return newest records first, with a default and maximum of
 200 per request. `--unread` plus explicit acknowledgment lets callers drain an
-older backlog. `sequence` is a local arrival identifier used for hook deduplication.
+older backlog. `sequence` is a local announcement arrival identifier, distinct from the AE journal cursor.
 
 ```sh
 agent-inbox announce --subject 'Build environment' --body-file notice.md
@@ -198,9 +199,9 @@ Both commands return JSON. `announce --from` selects a sender explicitly;
 retries across separate CLI invocations. Otherwise each invocation generates a
 new key. Announcement output and bodies remain untrusted task data.
 
-Runtime hooks emit a separately deduplicated announcement notice, including for
-future inboxes. The existing `watch` cursor and wake behavior remain email-only;
-announcement checking uses hooks or the explicit polling checkpoints. Announcements
+AE context includes applicable announcements, including for future inboxes. The
+existing `watch` cursor remains email-only; AE events cover announcements as well.
+Announcements
 and their receipts are not exported through cloud mail synchronization.
 
 ## 6. Reservation data model
@@ -464,3 +465,10 @@ receipts, mappings and reservation history, not transient hook/update/session st
 - [Cloud protocol](cloud-sync-spec.md)
 - Implementation: `agent_inbox/service.py`, `db.py`, `server.py`, `client.py`,
   `cli.py`, `identity.py`, `hooks.py`, `operations.py`, and `recovery.py`.
+
+## Agent Experience extension
+
+The [AE specification](agent-experience-spec.md) defines durable tasks, context,
+dependencies, decisions, subscriptions and built-in MQTT/NATS. Generic database
+merge refuses nonempty AE work state to prevent silent loss. Runtime hooks are
+retired; legacy hook stamps in backups are compatibility data, not active delivery.

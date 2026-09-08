@@ -28,7 +28,7 @@ from agent_inbox.launchagent import (
     uninstall_launchagent,
 )
 from agent_inbox.models import InboxError, ServerNotRunningError
-from agent_inbox.hooks import hooks_status, install_hooks, run_hook_check, uninstall_hooks
+from agent_inbox.hooks import hooks_status, uninstall_hooks
 from agent_inbox.project_setup import ONBOARDING_PROMPT, copy_to_clipboard, setup_global, setup_project
 from agent_inbox.server import run_server
 
@@ -645,6 +645,8 @@ def cmd_watch(args: argparse.Namespace, client: InboxClient) -> int:
 def cmd_setup(args: argparse.Namespace) -> int:
     """Create data directory and install/load macOS LaunchAgent."""
     try:
+        from agent_inbox.ae_bus import provision
+        provision()
         data_dir = get_data_dir()
         data_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -664,8 +666,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
         for runtime, target, status in setup_global():
             print(f"Global instructions [{runtime}] {target}: {status}")
 
-        for runtime, status in install_hooks():
-            print(f"Hooks [{runtime}]: {status}")
+        for runtime, status in uninstall_hooks():
+            print(f"Legacy hook cleanup [{runtime}]: {status}")
 
         # Test healthz
         client = InboxClient()
@@ -753,12 +755,10 @@ def cmd_claim(args: argparse.Namespace, client: InboxClient) -> int:
 
 
 def cmd_hooks(args: argparse.Namespace) -> int:
-    """Install/uninstall/report the per-turn mail delivery hooks."""
+    """Remove/report legacy hook wiring; runtime delivery is retired."""
     try:
         action = args.hooks_action
-        if action == "install":
-            rows = install_hooks()
-        elif action == "uninstall":
+        if action == "uninstall":
             rows = uninstall_hooks()
         else:
             rows = hooks_status()
@@ -829,6 +829,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Sub-commands")
+
+    from agent_inbox.ae_cli import add_parser as add_ae_parser
+    add_ae_parser(subparsers)
 
     p_cloud = subparsers.add_parser("cloud", help="Configure optional cloud mail sync")
     cloud_commands = p_cloud.add_subparsers(dest="cloud_action", required=True)
@@ -963,8 +966,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_proj.add_argument("--copy", action="store_true", help="Also copy the onboarding prompt to the clipboard")
 
     # prompt
-    p_hooks = subparsers.add_parser("hooks", help="Manage per-turn mail delivery hooks for agent runtimes")
-    p_hooks.add_argument("hooks_action", choices=["install", "uninstall", "status"], help="What to do")
+    p_hooks = subparsers.add_parser("hooks", help="Remove or inspect legacy hook wiring")
+    p_hooks.add_argument("hooks_action", choices=["uninstall", "status"], help="What to do")
 
     p_hc = subparsers.add_parser("hook-check")
     p_hc.add_argument("--format", dest="hc_format", choices=["plain", "json"], default="plain")
@@ -988,6 +991,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.command:
         parser.print_help(sys.stderr)
         return 1
+
+    if args.command == "hook-check":
+        return 0  # Legacy hook commands do no I/O or context injection.
+
+    if args.command == "ae":
+        from agent_inbox.ae_cli import run
+        return run(args)
 
     if args.command == "update":
         from agent_inbox.updates import run_update
@@ -1035,19 +1045,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_prompt(args)
     elif args.command == "hooks":
         return cmd_hooks(args)
-    elif args.command == "hook-check":
-        # Read hook stdin defensively: some runtimes pipe JSON and close, but a
-        # runtime (or shell) that leaves the pipe open must never hang the hook.
-        stdin_text = ""
-        if args.hc_format == "json" and not sys.stdin.isatty():
-            import select
-            try:
-                ready, _, _ = select.select([sys.stdin], [], [], 0.2)
-                if ready:
-                    stdin_text = sys.stdin.read()
-            except Exception:
-                pass
-        return run_hook_check(args.hc_format, stdin_text)
     elif args.command == "claim":
         return cmd_claim(args, client)
 

@@ -10,6 +10,8 @@ END_MARKER = "<!-- agent-inboxes:end -->"
 MANAGED_BLOCK = """<!-- agent-inboxes:start -->
 ## Agent Inboxes
 
+Run `agent-inbox ae context` at session start and after context loss. It restores assignments, dependencies, decisions, unread messages and reservations. Use `agent-inbox ae events --source <source> --after <cursor> --wait 60` to receive relevant changes. Accept work with `ae task claim`; report blockers, completion evidence and handoff notes through `ae task`. Task ownership does not replace file reservations.
+
 If the `agent-inbox` command is not installed on this machine, ignore this section.
 
 Use the local `agent-inbox` CLI for durable coordination with agents in other sessions, worktrees, or projects. Your address is `<agent>@<project>`: the project is derived from Git, and the agent name comes from `AGENT_INBOX_AGENT` or your runtime family. Run `agent-inbox whoami` before using it. When several agents of the same family may run concurrently in one project, claim a unique slot at session start with `eval "$(agent-inbox claim)"` — it assigns the lowest free name (`claude`, `claude-2`, `claude-3`, ...) and the lease expires after 2 hours idle. Agents sharing one address are still told apart by session id — `agent-inbox whoami` shows yours (override with `AGENT_INBOX_SESSION`) and mail is stamped with the sender's session.
@@ -20,7 +22,6 @@ Polling checkpoints:
 - After finishing or handing off work, send any required completion reply, then check unread mail once more before ending the session.
 - To subscribe to push delivery, run `agent-inbox watch` as a background task: it blocks until new mail arrives (exit 0) or times out (exit 3), so its exit wakes you. Relaunch it after handling the mail.
 - Do not busy-poll in a loop; use `watch` or these checkpoints.
-- When delivery hooks are installed (`agent-inbox hooks status`), unread mail is also injected into your context automatically each turn; the checkpoints above remain the guaranteed fallback.
 
 Addressing:
 - Use full lowercase addresses. Use `agent-inbox inboxes --project <slug>` when the recipient is not already named in the task; do not guess a person's address.
