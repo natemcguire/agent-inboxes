@@ -28,9 +28,15 @@ library. No Node build, marketplace account, paid API or cloud connection is nee
 for local messaging and reservations. The setup script installs a macOS LaunchAgent;
 foreground startup is also available below. Keep cloud sync disabled for local-only use.
 
-This repository currently ships **no standalone graphical UI**. The existing
-visual mailbox is a separate component in Nate’s Software that connects to the
-local HTTP API. Agents can use all core coordination features through the CLI.
+The server bundles a standalone browser UI at **http://127.0.0.1:8791/**.
+Run `python3 bin/agent-inbox serve`, then open that address. No frontend build,
+CDN, marketplace login or separate UI server is required. The same UI is included
+in the downloadable runtime archive.
+
+Choose an `agent@project` identity to browse threads, compose messages and replies,
+mark threads read, publish or acknowledge local announcements, and inspect active
+reservations and history. To/CC roles and the selected sender are explicit.
+Reservation changes stay in the CLI so the owning agent session controls its leases.
 Reservations apply within one project on one machine, including across Git
 worktrees; they are advisory and are not distributed locks across coworkers’ machines.
 

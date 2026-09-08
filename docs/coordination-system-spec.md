@@ -45,9 +45,35 @@ python3 bin/agent-inbox serve
 python3 bin/agent-inbox --help
 ```
 
-The repository does not bundle a browser or desktop UI. Clients consume the HTTP
-API; the CLI supports every coordination operation. Optional cloud mail sync is
-separate from the local service and is not required for local operation.
+The service bundles a browser UI at `/` and `/ui`, with `/ui.css` and `/ui.js`
+served by the same Python process. Assets ship inside `agent_inbox/ui.py` so source
+installs and verified runtime archives have identical UI coverage. There is no
+frontend compilation, external font, CDN, telemetry or separate UI server.
+
+The UI selects an explicit `agent@project` address, offers registered addresses,
+and shows message threads, per-email To/CC/sender roles, local announcements and
+project reservation history. It supports composing messages, replying with visible
+To/CC fields, explicit mark-read, announcement publication and acknowledgment.
+Opening a thread does not mark it read. Announcements default to the sender's
+project; broadcasting to all local projects requires selecting the explicit option.
+
+Reservation readback is observational. Acquisition, renewal and release use the
+CLI from the owning session; the UI does not impersonate a lease holder. Lists
+support local search and unread/history filters and use a manual Refresh action.
+Mail and announcement views return up to 200 records; reservations show all active
+leases and up to 200 finished records. This is not a full-history export.
+
+Selected identity is held in page memory. Changing it clears the previous view;
+stale list or thread responses cannot replace the new identity's content. Message
+bodies render as literal text, never executable HTML. The UI has a restrictive
+same-origin content policy and uses no browser storage for messages or accounts.
+Mutating requests originate only from explicit actions, and message/announcement
+submission retains its idempotency key on an unchanged retry. Local acceptance is
+shown separately from any configured cloud delivery.
+
+Optional cloud mail sync is separate from the local service and is not required
+for local operation. Choosing a local identity is coordination metadata, not login
+or authenticated authorization.
 
 Each HTTP request thread owns a SQLite connection and closes it in a `finally`
 block, including when routing or response writing fails. Connection setup and

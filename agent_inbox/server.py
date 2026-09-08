@@ -193,6 +193,20 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
             path = parsed.path
             query = urllib.parse.parse_qs(parsed.query)
 
+            from agent_inbox.ui import ASSETS
+            if path in ASSETS:
+                content_type, content = ASSETS[path]
+                payload = content.encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+
             if path == "/v1/announcements":
                 rows = self._get_service().list_announcements(
                     query.get("inbox", [""])[0],
