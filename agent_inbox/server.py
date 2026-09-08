@@ -210,9 +210,22 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                                 break
                             after, source = result["cursor"], result["source"]
                             time.sleep(.1)
+                    elif path in ("/v1/ae/brief", "/v1/ae/watch"):
+                        params = dict(actor=actor, session=query.get("session", [""])[0],
+                                      after=int(query["after"][0]) if "after" in query else None,
+                                      source=query.get("source", [None])[0],
+                                      limit=int(query.get("limit", ["20"])[0]),
+                                      policy=query.get("policy", ["all"])[0])
+                        if path.endswith("/watch"):
+                            result = ae.watch(**params, timeout=float(query.get("timeout", ["60"])[0]),
+                                              coalesce=float(query.get("coalesce", ["30"])[0]))
+                        else:
+                            result = ae.brief(**params)
+                    elif path == "/v1/ae/tasks":
+                        result = ae.tasks(actor, query.get("state", [None])[0],
+                                          query.get("after", [""])[0], int(query.get("limit", ["50"])[0]))
                     elif path == "/v1/ae/status":
-                        bus = getattr(self.server, "ae_bus", None)
-                        result = {"source": ae.source, "transport": bus.status() if bus else {"connected": False, "error": "Managed AE runtime is not started"}}
+                        result = {"source": ae.source, "transport": {"kind": "http", "connected": True, "broker_required": False}}
                     elif path.startswith("/v1/ae/decisions/"):
                         result = ae.decision(urllib.parse.unquote(path.removeprefix("/v1/ae/decisions/")), actor)
                     elif path.startswith("/v1/ae/task-history/"):
@@ -256,11 +269,10 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     db_status = "ok"
                 except Exception:
                     db_status = "error"
-                bus = getattr(self.server, "ae_bus", None)
-                healthy = db_status == "ok" and (bus is None or bus.connected)
+                healthy = db_status == "ok"
                 self._send_json(HTTPStatus.OK if healthy else HTTPStatus.SERVICE_UNAVAILABLE, {
                     "status": "ok" if healthy else "error",
-                    "ae_transport": bus.status() if bus else None,
+                    "ae_transport": {"kind": "http", "connected": healthy, "broker_required": False},
                     "service": "agent-inboxes",
                     "pid": os.getpid(),
                     "db": db_status,
@@ -744,24 +756,23 @@ def run_server(host: Optional[str] = None, port: Optional[int] = None, db_path: 
     print(f"Database: {get_db_path() if not db_path else db_path}")
     print("Press Ctrl+C to stop.")
 
-    from agent_inbox.ae_bus import AgentBus
-    server.ae_bus = AgentBus(server.db_path, int(os.environ.get("AGENT_INBOX_AE_NATS_PORT", "8792")), int(os.environ.get("AGENT_INBOX_AE_MQTT_PORT", "8793")))
-    server.ae_bus.start()
-    if not server.ae_bus.ready.wait(12) or not server.ae_bus.connected:
-        server.ae_bus.stop()
-        server.server_close()
-        conn.close()
-        raise RuntimeError(server.ae_bus.error or "AE broker startup timed out")
-
     from agent_inbox.updates import UpdateWorker
     updates = UpdateWorker(server.db_path)
     updates.start()
+    import signal
+    previous_sigterm = None
+    if threading.current_thread() is threading.main_thread():
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        def terminate(signum, frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, terminate)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping server...")
     finally:
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
         updates.stopped.set()
-        server.ae_bus.stop()
         server.server_close()
         conn.close()

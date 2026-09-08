@@ -1,4 +1,4 @@
-"""AE acceptance: context continuity, ownership races and real broker protocols."""
+"""AE acceptance: context continuity, ownership races and loss-aware attention."""
 import hashlib
 import json
 import os
@@ -103,76 +103,83 @@ class AgentExperienceTests(unittest.TestCase):
         with self.assertRaises(NotFoundError):self.command('subscribe',{'kind':'thread','ref':message['thread_id']},actor='stranger@project')
         for i in range(30):self.command('decision.record',{'title':f'Decision {i}','body':'long context '*1000,'source_ref':'test'})
         context=self.ae.context('alpha@project','session-a',50)
-        self.assertLessEqual(len(json.dumps(context,ensure_ascii=False).encode()),24100)
+        self.assertLessEqual(len(json.dumps(context).encode()),24000)
         self.assertTrue(any(context['truncated'].values()))
         self.assertTrue(context['sections']['decisions'][0]['excerpted_fields'])
 
-    def test_actual_mqtt_and_nats_commands_share_work_and_events(self):
-        # Optional test dependency only; the application itself is stdlib + its broker binary.
-        try: import paho.mqtt.client as mqtt
-        except ImportError:self.skipTest('Install paho-mqtt to run wire interoperability acceptance')
-        from agent_inbox.ae_bus import AgentBus,NatsConnection
-        def freeport():
-            with socket.socket() as s:s.bind(('127.0.0.1',0));return s.getsockname()[1]
-        nats_port,mqtt_port=freeport(),freeport()
-        bus=AgentBus(self.path,nats_port,mqtt_port);bus.start()
-        self.addCleanup(bus.stop)
-        self.assertTrue(bus.ready.wait(12));self.assertTrue(bus.connected,bus.error)
-        credentials=json.loads((bus.directory/'credentials.json').read_text())
-        source=self.ae.source
-        native=NatsConnection(nats_port,'ae-agent',credentials['agent']);self.addCleanup(native.close)
-        native.subscribe(f'ae.events.{source}.>')
-        packets=[];connected=threading.Event();subscribed=threading.Event()
-        client=mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,protocol=mqtt.MQTTv311)
-        client.username_pw_set('ae-agent',credentials['agent'])
-        def on_connect(c,u,flags,rc,props):
-            if rc==0:c.subscribe([(f'ae/replies/{source}/#',1),(f'ae/events/{source}/#',1)]);connected.set()
-        client.on_connect=on_connect
-        client.on_subscribe=lambda *args:subscribed.set()
-        client.on_message=lambda c,u,m:packets.append((m.topic,json.loads(m.payload)))
-        client.connect('127.0.0.1',mqtt_port);client.loop_start()
-        def close_mqtt():client.disconnect();client.loop_stop()
-        self.addCleanup(close_mqtt)
-        self.assertTrue(connected.wait(5));self.assertTrue(subscribed.wait(5))
-        request={'request_id':'mqtt-task','actor':'alpha@project','session':'session-a','operation':'task.create','payload':{'title':'Across both protocols'}}
-        info=client.publish(f'ae/commands/{source}',json.dumps(request),qos=1);info.wait_for_publish(5)
-        deadline=time.monotonic()+8
-        while time.monotonic()<deadline and not any(p.get('request_id')=='mqtt-task' for _,p in packets):time.sleep(.02)
-        reply=next(p for _,p in packets if p.get('request_id')=='mqtt-task')
-        self.assertTrue(reply['ok'],reply)
-        task_id=reply['result']['id']
-        received=[]
-        deadline=time.monotonic()+5
-        while time.monotonic()<deadline and not received:
-            frame=native.receive(.1)
-            if frame:received.append(json.loads(frame[2]))
-        self.assertEqual(received[0]['ref'],task_id)
-        request.update(request_id='nats-claim',operation='task.claim',payload={'id':task_id,'version':1})
-        native.publish(f'ae.commands.{source}',json.dumps(request).encode());native.flush()
-        deadline=time.monotonic()+5
-        while time.monotonic()<deadline and self.ae.task(task_id,'alpha@project')['state']!='active':time.sleep(.02)
-        self.assertEqual(self.ae.task(task_id,'alpha@project')['state'],'active')
-        deadline=time.monotonic()+5
-        while time.monotonic()<deadline and not any(p.get('kind')=='task.changed' for _,p in packets):time.sleep(.02)
-        self.assertTrue(any(p.get('kind')=='task.changed' for _,p in packets))
-        # MQTT replay uses the same application request ID; never creates another task.
-        original=dict(request,request_id='mqtt-task',operation='task.create',payload={'title':'Across both protocols'})
-        client.publish(f'ae/commands/{source}',json.dumps(original),qos=1).wait_for_publish(5)
-        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM ae_tasks').fetchone()[0],1)
-        bus.process.terminate()
-        bus.process.wait(timeout=5)
-        offline=self.command('task.create',{'title':'Committed during broker restart'})
-        deadline=time.monotonic()+12
-        while time.monotonic()<deadline and not any(p.get('ref')==offline['id'] for _,p in packets):time.sleep(.05)
-        self.assertTrue(bus.connected,bus.error)
-        # MQTT reconnects/resubscribes; if live notification predates resubscription,
-        # authoritative replay must still recover the event with the same source.
-        replay=self.ae.events('alpha@project',source=source)
-        self.assertTrue(any(e['ref']==offline['id'] for e in replay['events']))
-        deadline=time.monotonic()+5
-        while time.monotonic()<deadline:
-            pending=self.conn.execute('SELECT MAX(sequence) FROM ae_events').fetchone()[0]
-            published=self.conn.execute('SELECT sequence FROM ae_delivery WHERE id=1').fetchone()[0]
-            if published==pending:break
-            time.sleep(.05)
-        self.assertEqual(published,pending)
+    def test_queue_invalidation_and_historical_participation(self):
+        task=self.command('task.create',{'title':'Public queue'},actor='maker@project')
+        original=self.ae.events('observer@project')
+        self.command('task.claim',{'id':task['id'],'version':1},actor='worker@project')
+        after=self.ae.events('observer@project',original['cursor'],source=original['source'])
+        self.assertEqual(after['events'][0]['kind'],'task.changed')
+        self.assertEqual(self.ae.events('observer@project')['events'][0]['sequence'],original['events'][0]['sequence'])
+        self.command('task.handoff',{'id':task['id'],'version':2,'target':'receiver@project','note':'Continue'},actor='worker@project')
+        self.assertEqual(self.ae.events('worker@project')['events'][-1]['detail']['version'],3)
+
+    def test_brief_cursor_is_delivered_not_snapshot_or_ack(self):
+        start=self.ae.brief('alpha@project','a')
+        self.assertTrue(start['history_omitted'])
+        for i in range(6):self.command('task.create',{'title':str(i)})
+        page=self.ae.brief('alpha@project','a',start['cursor'],start['source'],limit=2)
+        self.assertLess(page['cursor'],page['snapshot_cursor'])
+        self.assertTrue(page['has_more'])
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM ae_receipts').fetchone()[0],0)
+        seen=[]
+        cursor=start['cursor']
+        while True:
+            page=self.ae.brief('alpha@project','a',cursor,start['source'],limit=2)
+            seen.extend(e['sequence'] for e in page['events']);cursor=page['cursor']
+            if not page['has_more']:break
+        self.assertEqual(len(seen),6);self.assertEqual(len(set(seen)),6)
+        with self.assertRaises(ConflictError):self.ae.brief('alpha@project','a',0,'wrong')
+
+    def test_unicode_budget_and_scan_omission(self):
+        for i in range(15):self.command('decision.record',{'title':str(i),'body':'航'*800,'source_ref':'test'})
+        context=self.ae.context('alpha@project','a',50)
+        self.assertLessEqual(len(json.dumps(context).encode()),24000)
+        brief=self.ae.brief('alpha@project','a',0,self.ae.source,50)
+        self.assertLessEqual(len(json.dumps(brief).encode()),24000)
+        self.conn.executemany("INSERT INTO ae_events(kind,project,ref) VALUES('decision.created','other',?)",[(str(i),) for i in range(1001)])
+        context=self.ae.context('alpha@project','a')
+        self.assertTrue(context['recent_scan_limited']);self.assertTrue(context['truncated']['recent_events'])
+        # Hidden pages advance without pretending the backlog is exhausted.
+        page=self.ae.events('new@new')
+        self.assertFalse(page['events']);self.assertTrue(page['has_more'])
+
+    def test_structured_handoff_and_task_inventory(self):
+        ids=[]
+        for i in range(6):ids.append(self.command('task.create',{'title':str(i)})['id'])
+        page=self.ae.tasks('alpha@project',limit=2)
+        self.assertTrue(page['has_more'])
+        self.assertEqual(len(self.ae.tasks('alpha@project',after=page['cursor'],limit=10)['tasks']),4)
+        self.command('task.claim',{'id':ids[0],'version':1})
+        details=dict(next_action='Run verification',workspace='/tmp/fixture',ref='branch:test',acceptance='Expected total 600',evidence='report.md')
+        handed=self.command('task.handoff',{'id':ids[0],'version':2,'target':'beta@project','note':'Ready','handoff':details})
+        self.assertEqual(handed['handoff']['next_action'],details['next_action'])
+        self.command('task.claim',{'id':ids[0],'version':3},actor='beta@project')
+        self.assertEqual(self.ae.history(ids[0],'beta@project')['history'][2]['handoff']['ref'],'branch:test')
+
+    def test_watch_batches_routine_events_but_bypasses_for_direct_mail(self):
+        start=self.ae.brief('alpha@project','a')
+        self.command('decision.record',{'title':'Routine','body':'Routine update','source_ref':'test'})
+        before=time.monotonic()
+        batch=self.ae.watch('alpha@project','a',start['cursor'],start['source'],timeout=1,coalesce=.2)
+        self.assertGreaterEqual(time.monotonic()-before,.18)
+        self.assertEqual(batch['wake_reason'],'batch')
+        InboxService(self.conn).send_email('sender@project',['alpha@project'],[],'Blocker','Please review','urgent-mail')
+        before=time.monotonic()
+        urgent=self.ae.watch('alpha@project','a',batch['cursor'],start['source'],timeout=1,coalesce=1,policy='to-me')
+        self.assertLess(time.monotonic()-before,.5)
+        self.assertEqual(urgent['wake_reason'],'urgent')
+        # One session receiving the page does not consume it for another.
+        again=self.ae.brief('alpha@project','b',batch['cursor'],start['source'],policy='to-me')
+        self.assertEqual([e['sequence'] for e in urgent['events']],[e['sequence'] for e in again['events']])
+
+    def test_hook_cleanup_preserves_quoted_mentions_and_compound_commands(self):
+        from agent_inbox.hooks import _strip_hooks_config
+        preserve=["echo 'agent-inbox hook-check'", 'agent-inbox hook-check; echo keep', 'other-tool agent-inbox hook-check']
+        config={'hooks':{'PostToolUse':[{'hooks':[{'type':'command','command':cmd} for cmd in preserve+['/tmp/agent-inbox hook-check','agent-inbox hook-check --format=json']]}]}}
+        self.assertTrue(_strip_hooks_config(config))
+        self.assertEqual([h['command'] for h in config['hooks']['PostToolUse'][0]['hooks']],preserve)
+        self.assertFalse(_strip_hooks_config(config))

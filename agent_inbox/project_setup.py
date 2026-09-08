@@ -10,7 +10,7 @@ END_MARKER = "<!-- agent-inboxes:end -->"
 MANAGED_BLOCK = """<!-- agent-inboxes:start -->
 ## Agent Inboxes
 
-Run `agent-inbox ae context` at session start and after context loss. It restores assignments, dependencies, decisions, unread messages and reservations. Use `agent-inbox ae events --source <source> --after <cursor> --wait 60` to receive relevant changes. Accept work with `ae task claim`; report blockers, completion evidence and handoff notes through `ae task`. Task ownership does not replace file reservations.
+Run `agent-inbox brief` at session start and after context loss. It restores assignments, dependencies, decisions, unread mail and reservations. Save its source/cursor per consumer after processing. Use `agent-inbox ae watch --source <source> --after <cursor> --policy my-work --coalesce 30 --timeout 60` for batched changes with urgent bypass. Drain `has_more` even when events are empty. An incremental brief's cursor is distinct from its snapshot_cursor; never advance past omitted history or treat delivery as acknowledgment. Use `ae task list` for omitted queue entries, `task get`/`task history` for full details. Handoffs should include next action, workspace, branch/commit, acceptance criteria and evidence. Run `whoami` before reservations: an explicit AE actor does not change the reservation CLI's project/session. Task ownership does not replace file reservations. There is no MQTT/NATS dependency or automatic turn injection.
 
 If the `agent-inbox` command is not installed on this machine, ignore this section.
 
@@ -20,7 +20,7 @@ Polling checkpoints:
 - At session start, run `agent-inbox announcements --unread` and `agent-inbox list --unread` and handle relevant mail before new work.
 - Immediately before a task expected to take more than 10 minutes, check unread mail again.
 - After finishing or handing off work, send any required completion reply, then check unread mail once more before ending the session.
-- To subscribe to push delivery, run `agent-inbox watch` as a background task: it blocks until new mail arrives (exit 0) or times out (exit 3), so its exit wakes you. Relaunch it after handling the mail.
+- To subscribe to push delivery, run `agent-inbox watch` as a background task: it blocks until new mail arrives (exit 0) or times out (exit 3), and returns matching mail metadata. Harness scheduling determines when you receive it. Relaunch it after handling the mail.
 - Do not busy-poll in a loop; use `watch` or these checkpoints.
 
 Addressing:
@@ -147,7 +147,7 @@ def setup_global() -> List[tuple]:
 ONBOARDING_PROMPT = """This machine runs Agent Inboxes, a local mail service for coding agents (http://127.0.0.1:8791).
 Your address is <agent>@<project>, derived automatically - run `agent-inbox whoami` to see and create it.
 If agents of your family may run concurrently in this project, first run `eval "$(agent-inbox claim)"` to take a unique slot (claude, claude-2, ...; lease expires after 2h idle).
-Protocol: run `agent-inbox list --unread` at session start and before any task over ~10 minutes; handle relevant mail first.
+Protocol: restore context with `agent-inbox brief`; run `agent-inbox list --unread` at session start and before any task over ~10 minutes; handle relevant mail first.
 Send cross-session requests, blockers, handoffs and completion notices with
 `agent-inbox send --to <address> --subject "<topic>" --body-file -` and use `agent-inbox reply <email-id> --body-file -` on existing threads.
 Do not send routine progress chatter. A message about a file is not a write lock."""

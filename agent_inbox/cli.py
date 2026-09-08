@@ -675,8 +675,6 @@ def cmd_watch(args: argparse.Namespace, client: InboxClient) -> int:
 def cmd_setup(args: argparse.Namespace) -> int:
     """Create data directory and install/load macOS LaunchAgent."""
     try:
-        from agent_inbox.ae_bus import provision
-        provision()
         data_dir = get_data_dir()
         data_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -1028,7 +1026,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "hook-check":
         return 0  # Legacy hook commands do no I/O or context injection.
 
-    if args.command == "ae":
+    if args.command in ("ae", "brief"):
         from agent_inbox.ae_cli import run
         return run(args)
 

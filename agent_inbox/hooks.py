@@ -1,6 +1,7 @@
 """Legacy hook cleanup and notification-stamp compatibility. Delivery is retired."""
 
 import json
+import shlex
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -106,7 +107,7 @@ def _merge_hooks_config(config: dict, events: List[str], command: str) -> bool:
     for event in events:
         groups = hooks.setdefault(event, [])
         present = any(
-            HOOK_MARKER in str(h.get("command", ""))
+            _owned_hook(h)
             for g in groups if isinstance(g, dict)
             for h in (g.get("hooks") or []) if isinstance(h, dict)
         )
@@ -116,8 +117,23 @@ def _merge_hooks_config(config: dict, events: List[str], command: str) -> bool:
     return changed
 
 
+def _owned_hook(entry) -> bool:
+    """Recognize only a direct legacy invocation, never a quoted mention."""
+    if not isinstance(entry, dict) or entry.get("type", "command") != "command":
+        return False
+    try:
+        args = shlex.split(entry.get("command", ""))
+    except (ValueError, TypeError):
+        return False
+    if not args or Path(args[0]).name != "agent-inbox":
+        return False
+    return args[1:] in (["hook-check"], ["hook-check", "--format=json"],
+                       ["hook-check", "--format=plain"], ["hook-check", "--format", "json"],
+                       ["hook-check", "--format", "plain"])
+
+
 def _strip_hooks_config(config: dict) -> bool:
-    """Remove every hook entry carrying our marker. Returns changed."""
+    """Remove only recognized direct Agent Inbox hook commands. Returns changed."""
     changed = False
     hooks = config.get("hooks")
     if not isinstance(hooks, dict):
@@ -131,7 +147,7 @@ def _strip_hooks_config(config: dict) -> bool:
             if not isinstance(g, dict):
                 new_groups.append(g)
                 continue
-            kept = [h for h in (g.get("hooks") or []) if HOOK_MARKER not in str(h.get("command", ""))]
+            kept = [h for h in (g.get("hooks") or []) if not _owned_hook(h)]
             if len(kept) != len(g.get("hooks") or []):
                 changed = True
             if kept or not (g.get("hooks")):
@@ -229,7 +245,7 @@ def hooks_status() -> List[Tuple[str, str]]:
         wired = [
             e for e in events
             if any(
-                HOOK_MARKER in str(h.get("command", ""))
+                _owned_hook(h)
                 for g in (config.get("hooks", {}).get(e) or []) if isinstance(g, dict)
                 for h in (g.get("hooks") or []) if isinstance(h, dict)
             )

@@ -38,11 +38,10 @@ Git and the actual files remain authoritative for source state.
 
 ### Runtime and UI
 
-Python 3.11+ runs the CLI and HTTP API without pip runtime packages. The managed
-NATS binary supplies built-in NATS and MQTT; provision it before serving:
+Python 3.11+ runs the CLI and HTTP API using its standard library. No broker or
+additional runtime package is required:
 
 ```sh
-python3 bin/agent-inbox ae setup
 python3 bin/agent-inbox serve
 python3 bin/agent-inbox --help
 ```
@@ -469,6 +468,6 @@ receipts, mappings and reservation history, not transient hook/update/session st
 ## Agent Experience extension
 
 The [AE specification](agent-experience-spec.md) defines durable tasks, context,
-dependencies, decisions, subscriptions and built-in MQTT/NATS. Generic database
+dependencies, decisions, subscriptions, bounded briefs and HTTP policy watches. Generic database
 merge refuses nonempty AE work state to prevent silent loss. Runtime hooks are
 retired; legacy hook stamps in backups are compatibility data, not active delivery.

@@ -1,139 +1,147 @@
-# Agent Experience (AE): implementation checklist and contract
+# Agent Experience 2.1: local work and attention
 
-AE is the normal interface to coordinated work. An agent identifies its mailbox
-and runtime session once, restores relevant context, receives changes, accepts
-work, reports blockers/results, and hands off. Protocol selection is plumbing.
+## Implemented scope
 
-## Implementation checklist
+- Durable tasks, dependencies, session ownership, decisions, handoff history, subscriptions and event receipts.
+- One Python standard-library service over SQLite and loopback HTTP. No broker, MQTT/NATS listener, binary provisioning or concierge daemon.
+- Bounded current context, a concise brief with incremental changes, and policy watching with routine batching and urgent bypass.
+- Task inventory pagination, structured handoff references, historical queue-event visibility and explicit omitted-history signals.
+- Runtime delivery hooks remain retired; direct legacy hook cleanup preserves unrelated commands and quoted mentions.
 
-- [x] A unified, durable event journal for mail delivery, announcements,
-  reservations, task transitions, decisions and subscriptions. Events commit in
-  the transaction that changes state. Reconnection uses a database-scoped cursor.
-- [x] A context endpoint and CLI: identity/session, current assignments, ready
-  queue, unmet dependencies, relevant decisions, unread mail/announcements,
-  active reservations, subscriptions and actionable recent events. Bound each
-  section and expose truncation; never pretend excerpts are the full history.
-- [x] Durable work requests with priority, optional target agent, linked thread,
-  dependency IDs and intended paths. Atomic claim, block, resume, complete and
-  handoff, with expected-version checks and session ownership. Completion requires
-  a result; blocking/handoff requires a reason or next-step note. Completing a
-  dependency makes waiting work eligible without another message.
-- [x] Explicit event acknowledgment, separate from accepting a task or marking
-  mail read. Mail To/CC roles remain authoritative routing metadata.
-- [x] Persistent subscriptions to specific tasks or threads; direct assignments,
-  addressed mail, project queue/reservations/decisions and applicable announcements
-  are relevant by default. Unrelated project events are excluded.
-- [x] One managed NATS server with JetStream and an MQTT 3.1.1 listener, both
-  enabled. One event ID and command contract across HTTP, NATS and MQTT. MQTT is
-  mapped to NATS subjects by the broker, not a second inconsistent message store.
-- [x] Durable event publication cursor and reconnect/retry. Broker notification
-  receipt does not imply task execution. Clients deduplicate by source + sequence
-  and recover missing changes from the authoritative HTTP journal.
-- [x] Built-in CLI commands and project instructions. Runtime delivery hooks are
-  removed; the old hook-check entry point is silent. Context and events supply
-  attention without injecting turns or executing message bodies.
-- [x] Isolated acceptance: two sessions race to claim, dependency completion,
-  block/resume, handoff, reconstruction after restart, project isolation,
-  message linkage, cursor replay, and actual MQTT↔NATS command/event traffic.
+## Work and identity
 
-## Work model
+Task states are queued, active, blocked and completed. Ready means queued with all
+prerequisites completed. Dependencies must already exist in the same project, so
+creation cannot introduce cycles. Claims are atomic. Mutations require the latest
+version; active work belongs to one address and runtime session. The same address
+may explicitly resume from a replacement runtime. Completion requires a result;
+blocking and handoff require notes. Handoff releases task ownership, not leases.
 
-States are `queued`, `active`, `blocked`, `completed`. A queued task may be waiting
-on dependencies; `ready` is computed, never a stale stored boolean. Dependencies
-must reference existing tasks in the same project, so new tasks cannot introduce
-cycles. A task targets an address optionally; claim establishes an owner address
-and runtime session. Handoff releases task ownership, returns it to the queue,
-and records a durable note and optional new target. It does not silently release
-unrelated file reservations. File reservations remain explicit advisory leases;
-context shows them alongside intended task paths. They never authorize file writes.
+The CLI handoff additionally requires next_action, workspace, ref, acceptance and
+evidence. API payloads provide these in a `handoff` object; old note-only requests
+remain supported. If supplied, all five fields are nonempty strings, at most 2,000
+characters each. An additive ae_handoffs table stores each handoff version. Task
+reads expose the latest handoff; paginated history exposes its original version.
+References are descriptive, not verified builds or permission to execute commands.
 
-Transitions use optimistic version checks plus SQLite `BEGIN IMMEDIATE`.
-Only the owning address/session can change an active task. A replacement runtime
-of that same address explicitly uses `resume` with the latest version to recover
-an assignment. Address identity is coordination metadata within the existing
-same-user trust boundary, not proof of a human's authorization.
+File reservations remain explicit advisory leases. AE actor overrides do not
+change the ordinary reservation command's derived project/session. Run whoami
+before reserving. Conflicts and missing paths are separately represented in
+attention. Project addresses are cooperative metadata within a same-user trust
+boundary, not per-agent authentication or distributed locks.
 
-Task creation can link a thread visible to its creator; context does not expose
-that thread's body to other agents unless normal mailbox membership allows it.
-Decisions are explicit project facts with source references, not model-generated
-summaries presented as facts. Every body/note remains untrusted task data.
+## Context and briefs
 
-## Attention and recovery
+`agent-inbox brief` and `agent-inbox ae brief` call GET `/v1/ae/brief`.
+`ae context` remains the fuller GET `/v1/ae/context` interface. Context includes
+assignments, ready/waiting tasks, unread mail with To/CC roles, announcements,
+decisions, reservations and actions. Brief removes duplicate recent-event and
+following-work sections and adds one bounded page of event changes.
 
-`context` produces a bounded working set. `events --after` provides lossless
-forward pagination over the retained journal, filtered to relevant events.
-Acknowledgment stamps the actor's receipt; it does not erase history. Replay
-cursors are scoped to a source UUID; a cursor from another database is rejected.
-Subscription creation starts a new relevance rule; callers explicitly replay from
-an earlier cursor if they need earlier matching events.
+A first brief with no `after` is a bootstrap: `mode=bootstrap`,
+`history_omitted=true`, events empty, and cursor equal to the current snapshot
+watermark. It does not claim to deliver or acknowledge prior history. Explicit
+`after=0` with the returned source replays earlier retained events.
 
-The journal starts at upgrade. Existing mail, announcements and reservations are
-available immediately in context; they are not misrepresented as newly delivered
-historical events. No retention deletion is introduced in this change.
+An incremental brief requires `source` and `after`. It returns:
 
-## Transport and operations
+- `source`: persistent database UUID; wrong-source cursors are rejected.
+- `snapshot_cursor`: watermark of the contextual state read.
+- `cursor`: last sequence examined while delivering this event page. It may trail or exceed the separately read snapshot watermark.
+- `events`: relevant metadata with stable source/sequence identity, acknowledgment state and object references.
+- `has_more`: more journal rows remain, even if this page contains no matching events.
+- `truncated`, excerpt flags and scan metadata: explicit limits, never proof of absence.
+- `acknowledged=false`: delivery has not changed event receipts, mail read state or task ownership.
 
-Setup provisions a pinned, checksum-verified NATS binary into application data.
-Normal `serve` supervises one loopback-only broker with authenticated NATS and
-MQTT listeners, durable JetStream storage and locally stored mode-0600 credentials.
-A missing binary is a clear setup error, not silent polling-only operation.
-Managed children are terminated by owned process handle, never by port number.
-No work account, external broker or remote machine is connected automatically.
+Snapshots and pages are separate reads, not one atomic cross-section event bundle.
+Fetch current task state/version before acting. Save cursor progress per consumer
+only after processing succeeds; after a crash, retry the earlier cursor and deduplicate
+source/sequence. There is no shared server checkpoint that lets one session consume
+another's progress. Switching filter policy can expose older events; replay from
+an earlier cursor if needed. Subscriptions also change relevance prospectively;
+explicit earlier replay is supported.
 
-Both protocols accept the same idempotent AE command envelope and deliver the
-same event metadata. NATS request/reply and MQTT response topics return committed
-results. Messages carry references, not the complete mailbox. Live notifications can duplicate or be missed by disconnected clients. Broker
-flush confirms processing, not durable agent receipt. SQLite is the durable replay
-and work-state authority.
+Context uses a 24,000-byte JSON wire budget measured with the HTTP serializer's
+Unicode escaping and all metadata included. Brief reserves up to 12,000 bytes for
+context and 10,000 for event metadata, with remaining space for its envelope. CLI
+JSON uses the same serialization (plus a trailing newline). Fields are excerpted
+with markers; full task/decision/mail data remain retrievable. Oversized individual
+event details may be omitted with `detail_omitted=true`; retrieve full metadata
+through `ae events` from the previous sequence. Cursor advancement never drops an
+undelivered matching event to make a page fit.
 
-This release provides one authoritative service. Sharing it across machines needs
-a separately configured authenticated network boundary; it does not turn separate
-local reservation databases into a distributed lock. No automatic agent execution
-or elevated tool authority follows from a broker notification.
+Context scans at most the latest 1,000 journal entries. `recent_scan_from`,
+`recent_scan_limited` and `truncated.recent_events` describe possible omissions.
+Its current-state cursor is not proof all previous events were seen. Forward pages
+scan at most 1,000 rows, advance through irrelevant rows, and retain `has_more`.
+Task candidates are SQL-limited before hydration; existing mailbox/reservation
+helpers can still scan larger histories. No high-volume latency guarantee is made.
 
-## API and protocol contract
+GET `/v1/ae/tasks` / `ae task list` provides state filtering and cursor pagination
+(`after` is the last task ID, ordered by creation time and ID). A missing or
+cross-project cursor is rejected. State filters are current-state views and may
+change between pages. `task get`, `task history` and `decision get` provide full data.
 
-`POST /v1/ae/command` accepts `actor`, `session`, `request_id`, `operation` and a
-`payload` object. Mutations are idempotent: identical retries return the committed
-response; reuse with changed content is rejected. Read operations always return
-current data. Operations are `context`, `events`, `task.get`, `task.history`,
-`task.create`, `task.claim`, `task.block`, `task.resume`, `task.complete`,
-`task.handoff`, `decision.record`, `decision.get`, `subscribe`, `unsubscribe`, `ack`.
-See `agent-inbox ae --help` and subcommand help for payload fields.
+## Event relevance
 
-HTTP also exposes GET `/v1/ae/context`, `/v1/ae/events`, `/v1/ae/status`,
-`/v1/ae/tasks/{id}`, `/v1/ae/task-history/{id}`, `/v1/ae/decisions/{id}`.
-Event long polling waits at most 60 seconds. Actor identity is required for scoped
-reads; cursor continuation requires the matching source UUID.
+Mail respects recipient routing and real thread membership for subscriptions.
+Announcements are project-scoped or explicitly global. Reservations and decisions
+are project-visible. Task events use immutable transition snapshots and their
+recorded version, not current ownership: public queue additions/removals remain
+visible, and former participants retain appropriate replay access after handoff.
+Explicit subscriptions and dependency participation add relevant task events.
+No other-project tasks or private thread contents are exposed by these rules.
 
-Broker commands use `ae.commands.SOURCE_UUID` (NATS) or
-`ae/commands/SOURCE_UUID` (MQTT). Subscribe before publishing. Replies use
-`ae.replies.SOURCE_UUID.SHA256_REQUEST_ID`, with slashes for MQTT; native NATS
-request/reply inboxes are also supported. Responses contain `ok`, `request_id`,
-and either `result` or `error`. Events use
-`ae.events.SOURCE_UUID.PROJECT_UTF8_HEX` (or `global`), with slashes for MQTT.
-The local `ae-agent` credential can submit commands and receive events/replies,
-but cannot publish forged events. It is shared local client access, not per-agent
-cryptographic authentication or per-project broker isolation.
+## Policy watch
 
-Context targets a 24 KB JSON budget, excerpts body/note/result fields at 800
-characters, and marks omitted sections and excerpts. Recent context scans the last
-1,000 journal entries; it is not an exhaustive backlog. Forward event pagination
-scans up to 1,000 entries per page, returns up to 200 matching events, and advances
-the cursor through hidden events. Follow `has_more` even when a page is empty.
-Task reads include the last ten transition snapshots; task history provides full
-forward version pagination. Decisions and original messages remain retrievable.
+GET `/v1/ae/watch` / `ae watch` requires explicit source and after. Parameters:
+`limit` (default20, maximum50), `timeout` (0–60 seconds, default60),
+`coalesce` (0–30 seconds, default30), and one policy:
 
-Setup removes legacy delivery wiring only when explicitly run. This source change
-does not itself edit an operator's installed runtime or personal configuration.
-Generic database merge refuses databases containing AE work state. Deployments
-must provision the pinned broker before enabling the 2.0 runtime.
+- `all`: all relevant events, including project queue activity and decisions.
+- `to-me`: direct To mail; CC-only mail does not match.
+- `my-tasks`: tasks created by, assigned to, previously owned by, or explicitly subscribed to by this actor.
+- `my-files`: reservation changes overlapping owned active/blocked task paths, or the actor's own reservation records.
+- `my-work`: union of the previous three. Use all to discover unassigned queue work.
 
-## Verification record
+The handler reads the journal without holding a transaction while sleeping. Routine
+matching events start a coalescing window. Direct To mail, relevant task readiness,
+blockers/queued handoffs and relevant reservation changes bypass it. Full pages and
+scan limits return immediately for draining. Timeout bounds the total wait, including
+batching. Watch returns a brief plus changed/wake_reason. CLI exit0 means changes
+or more history to drain; exit3 means a timeout without changes or more rows.
 
-On September 8, 2026, the isolated full suite passed 129 tests, including the
-real MQTT/NATS bidirectional command/event test with paho-mqtt and the pinned
-broker. `scripts/verify-ae.py` also passed against a real temporary HTTP service,
-CLI and managed broker: startup, context, replay, claim, reservation guidance,
-handoff/history, bundled UI route and owned broker shutdown. No installed personal
-service, remote account or main checkout was changed by these checks.
+Receipts and checkpoints are unchanged by a wake. Harness scheduling is outside
+the service contract: a helper process returning data does not itself start a model
+turn. No runtime hooks, autonomous execution or hidden concierge are installed.
+
+## Compatibility and operations
+
+Existing command envelopes retain actor, session, request_id, operation and payload.
+Identical mutation retries return the original committed response; changed content
+with the same ID is rejected. Reads always return current data. HTTP/CLI work
+continues without any broker availability test. Health checks report HTTP/SQLite;
+SIGTERM and SIGINT close the owned HTTP listener. Legacy ae setup is a no-op.
+
+The upgrade preserves existing SQLite mail/work/history/receipt tables and source
+UUID. It adds handoff storage/indexes and leaves obsolete broker delivery state alone.
+No broker files or processes are guessed at and deleted. Stop an old service before
+upgrading and inspect any recorded broker child before cleanup. Back up SQLite first.
+Generic database merge refuses nonempty AE work state rather than silently losing it.
+Cloud mail sync does not synchronize task ownership or file leases across machines.
+
+## Verification
+
+Regression coverage includes claim races, dependency transitions, session recovery,
+public queue invalidation, former-owner replay, Unicode wire budgets, scan-limit
+signals, brief pagination without acknowledgment, per-session replay, structured
+handoffs, task pagination, policy batching/urgent bypass and conservative hook cleanup.
+The standalone verifier starts the real HTTP service with occupied legacy broker
+ports, exercises CLI brief/watch/handoff/UI, and verifies actual SIGTERM restart
+and durable recovery without downloading a binary. No model wake or reduced token
+cost is claimed; those require a separate harness-level comparison.
+
+Acceptance on September 8, 2026: all 134 unittest checks passed; the real-process
+verifier passed. A separate 2.0 fixture upgrade preserved source UUID, complete
+event responses, claimed task version and database integrity. This is not evidence
+of automatic harness wake-up or a measured reduction in token use.
