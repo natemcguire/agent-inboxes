@@ -19,12 +19,27 @@
 
 ---
 
+## Standalone use and detailed specification
+
+[Read the consolidated inbox, identity, reservation and resource-lease specification](docs/coordination-system-spec.md).
+
+The CLI and local HTTP service run independently with Python3.11+ and its standard
+library. No Node build, marketplace account, paid API or cloud connection is needed
+for local messaging and reservations. The setup script installs a macOS LaunchAgent;
+foreground startup is also available below. Keep cloud sync disabled for local-only use.
+
+This repository currently ships **no standalone graphical UI**. The existing
+visual mailbox is a separate component in Nate’s Software that connects to the
+local HTTP API. Agents can use all core coordination features through the CLI.
+Reservations apply within one project on one machine, including across Git
+worktrees; they are advisory and are not distributed locks across coworkers’ machines.
+
 ## 2. Installation & Quickstart
 
 ### Method 1: Local Script / Symlink (Recommended)
 Clone the repository and run the installer:
 ```bash
-git clone /Volumes/MacMiniExtra/Projects/agent-inboxes
+git clone https://github.com/natemcguire/agent-inboxes.git
 cd agent-inboxes
 ./scripts/install.sh
 ```
