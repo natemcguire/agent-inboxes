@@ -632,7 +632,13 @@ def repository_identity(value):
     p = urllib.parse.urlsplit(value)
     if p.hostname:
         return p.hostname.lower() + (':' + str(p.port) if p.port and p.port not in (22,443,80) else '') + '/' + p.path.strip('/').removesuffix('.git')
-    return str(Path(value).expanduser().resolve())
+    # A bare token is a literal identity, not a filesystem path: resolving it
+    # against the CWD minted identities like /Users/x/<slug> for checkouts that
+    # never existed. Only path-shaped or actually-present values canonicalize.
+    path = Path(value).expanduser()
+    if value.startswith(('/', '.', '~')) or path.exists():
+        return str(path.resolve())
+    return value
 
 
 def map_project(conn, repo, slug):
@@ -642,9 +648,9 @@ def map_project(conn, repo, slug):
     repo = repository_identity(repo)
     with transaction(conn):
         existing = conn.execute('SELECT slug FROM project_mappings WHERE repo_identity=?', (repo,)).fetchone()
-        collision = conn.execute('SELECT repo_identity FROM project_mappings WHERE slug=?', (slug,)).fetchone()
+        # One identity keeps one slug forever, but many identities (clones of
+        # the same repository, per the spec) may legitimately share a slug.
         require(existing is None or existing[0] == slug, 'Repository mapping cannot be changed')
-        require(collision is None or collision[0] == repo, 'Project mapping collision')
         conn.execute('INSERT INTO project_mappings VALUES (?,?) ON CONFLICT(repo_identity) DO NOTHING', (repo, slug))
         conn.execute("UPDATE cloud_envelopes SET state='pending',reason=NULL,retry_at=0 WHERE state='retryable' AND reason='unresolved_project_mapping'")
         conn.execute('UPDATE cloud_state SET push_retry_at=0 WHERE id=1')

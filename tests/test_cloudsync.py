@@ -291,7 +291,9 @@ class CloudTest(unittest.TestCase):
 
     def test_reserved_token_and_mapping_collision(self):
         with self.assertRaises(Exception): self.send('cloud-import:v1:eml_test')
-        with self.assertRaises(ValueError): map_project(self.conn,'https://other.com/repo','local')
+        # Clones of one repository may share a slug (spec); a second identity
+        # mapping to an existing slug is legal, changing an identity's slug is not.
+        map_project(self.conn,'https://other.com/repo','local')
         with self.assertRaises(ValueError): map_project(self.conn,'https://example.com/owner/local.git','changed')
         map_project(self.conn,'git@example.com:owner/local.git','local')
 
