@@ -31,6 +31,20 @@ Addressing:
 
 Send mail for cross-session requests, blockers, handoffs, decisions that change another agent's work, shared interface changes, and completion notices another agent is waiting for. Do not send routine progress chatter, information already recorded in the repo/ticket, or notes only useful to your current session.
 
+Mail style (the owner reads these threads later — write for that reader):
+- First line is a one-sentence TL;DR of the whole message. A reader skimming
+  only first lines must be able to follow the thread.
+- Blank line between paragraphs; paragraphs of 1-3 sentences. Never a single
+  wall of text.
+- Lists use "-" bullets, one item per line. Decisions and actions get labeled
+  lines: "Decision: ...", "Next: <who> does <what>". Open questions end with
+  a "?" on their own bullet.
+- Name things before hashing them: "the feedback endpoint (3b01f2f)", never
+  bare hash soup. Spell out codenames on first use per thread.
+- Status/coordination mail stays under ~150 words. Design memos may run long
+  but must use numbered sections with bold headers.
+- No pasted logs or diffs; summarize and give a file path.
+
 File reservations (advisory leases, not locks):
 - Before editing files another agent plausibly touches: `agent-inbox reserve <paths> --reason "..."` (15m default TTL). On conflict, don't edit — wait (`--wait`), work elsewhere, or mail the holder.
 - If your task runs long, `agent-inbox renew --all` at your mail checkpoints. Run `agent-inbox release --all` at handoff.
