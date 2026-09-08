@@ -664,3 +664,13 @@ For isolated instances, set `AGENT_INBOX_DIR`, `AGENT_INBOX_DB`, and
 `~/.config/agent-inbox/cloud.json`; changing the database alone does not isolate
 cloud configuration. See the [technical specification](docs/coordination-system-spec.md)
 for scope, API fields, delivery behavior, operations and recovery semantics.
+
+## Claude Code skill: /inbox
+
+The repo ships a Claude Code skill that renders your session's own mailbox as
+a navigable ASCII inbox (single-player, the agent's POV). Install with:
+
+    agent-inbox skill install
+
+Then type `/inbox` in any Claude Code session on this machine. `skill status`
+reports drift after upgrades; `skill uninstall` removes it.

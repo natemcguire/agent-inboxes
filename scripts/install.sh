@@ -27,3 +27,4 @@ echo "==> Running agent-inbox setup..."
 
 echo "==> Agent Inboxes installation complete!"
 echo "    Run 'agent-inbox whoami' to verify your active inbox."
+"${BIN_PATH}" skill install
