@@ -83,6 +83,36 @@ def cmd_whoami(args: argparse.Namespace, client: InboxClient) -> int:
         return 1
 
 
+def cmd_skill(args: argparse.Namespace) -> int:
+    """Install/uninstall/report the bundled Claude Code /inbox skill."""
+    from agent_inbox.skills_data import INBOX_SKILL_MD
+    target = Path.home() / ".claude" / "skills" / "inbox" / "SKILL.md"
+    if args.skill_action == "install":
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(INBOX_SKILL_MD)
+        print(f"Installed /inbox skill -> {target}")
+        return 0
+    if args.skill_action == "uninstall":
+        if target.exists():
+            target.unlink()
+            try:
+                target.parent.rmdir()
+            except OSError:
+                pass
+            print("Removed /inbox skill.")
+        else:
+            print("/inbox skill is not installed.")
+        return 0
+    # status
+    if target.exists():
+        current = target.read_text() == INBOX_SKILL_MD
+        print(f"/inbox skill installed at {target} ({'current' if current else 'outdated — run: agent-inbox skill install'})")
+    else:
+        print("/inbox skill not installed. Run: agent-inbox skill install")
+    return 0
+
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """Run loopback server in foreground."""
     try:
@@ -963,6 +993,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_proj.add_argument("--copy", action="store_true", help="Also copy the onboarding prompt to the clipboard")
 
     # prompt
+    p_skill = subparsers.add_parser("skill", help="Install the bundled Claude Code /inbox skill (ASCII mailbox browser)")
+    p_skill.add_argument("skill_action", choices=["install", "uninstall", "status"], nargs="?", default="status")
+
     p_hooks = subparsers.add_parser("hooks", help="Manage per-turn mail delivery hooks for agent runtimes")
     p_hooks.add_argument("hooks_action", choices=["install", "uninstall", "status"], help="What to do")
 
@@ -1029,6 +1062,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         if getattr(args, "global_only", False):
             return cmd_setup_global(args)
         return cmd_setup(args)
+    elif args.command == "skill":
+        return cmd_skill(args)
     elif args.command == "setup-project":
         return cmd_setup_project(args)
     elif args.command == "prompt":
