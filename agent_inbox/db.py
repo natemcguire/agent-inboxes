@@ -215,6 +215,20 @@ def init_db(conn: sqlite3.Connection) -> None:
     if "cloud_synced_at" not in email_columns:
         conn.execute("ALTER TABLE emails ADD COLUMN cloud_synced_at TEXT")
 
+    # v1.5.2: clones of one repository may share a slug (spec), so the UNIQUE
+    # constraint on project_mappings.slug must go. SQLite cannot drop a
+    # constraint in place; rebuild once when the old shape is detected.
+    mapping_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='project_mappings'"
+    ).fetchone()
+    if mapping_sql and "UNIQUE" in (mapping_sql[0] or ""):
+        conn.executescript(
+            "CREATE TABLE project_mappings_v2 (repo_identity TEXT PRIMARY KEY, slug TEXT NOT NULL);"
+            "INSERT INTO project_mappings_v2 SELECT repo_identity, slug FROM project_mappings;"
+            "DROP TABLE project_mappings;"
+            "ALTER TABLE project_mappings_v2 RENAME TO project_mappings;"
+        )
+
     # v1.3: reservations.repo_key (nullable) — worktree-safe repository identity.
     # NULL is conservative: keyless leases conflict with everything in-project.
     reservation_columns = {row[1] for row in conn.execute("PRAGMA table_info(reservations)")}
@@ -252,7 +266,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS delivery_counter (id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL);
         INSERT OR IGNORE INTO delivery_counter VALUES (1,0);
         CREATE TABLE IF NOT EXISTS hook_stamps (address TEXT PRIMARY KEY, seen_activity INTEGER NOT NULL, last_emit REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS project_mappings (repo_identity TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+        CREATE TABLE IF NOT EXISTS project_mappings (repo_identity TEXT PRIMARY KEY, slug TEXT NOT NULL);
         CREATE TRIGGER IF NOT EXISTS immutable_cloud_binding BEFORE UPDATE OF endpoint,user_id ON cloud_state
         WHEN OLD.endpoint IS NOT NULL AND (NEW.endpoint IS NOT OLD.endpoint OR NEW.user_id IS NOT OLD.user_id)
         BEGIN SELECT RAISE(ABORT, 'cloud binding is immutable'); END;
