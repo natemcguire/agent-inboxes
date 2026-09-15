@@ -10,46 +10,38 @@ from pathlib import Path
 from unittest import mock
 
 from agent_inbox.cli import main
+from agent_inbox.client import InboxClient
 from agent_inbox.db import get_connection
-from agent_inbox.project_setup import setup_project
 from agent_inbox.server import AgentInboxServer
+from agent_inbox.service import InboxService
 
 
 class TestCLI(unittest.TestCase):
 
-    @classmethod
-    def setUpClass(cls):
-        cls.tmp_dir = tempfile.TemporaryDirectory()
-        cls.db_path = Path(cls.tmp_dir.name) / "cli_test.db"
-        cls.db_conn = get_connection(cls.db_path)
-
-        cls.server = AgentInboxServer(("127.0.0.1", 0), cls.db_conn, verbose=False)
-        cls.host, cls.port = cls.server.server_address
-        cls.base_url = f"http://{cls.host}:{cls.port}"
-
-        cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.server_thread.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.server.shutdown()
-        cls.server.server_close()
-        cls.db_conn.close()
-        cls.tmp_dir.cleanup()
-
     def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp_dir.cleanup)
+        self.db_path = Path(self.tmp_dir.name) / "cli_test.db"
         self.env_patch = mock.patch.dict(os.environ, {
-            "AGENT_INBOX_URL": self.base_url,
+            "AGENT_INBOX_DIR": self.tmp_dir.name,
+            "AGENT_INBOX_DB": str(self.db_path),
+            "AGENT_INBOX_CLOUD_CONFIG": str(Path(self.tmp_dir.name) / "cloud.json"),
             "AGENT_INBOX_AGENT": "test-agent",
             "AGENT_INBOX_PROJECT": "test-project",
         })
         self.env_patch.start()
-        from agent_inbox.service import InboxService
+        self.addCleanup(self.env_patch.stop)
+        self.db_conn = get_connection(self.db_path)
+        self.addCleanup(self.db_conn.close)
+        self.server = AgentInboxServer(("127.0.0.1", 0), self.db_conn, verbose=False)
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        os.environ["AGENT_INBOX_URL"] = self.base_url
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
         for address in ('target@other-project', 'filetest@other-project'):
             InboxService(self.db_conn).ensure_inbox(address)
-
-    def tearDown(self):
-        self.env_patch.stop()
 
     def _run_cli(self, args: list) -> tuple[int, str, str]:
         """Run CLI main function and capture stdout/stderr."""
@@ -145,28 +137,33 @@ class TestCLI(unittest.TestCase):
             self.assertIn("<!-- agent-inboxes:end -->", content)
 
     def test_send_body_file(self):
-        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
-            f.write("Content from temporary file")
-            f_path = f.name
-        try:
-            code, out, err = self._run_cli([
-                "send",
-                "--to", "filetest@other-project",
-                "--subject", "File Body Test",
-                "--body-file", f_path,
-                "--json",
-            ])
-            self.assertEqual(code, 0)
-            data = json.loads(out)
-            self.assertIn("email_id", data)
-        finally:
-            Path(f_path).unlink()
+        body = "First paragraph: café.\n\n- Preserve this line\n"
+        body_path = Path(self.tmp_dir.name) / "message.md"
+        body_path.write_text(body, encoding="utf-8")
+        reader = InboxClient(self.base_url)
+        for source in (str(body_path), "-"):
+            with self.subTest(source=source), mock.patch("sys.stdin", io.StringIO(body)):
+                code, out, err = self._run_cli([
+                    "send", "--to", "filetest@other-project",
+                    "--subject", "File Body Test", "--body-file", source, "--json",
+                ])
+                self.assertEqual(code, 0, err)
+                data = json.loads(out)
+                delivered = reader.get_thread("filetest@other-project", data["thread_id"])["emails"]
+                self.assertEqual(len(delivered), 1)
+                self.assertEqual(delivered[0]["email_id"], data["email_id"])
+                self.assertEqual(delivered[0]["body_markdown"], body)
+                self.assertEqual(delivered[0]["subject"], "File Body Test")
+                self.assertEqual(delivered[0]["from"], "test-agent@test-project")
+                self.assertEqual(delivered[0]["to"], ["filetest@other-project"])
 
     def test_inboxes_command(self):
+        InboxService(self.db_conn).ensure_inbox("known@test-project", display_name="Known agent")
         code, out, err = self._run_cli(["inboxes", "--project", "test-project", "--json"])
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 0, err)
         data = json.loads(out)
-        self.assertIn("inboxes", data)
+        self.assertEqual([inbox["address"] for inbox in data["inboxes"]], ["known@test-project"])
+        self.assertEqual(data["inboxes"][0]["display_name"], "Known agent")
 
     def test_binary_executable_execution(self):
         bin_path = Path(__file__).resolve().parent.parent / "bin" / "agent-inbox"

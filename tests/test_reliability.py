@@ -58,7 +58,7 @@ class ReliabilityTests(unittest.TestCase):
             client = InboxClient(f'http://127.0.0.1:{server.server_port}')
             thread.start()
             try:
-                with patch('agent_inbox.server.get_connection', side_effect=capture):
+                with patch('agent_inbox.server.get_connection', side_effect=capture) as connect:
                     for _ in range(30):
                         self.assertEqual(client.healthz()['db'],'ok')
                     client.put_inbox('sender@p')
@@ -66,9 +66,12 @@ class ReliabilityTests(unittest.TestCase):
                     self.assertEqual(client.list_announcements('late@p')[0]['id'],ann['id'])
                     client.acknowledge_announcement(ann['id'],'late@p')
                     self.assertEqual(client.list_announcements('late@p',unread=True),[])
-                    with patch('agent_inbox.service.InboxService.list_announcements', side_effect=RuntimeError('injected failure')):
-                        with self.assertRaises(InboxError):
+                    with patch('agent_inbox.service.InboxService.list_announcements', side_effect=RuntimeError('injected failure')) as list_announcements:
+                        with self.assertRaises(InboxError) as error:
                             client.list_announcements('late@p')
+                        list_announcements.assert_called_once()
+                        self.assertEqual(error.exception.status_code, 500)
+                        self.assertEqual(error.exception.code, 'internal_error')
                     client.acquire_reservations('p', [f'file{i}.py' for i in range(60)], 'owner@p')
                     client.release_reservations('p', 'owner@p', release_all=True)
                     client.acquire_reservations('p', ['active.py'], 'owner@p')
@@ -80,6 +83,8 @@ class ReliabilityTests(unittest.TestCase):
                     self.assertEqual(view['reading_as'],'observer@p')
                     self.assertEqual(view['emails'][0]['your_role'],'cc')
                     self.assertEqual(client.list_threads('observer@p',unread=True)[0]['your_roles'],['cc'])
+                    self.assertGreaterEqual(connect.call_count, 30)
+                    self.assertEqual(len(opened), connect.call_count)
             finally:
                 server.shutdown()
                 thread.join()
@@ -88,6 +93,7 @@ class ReliabilityTests(unittest.TestCase):
             # Request threads close immediately; join them explicitly for assertions.
             import time
             deadline = time.monotonic()+2
+            self.assertGreaterEqual(len(opened), 30, 'Connection cleanup check must observe real request connections')
             for db in opened:
                 while True:
                     try:

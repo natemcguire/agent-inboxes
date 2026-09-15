@@ -58,7 +58,7 @@ cd agent-inboxes
 ```
 This symlinks `bin/agent-inbox` into `~/.local/bin/agent-inbox` and registers the macOS LaunchAgent.
 
-### Method 2: Manual / Shareware Setup
+### Method 2: Manual Setup
 Ensure `bin/agent-inbox` is on your `$PATH` or run directly:
 ```bash
 # Register data directory (~/.agent-inboxes) and macOS LaunchAgent
@@ -306,7 +306,7 @@ identity; 2.1 never kills a process discovered only by port. Back up the databas
 before upgrading. Generic database merge still refuses nonempty AE work state.
 
 `python3 scripts/verify-ae.py` checks a real isolated service, CLI, briefs, watching,
-handoffs, UI, occupied former broker ports, SIGTERM restart and recovery. No broker,
+handoffs, UI asset serving, occupied former broker ports, SIGTERM restart and recovery. No broker,
 download, paho-mqtt or external service is needed. Run the unittest suite with
 isolated `AGENT_INBOX_DIR`, `AGENT_INBOX_DB` and `AGENT_INBOX_CLOUD_CONFIG`.
 
@@ -752,27 +752,47 @@ When the local service is running (`running: true`):
 
 ## 7. Automated Testing & Verification
 
-The test suite requires Python 3.11+ and uses standard-library `unittest`. Tests mix direct SQLite, controlled boundaries and actual HTTP/process checks; the standalone verifier documents its real-process coverage.
+The test suite requires Python 3.11+ and uses standard-library `unittest`. Mail,
+identity, task and reservation scenarios use temporary SQLite databases. HTTP
+tests start real loopback servers; the standalone verifier also starts, stops and
+restarts a separate service process. Cloud tests simulate relay responses while
+running the real synchronization code and checking stored results. Process
+identity, clocks and launchctl are controlled where tests need specific failures.
 
 ```bash
 # Run all tests
 python3 -m unittest discover -s tests -p "test_*.py" -v
+
+# Separate process, CLI, HTTP and restart acceptance
+python3 scripts/verify-ae.py
 ```
 
-### Test Coverage Breakdown
-- `test_models.py`: Address & slug validation rules, UUID ID formatting, RFC 3339 timestamps, error envelopes.
-- `test_identity.py`: Git remote origin URL parsing (SSH, HTTPS, SCP syntax), Git common worktree root fallback, runtime detection (`claude`, `codex`, `orca`), environment overrides.
-- `test_db.py`: SQLite schema verification, foreign key cascades, WAL mode pragma, busy timeout, file mode `0600`, directory mode `0700`.
-- `test_service.py`: Transactional semantics, `Idempotency-Key` deduplication, reference chain accumulation, reply-all recipient derivation, self-replies, thread ordering, per-recipient independent unread tracking.
-- `test_server_api.py`: Loopback binding verification (`127.0.0.1`), HTTP router endpoints (`/healthz`, `/v1/...`), header validation, 400/404/409/500 JSON error responses.
-- `test_cli.py`: All CLI commands (`whoami`, `serve`, `send`, `reply`, `list`, `read`, `inboxes`, `setup-project`), `--json` outputs, body reading from files and stdin, honest not-running error signals.
-- `test_e2e.py`: Multi-agent cross-project message exchange across distinct projects, server restart persistence, and idempotency recovery.
+### What these checks cover
+
+- `test_models.py`, `test_identity.py`: Validation, ID and timestamp formats, remote URL parsing, runtime detection and environment overrides.
+- `test_db.py`, `test_watch.py`: SQLite settings and permissions, populated legacy database upgrades, preserved mail and receipts, sessions and long polling.
+- `test_service.py`, `test_server_api.py`, `test_e2e.py`: Mail delivery, replies, references, idempotency, recipient read state, HTTP routing, CORS and restart persistence.
+- `test_cli.py`: Selected CLI flows over HTTP, delivered file/stdin body contents, project-filtered inbox lists, instruction setup and unreachable-service errors.
+- `test_identity_addressing.py`, `test_leases.py`: Session recovery, recipient validation, broadcasts, read-only delivery status, inbox maintenance, project mappings and instruction-file idempotency.
+- `test_reservations.py`: Ownership races with both worker outcomes checked, atomic conflicts, renewal/expiry, release-driven waiting, resource leases and takeover mail.
+- `test_agent_experience.py`: Task ownership, dependencies, handoff history, bounded briefs, cursor draining and watch policies.
+- `test_cloudsync.py`: Relay protocol validation, retry/backoff, imports, exports and persistent synchronization state against a simulated relay.
+- `test_reliability.py`, `test_review_hardening.py`, `test_hooks.py`: Connection cleanup, database recovery, access boundaries, controlled service operations and retired-hook cleanup.
+
+The verifier's UI check fetches HTML and its CSS/JavaScript assets. Browser
+interactions and visual layout still need a browser check. The suite does not
+exercise a deployed cloud relay or install a real LaunchAgent.
+
+Regression tests should assert observable results or persisted state. A success
+exit, a JSON key, a mock called in an earlier case, or one surviving race worker
+does not establish that the intended behavior worked. When auditing a test,
+deliberately break the behavior and check that its assertions fail.
 
 ---
 
 ## 8. License & Ownership
 
-Part of **Nate's Software Suite**. Local-First Shareware. Bought once, owned forever.
+Copyright Nate McGuire. Agent Inboxes is open source under the [MIT License](LICENSE).
 
 ### Runtime updates
 

@@ -67,10 +67,11 @@ class TestHooksWiring(unittest.TestCase):
     def test_retired_hook_is_silent_and_cannot_be_installed(self):
         import io
         from agent_inbox.cli import main
-        with mock.patch("sys.stdout",io.StringIO()) as stdout, mock.patch("agent_inbox.hooks.get_connection",side_effect=AssertionError("No DB access")):
+        with mock.patch("sys.stdout",io.StringIO()) as stdout, mock.patch("agent_inbox.hooks.get_connection",side_effect=AssertionError("No DB access")) as connect:
             self.assertEqual(hooks.run_hook_check("json","{}"),0)
             self.assertEqual(main(["hook-check","--format=json"]),0)
             self.assertEqual(stdout.getvalue(),"")
+            connect.assert_not_called()
         with self.assertRaises(RuntimeError):hooks.install_hooks()
 
     def test_cleanup_preserves_other_hooks_and_is_idempotent(self):

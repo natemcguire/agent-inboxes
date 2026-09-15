@@ -80,7 +80,10 @@ class TestGlobalSetup(unittest.TestCase):
             self.assertIn(END_MARKER, first)
             # Second run: no change, no duplicate block.
             self.assertFalse(inject_into_file(target))
-            self.assertEqual(first.count(START_MARKER), 1)
+            second = target.read_text(encoding="utf-8")
+            self.assertEqual(second, first)
+            self.assertEqual(second.count(START_MARKER), 1)
+            self.assertEqual(second.count(END_MARKER), 1)
 
     def test_setup_global_only_touches_runtimes_with_config_dirs(self):
         with tempfile.TemporaryDirectory() as tmp:

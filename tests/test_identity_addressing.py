@@ -170,10 +170,19 @@ class NotesRegressionTests(unittest.TestCase):
     def test_status_is_read_only_and_receipts_are_independent(self):
         self.register('sender@demo', 'a@demo', 'b@demo')
         sent = self.svc.send_email('sender@demo', ['a@demo'], ['b@demo'], 'X', 'Y', 'status')
+        before = '\n'.join(self.conn.iterdump())
         self.assertEqual(self.svc.email_status(sent['email_id'])['unread_count'], 2)
+        self.assertEqual('\n'.join(self.conn.iterdump()), before)
         self.svc.mark_thread_read('a@demo', sent['thread_id'])
-        self.assertEqual(self.svc.email_status(sent['email_id'])['read_count'], 1)
-        self.assertIsNone(self.svc.email_status(sent['email_id'])['recipients'][1]['read_at'])
+        before = '\n'.join(self.conn.iterdump())
+        status = self.svc.email_status(sent['email_id'])
+        self.assertEqual(status['read_count'], 1)
+        self.assertEqual(status['unread_count'], 1)
+        self.assertEqual([(r['address'], r['kind']) for r in status['recipients']],
+                         [('a@demo', 'to'), ('b@demo', 'cc')])
+        self.assertIsNotNone(status['recipients'][0]['read_at'])
+        self.assertIsNone(status['recipients'][1]['read_at'])
+        self.assertEqual('\n'.join(self.conn.iterdump()), before)
 
     def test_delivery_cursor_survives_deleted_mail_and_late_broadcasts(self):
         self.register('old@demo', 'peer@demo')
@@ -287,10 +296,28 @@ class NotesRegressionTests(unittest.TestCase):
         self.register('old@demo', 'peer@demo')
         sent = self.svc.send_email('old@demo', ['peer@demo'], [], 'Topic', 'Body', 'delete')
         reply = self.svc.reply_email(sent['email_id'], 'peer@demo', 'Reply', 'reply')
-        with self.assertRaises(ConflictError):
+        old_id = self.conn.execute("SELECT id FROM inboxes WHERE local_part='old'").fetchone()[0]
+        self.svc.acquire_reservations('demo', ['old.py'], 'old@demo', 'old-session', client_token='old-file')
+        self.svc.release_reservations('demo', 'old@demo', 'old-session', release_all=True)
+        before = '\n'.join(self.conn.iterdump())
+        with self.assertRaises(ConflictError) as error:
             self.svc.delete_inbox('old@demo')
+        self.assertEqual(error.exception.code, 'inbox_not_empty')
+        self.assertEqual('\n'.join(self.conn.iterdump()), before)
+        preview = self.svc.delete_inbox('old@demo', force=True, dry_run=True)
+        self.assertEqual(preview['sent_emails'], 1)
+        self.assertEqual(preview['reservations'], 1)
+        self.assertEqual('\n'.join(self.conn.iterdump()), before)
         self.svc.delete_inbox('old@demo', force=True)
-        self.assertIsNotNone(self.conn.execute('SELECT id FROM emails WHERE id=?', (reply['email_id'],)).fetchone())
+        self.assertIsNone(self.conn.execute('SELECT id FROM inboxes WHERE id=?', (old_id,)).fetchone())
+        self.assertIsNone(self.conn.execute('SELECT id FROM emails WHERE id=?', (sent['email_id'],)).fetchone())
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM email_recipients WHERE inbox_id=?', (old_id,)).fetchone()[0], 0)
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM reservations WHERE holder_inbox_id=?', (old_id,)).fetchone()[0], 0)
+        remaining = self.svc.get_thread('peer@demo', sent['thread_id'])['emails']
+        self.assertEqual([e['email_id'] for e in remaining], [reply['email_id']])
+        self.assertEqual(remaining[0]['body_markdown'], 'Reply')
+        self.assertIsNone(remaining[0]['reply_to_email_id'])
+        self.assertEqual(remaining[0]['references'], [])
         self.assertEqual(self.conn.execute('PRAGMA foreign_key_check').fetchall(), [])
 
     def test_merge_delivers_newly_visible_mail_to_existing_watchers(self):
@@ -332,7 +359,8 @@ class NotesRegressionTests(unittest.TestCase):
         with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as result:
             main(['--license'])
         self.assertEqual(result.exception.code, 0)
-        self.assertIn('MIT License', out.getvalue())
+        # argparse may wrap whitespace; all license terms must still be present.
+        self.assertEqual(' '.join(out.getvalue().split()), ' '.join(TEXT.split()))
 
 
 if __name__ == '__main__':

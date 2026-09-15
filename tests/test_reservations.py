@@ -2,7 +2,6 @@
 
 import tempfile
 import threading
-import time
 import unittest
 import uuid
 from pathlib import Path
@@ -62,12 +61,16 @@ class TestReservationSemantics(unittest.TestCase):
 
         # Own re-acquire (same address+session) is idempotent and renews.
         before = next(r for r in active if r["path"] == "src/lib/money.ts")["expires_at"]
-        res_again = self.svc.acquire_reservations(
-            "proj", ["src/lib/money.ts"], "a@proj", "s-aaaa", client_token=_tok()
-        )
+        # Move forward without sleeping so a no-op renewal cannot pass by equality.
+        future = _iso_add_seconds(utc_now_iso(), 60)
+        with mock.patch.object(service_mod, "utc_now_iso", return_value=future):
+            res_again = self.svc.acquire_reservations(
+                "proj", ["src/lib/money.ts"], "a@proj", "s-aaaa", client_token=_tok()
+            )
         self.assertNotIn("conflicts", res_again)
         after = res_again["reservations"][0]["expires_at"]
-        self.assertGreaterEqual(after, before)
+        self.assertGreater(after, before)
+        self.assertEqual(len(self.svc.list_reservations("proj")), 2)
         # Same session in a DIFFERENT session slug counts as a different holder.
         res_other_sess = self.svc.acquire_reservations(
             "proj", ["src/lib/money.ts"], "a@proj", "s-cccc", client_token=_tok()
@@ -105,18 +108,20 @@ class TestReservationSemantics(unittest.TestCase):
 
     def test_concurrent_acquire_exactly_one_wins(self):
         db_path = Path(self.tmp_dir.name) / "res.db"
-        results = []
+        results, errors = [], []
         barrier = threading.Barrier(2)
 
         def try_acquire(who):
             conn = get_connection(db_path)
             try:
                 svc = InboxService(conn)
-                barrier.wait()
+                barrier.wait(timeout=5)
                 res = svc.acquire_reservations(
                     "proj", ["hot/path.ts"], f"{who}@proj", f"s-{who}", client_token=_tok()
                 )
-                results.append((who, "conflicts" not in res))
+                results.append((who, res))
+            except BaseException as exc:
+                errors.append(exc)
             finally:
                 conn.close()
 
@@ -124,9 +129,17 @@ class TestReservationSemantics(unittest.TestCase):
         for t in threads:
             t.start()
         for t in threads:
-            t.join()
-        wins = [who for who, won in results if won]
+            t.join(timeout=10)
+        self.assertFalse(any(t.is_alive() for t in threads), "Reservation workers did not finish")
+        self.assertEqual(errors, [], "A worker exception must fail the race test")
+        self.assertEqual(len(results), 2)
+        wins = [who for who, res in results if "reservations" in res]
         self.assertEqual(len(wins), 1, f"exactly one acquirer must win, got {results}")
+        losses = [res for _, res in results if "conflicts" in res]
+        self.assertEqual(len(losses), 1)
+        self.assertEqual(losses[0]["conflicts"][0]["holder"], f"{wins[0]}@proj")
+        active = self.svc.list_reservations("proj")
+        self.assertEqual([(r["path"], r["holder"]) for r in active], [("hot/path.ts", f"{wins[0]}@proj")])
 
 
 class TestReservationWaitE2E(unittest.TestCase):
@@ -151,27 +164,34 @@ class TestReservationWaitE2E(unittest.TestCase):
 
         holder.acquire_reservations("proj", ["src/app.ts"], "holder@proj", reason="editing")
 
-        def release_later():
-            time.sleep(0.6)
-            holder.release_reservations("proj", "holder@proj", release_all=True)
+        started, finished = threading.Event(), threading.Event()
+        results, errors = [], []
+        def wait_for_release():
+            started.set()
+            try:
+                results.append(waiter.wait_reservations("proj", ["src/app.ts"], "waiter@proj", timeout=10))
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                finished.set()
 
-        t = threading.Thread(target=release_later, daemon=True)
-        started = time.monotonic()
+        t = threading.Thread(target=wait_for_release, daemon=True)
         t.start()
-        res = waiter.wait_reservations("proj", ["src/app.ts"], "waiter@proj", timeout=10)
-        elapsed = time.monotonic() - started
-        t.join()
-
-        self.assertTrue(res["free"])
-        self.assertLess(elapsed, 5.0)  # unblocked well before the 10s timeout
+        try:
+            self.assertTrue(started.wait(2), "Waiter did not start")
+            self.assertFalse(finished.wait(0.2), "Wait returned while another agent still held the file")
+            holder.release_reservations("proj", "holder@proj", release_all=True)
+            self.assertTrue(finished.wait(5), "Wait did not unblock promptly after release")
+            self.assertEqual(errors, [])
+            self.assertEqual(results, [{"free": True}])
+        finally:
+            holder.release_reservations("proj", "holder@proj", release_all=True)
+            t.join(timeout=12)
+        self.assertFalse(t.is_alive())
 
         # And the waiter can now actually acquire.
         acq = waiter.acquire_reservations("proj", ["src/app.ts"], "waiter@proj")
         self.assertEqual(acq["reservations"][0]["path"], "src/app.ts")
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestRepoKeysResourcesAndTakeoverMail(unittest.TestCase):
@@ -265,11 +285,12 @@ class TestRepoKeysResourcesAndTakeoverMail(unittest.TestCase):
         )
         with mock.patch.object(
             InboxService, "send_email", side_effect=RuntimeError("mail down")
-        ):
+        ) as send:
             res2 = self.svc.acquire_reservations(
                 "proj", ["solo.ts"], "taker@proj", "s-tttt",
                 force=True, client_token=_tok(),
             )
+            send.assert_called_once()
         self.assertNotIn("conflicts", res2)
         self.assertNotIn("notified", res2)
         forced_row = self.conn.execute(
@@ -355,3 +376,7 @@ class TestRepoKeysResourcesAndTakeoverMail(unittest.TestCase):
             # Per-project history filters correctly.
             per = self.svc.reservation_history("proj-one", limit=50)
             self.assertEqual([h["path"] for h in per], ["a.txt"])
+
+
+if __name__ == "__main__":
+    unittest.main()

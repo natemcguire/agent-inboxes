@@ -1,4 +1,8 @@
-"""Real isolated HTTP/CLI attention acceptance. No downloads or broker required."""
+"""Real isolated HTTP/CLI attention acceptance; UI asset serving smoke check.
+
+Does not execute JavaScript, test browser interactions or verify visual layout.
+"""
+from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
@@ -12,6 +16,22 @@ import urllib.error
 import urllib.request
 
 ROOT = Path(__file__).resolve().parent.parent
+
+if not __debug__:
+    raise SystemExit('Run without -O: verification requires assertions to be enabled.')
+
+
+class UIAssets(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.paths = set()
+
+    def handle_starttag(self, tag, attributes):
+        attributes = dict(attributes)
+        if tag == 'link' and attributes.get('rel') == 'stylesheet':
+            self.paths.add(attributes.get('href'))
+        elif tag == 'script' and attributes.get('src'):
+            self.paths.add(attributes['src'])
 
 
 def free_port():
@@ -37,7 +57,7 @@ with tempfile.TemporaryDirectory(prefix='ae-http-') as directory:
     def cli(actor, *args):
         result = subprocess.run([sys.executable, str(ROOT/'bin/agent-inbox'), 'ae', '--actor', actor,
                                  '--session', 'acceptance', *args], cwd=tmp, env=env,
-                                capture_output=True, text=True, check=True)
+                                capture_output=True, text=True, check=True, timeout=15)
         return json.loads(result.stdout)
     def start(log):
         process = subprocess.Popen([sys.executable, '-c', code], cwd=tmp, env=env, stdout=log, stderr=log)
@@ -46,7 +66,8 @@ with tempfile.TemporaryDirectory(prefix='ae-http-') as directory:
                 if process.poll() is not None: break
                 try:
                     with urllib.request.urlopen(env['AGENT_INBOX_URL']+'/healthz', timeout=1) as response:
-                        if json.load(response)['status']=='ok': return process
+                        health = json.load(response)
+                        if health['status']=='ok' and health['pid']==process.pid: return process
                 except (OSError, urllib.error.URLError):
                     time.sleep(.05)
             log.seek(0)
@@ -58,6 +79,7 @@ with tempfile.TemporaryDirectory(prefix='ae-http-') as directory:
         process.send_signal(signum)
         try: process.wait(timeout=10)
         except subprocess.TimeoutExpired: process.kill(); process.wait(); raise
+        assert process.returncode == 0, f'Service exited unexpectedly: {process.returncode}'
         with socket.socket() as sock:
             assert sock.connect_ex(('127.0.0.1', port)) != 0, 'HTTP listener left running'
     with (tmp/'server.log').open('w+') as log:
@@ -80,8 +102,17 @@ with tempfile.TemporaryDirectory(prefix='ae-http-') as directory:
             assert len(json.dumps(wake).encode())<=24000
             assert len(cli('alice@demo', 'task', 'history', task['id'])['history'])==3
             assert cli('alice@demo', 'task', 'list')['tasks'][0]['id']==task['id']
-            with urllib.request.urlopen(env['AGENT_INBOX_URL']+'/') as response:
-                assert 'Agent Inbox' in response.read().decode()
+            assets = UIAssets()
+            with urllib.request.urlopen(env['AGENT_INBOX_URL']+'/', timeout=5) as response:
+                assert response.status == 200
+                assert response.headers.get_content_type() == 'text/html'
+                assets.feed(response.read().decode())
+            assert assets.paths == {'/ui.css', '/ui.js'}, assets.paths
+            for path, content_type in [('/ui.css','text/css'), ('/ui.js','text/javascript')]:
+                with urllib.request.urlopen(env['AGENT_INBOX_URL']+path, timeout=5) as response:
+                    assert response.status == 200
+                    assert response.headers.get_content_type() == content_type
+                    assert response.read().strip(), f'Empty UI asset: {path}'
             assert cli('alice@demo', 'status')['transport']['broker_required'] is False
             # Actual SIGTERM, process restart and durable restoration, not reopening one connection.
             stop(process, signal.SIGTERM)
@@ -91,7 +122,7 @@ with tempfile.TemporaryDirectory(prefix='ae-http-') as directory:
             assert restored['sections']['ready_queue'][0]['handoff']==handoff['handoff']
             assert not (tmp/'runtime').exists()
             assert not (tmp/'inbox.db.ae').exists()
-            print('PASS: broker-free startup with occupied legacy ports, CLI/HTTP brief, watch, queue, handoff/history, UI, SIGTERM restart and durable recovery')
+            print('PASS: broker-free startup with occupied legacy ports, CLI/HTTP brief, watch, queue, handoff/history, UI asset serving, SIGTERM restart and durable recovery')
         finally:
             if process.poll() is None: stop(process, signal.SIGINT)
             for sock in listeners: sock.close()

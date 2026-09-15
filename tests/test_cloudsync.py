@@ -19,6 +19,8 @@ from agent_inbox.cloudsync import (CloudClient, CloudSyncError, SyncEngine, Sync
     endpoint_origin, login, map_project, replay, reset_generation, save_config, state,
     sync_status, validate_pull, LOCAL_WARNING)
 from agent_inbox.db import get_connection, init_db
+from agent_inbox.client import InboxClient
+from agent_inbox.models import ValidationError
 from agent_inbox.service import InboxService
 
 TIME = '2020-01-01T00:00:00.000Z'
@@ -104,8 +106,10 @@ class CloudTest(unittest.TestCase):
             ack=copy.deepcopy(good); ack['results'][0][field]=value; bad.append(ack)
         self.http.push.side_effect=None
         for response in bad:
+            self.http.push.reset_mock()
             self.clear_backoff(); self.http.push.return_value=response
             self.engine.sync_once(self.conn)
+            self.http.push.assert_called_once()
             self.assertNotEqual(self.status(mid)['state'],'acknowledged')
             self.assertIsNone(self.conn.execute('SELECT cloud_synced_at FROM emails').fetchone()[0])
 
@@ -290,7 +294,10 @@ class CloudTest(unittest.TestCase):
         self.assertEqual(state(self.conn)['user_id'],'usr_a')
 
     def test_reserved_token_and_mapping_collision(self):
-        with self.assertRaises(Exception): self.send('cloud-import:v1:eml_test')
+        with self.assertRaises(ValidationError) as error:
+            self.send('cloud-import:v1:eml_test')
+        self.assertEqual(error.exception.code, 'reserved_client_token')
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM emails').fetchone()[0], 0)
         # Clones of one repository may share a slug (spec); a second identity
         # mapping to an existing slug is legal, changing an identity's slug is not.
         map_project(self.conn,'https://other.com/repo','local')
@@ -301,15 +308,30 @@ class CloudTest(unittest.TestCase):
         from agent_inbox.cli import build_parser,cmd_reserve
         save_config({'enabled':True})
         args=build_parser().parse_args(['reserve','file','--json'])
-        client=mock.Mock(); client.address=None; client.acquire_reservations.return_value={'reservations':[]}
         with mock.patch('agent_inbox.cli.resolve_address',return_value='bob@local'),mock.patch('agent_inbox.cli.derive_project',return_value='local'):
             for failure in (False,True):
-                if failure: client.acquire_reservations.side_effect=ValueError('bad')
-                out=io.StringIO()
-                with contextlib.redirect_stdout(out),contextlib.redirect_stderr(io.StringIO()): result=cmd_reserve(args,client)
-                self.assertEqual(result, 1 if failure else 0)
-                client.acquire_reservations.assert_called()
-                self.assertIn(LOCAL_WARNING,json.loads(out.getvalue())['warnings'])
+                with self.subTest(failure=failure):
+                    client=mock.create_autospec(InboxClient, instance=True)
+                    client.address=None
+                    reservation={'path':'file','holder':'bob@local','active':True}
+                    client.acquire_reservations.return_value={'reservations':[reservation]}
+                    if failure: client.acquire_reservations.side_effect=ValueError('bad')
+                    out,err=io.StringIO(),io.StringIO()
+                    with contextlib.redirect_stdout(out),contextlib.redirect_stderr(err):
+                        result=cmd_reserve(args,client)
+                    self.assertEqual(result, 1 if failure else 0)
+                    client.acquire_reservations.assert_called_once_with(
+                        project='local', paths=['file'], resources=None, holder='bob@local',
+                        reason='', ttl_seconds=None, force=False)
+                    payload=json.loads(out.getvalue())
+                    self.assertEqual(payload['warnings'],[LOCAL_WARNING])
+                    if failure:
+                        self.assertFalse(payload['success'])
+                        self.assertNotIn('reservations',payload)
+                        self.assertIn('Error (invalid_argument): bad',err.getvalue())
+                    else:
+                        self.assertEqual(payload['reservations'],[reservation])
+                        self.assertEqual(err.getvalue(),'')
 
     def test_ack_snapshot_change_is_not_acknowledged(self):
         mid=self.send()
@@ -348,10 +370,12 @@ class CloudTest(unittest.TestCase):
     def test_request_errors_retry_no_quarantine_and_backoff(self):
         mid=self.send()
         for code in ['invalid_request','temporarily_unavailable','rate_limited','global_capacity','transport_error']:
+            self.http.push.reset_mock()
             self.clear_backoff()
             self.http.push.side_effect=CloudSyncError('retry',code=code,retry_after=40)
             before=time.time()
             self.engine.sync_once(self.conn)
+            self.http.push.assert_called_once()
             self.assertEqual(self.status(mid)['state'],'retryable')
             self.assertGreaterEqual(self.status(mid)['retry_at'],before+40)
             self.assertLessEqual(self.status(mid)['retry_at'],time.time()+900)

@@ -10,6 +10,7 @@ from pathlib import Path
 from agent_inbox.client import InboxClient
 from agent_inbox.db import get_connection
 from agent_inbox.server import AgentInboxServer
+from agent_inbox.service import InboxService
 
 
 # Frozen v1.0 schema (before sender_session / sessions): used to prove that an
@@ -46,6 +47,27 @@ CREATE TABLE emails (
   client_token      TEXT NOT NULL UNIQUE,
   sent_at           TEXT NOT NULL
 );
+CREATE TABLE thread_inboxes (
+  thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+  inbox_id INTEGER NOT NULL REFERENCES inboxes(id) ON DELETE CASCADE,
+  joined_at TEXT NOT NULL,
+  PRIMARY KEY (thread_id, inbox_id)
+);
+CREATE TABLE email_recipients (
+  email_id TEXT NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+  inbox_id INTEGER NOT NULL REFERENCES inboxes(id),
+  kind TEXT NOT NULL CHECK (kind IN ('to', 'cc')),
+  position INTEGER NOT NULL,
+  read_at TEXT,
+  PRIMARY KEY (email_id, inbox_id)
+);
+CREATE TABLE email_references (
+  email_id TEXT NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+  referenced_email_id TEXT NOT NULL REFERENCES emails(id),
+  position INTEGER NOT NULL,
+  PRIMARY KEY (email_id, position),
+  UNIQUE (email_id, referenced_email_id)
+);
 """
 
 
@@ -56,6 +78,26 @@ class TestSchemaUpgrade(unittest.TestCase):
             db_path = Path(td) / "v1_inbox.db"
             raw = sqlite3.connect(str(db_path))
             raw.executescript(V1_SCHEMA_SQL)
+            # An empty schema cannot reveal an upgrade that discards old data.
+            raw.executescript("""
+                INSERT INTO projects (id,slug) VALUES (1,'legacy');
+                INSERT INTO inboxes (id,project_id,local_part,display_name) VALUES
+                    (1,1,'alice','Alice'), (2,1,'bob','Bob'), (3,1,'observer','Observer');
+                INSERT INTO threads VALUES
+                    ('thr_legacy',1,'Existing work','2020-01-01T00:00:00.000Z','2020-01-02T00:00:00.000Z');
+                INSERT INTO emails VALUES
+                    ('eml_original','thr_legacy',1,'Existing work','Original body',NULL,'legacy-1','2020-01-01T00:00:00.000Z'),
+                    ('eml_reply','thr_legacy',2,'Re: Existing work','Reply body','eml_original','legacy-2','2020-01-02T00:00:00.000Z');
+                INSERT INTO thread_inboxes VALUES
+                    ('thr_legacy',1,'2020-01-01T00:00:00.000Z'),
+                    ('thr_legacy',2,'2020-01-01T00:00:00.000Z'),
+                    ('thr_legacy',3,'2020-01-01T00:00:00.000Z');
+                INSERT INTO email_recipients VALUES
+                    ('eml_original',2,'to',0,'2020-01-01T01:00:00.000Z'),
+                    ('eml_original',3,'cc',1,NULL),
+                    ('eml_reply',1,'to',0,NULL);
+                INSERT INTO email_references VALUES ('eml_reply','eml_original',0);
+            """)
             raw.close()
 
             conn = get_connection(db_path)
@@ -68,8 +110,36 @@ class TestSchemaUpgrade(unittest.TestCase):
                 self.assertIn("sessions", tables)
                 # NB-7: the reservations table is also created on upgrade.
                 self.assertIn("reservations", tables)
+                self.assertEqual(conn.execute('SELECT COUNT(*) FROM emails').fetchone()[0], 2)
+                svc = InboxService(conn)
+                detail = svc.get_thread('alice@legacy', 'thr_legacy')
+                self.assertEqual(detail['subject'], 'Existing work')
+                self.assertEqual([e['email_id'] for e in detail['emails']], ['eml_original', 'eml_reply'])
+                self.assertEqual([e['body_markdown'] for e in detail['emails']], ['Original body', 'Reply body'])
+                self.assertEqual(detail['emails'][1]['from'], 'bob@legacy')
+                self.assertEqual(detail['emails'][1]['reply_to_email_id'], 'eml_original')
+                self.assertEqual(detail['emails'][1]['references'], ['eml_original'])
+                self.assertFalse(detail['emails'][1]['read'])
+                self.assertIsNone(detail['emails'][1]['sender_session'])
+                status = svc.email_status('eml_original')
+                self.assertEqual(status['recipients'], [
+                    {'address': 'bob@legacy', 'kind': 'to', 'read_at': '2020-01-01T01:00:00.000Z'},
+                    {'address': 'observer@legacy', 'kind': 'cc', 'read_at': None},
+                ])
+                cursor = svc.watch_state('observer@legacy')['cursor']
+                self.assertGreater(cursor, 0)
+                self.assertEqual(conn.execute('PRAGMA foreign_key_check').fetchall(), [])
             finally:
                 conn.close()
+            # Reopening runs initialization again; neither data nor cursors may change.
+            reopened = get_connection(db_path)
+            try:
+                svc = InboxService(reopened)
+                self.assertEqual(svc.get_thread('alice@legacy', 'thr_legacy'), detail)
+                self.assertEqual(svc.email_status('eml_original'), status)
+                self.assertEqual(svc.watch_state('observer@legacy')['cursor'], cursor)
+            finally:
+                reopened.close()
 
 
 class TestWatchAndSessions(unittest.TestCase):
