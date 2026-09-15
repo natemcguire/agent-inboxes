@@ -7,6 +7,8 @@ import time
 import unittest
 from pathlib import Path
 
+from tests.support import isolated_inbox
+
 from agent_inbox.client import InboxClient
 from agent_inbox.db import get_connection
 from agent_inbox.server import AgentInboxServer
@@ -146,6 +148,7 @@ class TestWatchAndSessions(unittest.TestCase):
 
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
+        self.enterContext(isolated_inbox(self.tmp_dir.name))
         self.db_path = Path(self.tmp_dir.name) / "watch_test.db"
         self.db_conn = get_connection(self.db_path)
         self.server = AgentInboxServer(("127.0.0.1", 0), self.db_conn, verbose=False)

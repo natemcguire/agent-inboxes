@@ -5,6 +5,8 @@ import threading
 import unittest
 import uuid
 from pathlib import Path
+
+from tests.support import isolated_inbox
 from unittest import mock
 
 import agent_inbox.service as service_mod
@@ -146,6 +148,7 @@ class TestReservationWaitE2E(unittest.TestCase):
 
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
+        self.enterContext(isolated_inbox(self.tmp_dir.name))
         self.db_conn = get_connection(Path(self.tmp_dir.name) / "wait.db")
         self.server = AgentInboxServer(("127.0.0.1", 0), self.db_conn, verbose=False)
         host, port = self.server.server_address

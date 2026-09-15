@@ -8,6 +8,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from tests.support import isolated_inbox
+
 from agent_inbox.client import InboxClient
 from agent_inbox.db import get_connection
 from agent_inbox.server import AgentInboxServer
@@ -18,6 +20,7 @@ class TestServerAPI(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp_dir = tempfile.TemporaryDirectory()
+        cls.enterClassContext(isolated_inbox(cls.tmp_dir.name))
         cls.db_path = Path(cls.tmp_dir.name) / "test_api.db"
         cls.db_conn = get_connection(cls.db_path)
 

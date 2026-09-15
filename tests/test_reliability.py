@@ -7,6 +7,8 @@ import threading
 import unittest
 from unittest.mock import patch
 
+from tests.support import isolated_inbox
+
 from agent_inbox.client import InboxClient
 from agent_inbox.db import get_connection
 from agent_inbox.identity import derive_session
@@ -17,6 +19,10 @@ from agent_inbox.service import InboxService
 
 
 class ReliabilityTests(unittest.TestCase):
+    def setUp(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(isolated_inbox(directory))
+
     def test_session_survives_tool_shells(self):
         with patch.dict(os.environ, {'CLAUDE_CODE_SESSION_ID': 'stable-runtime'}, clear=True), patch('os.getppid', side_effect=[100,200]):
             self.assertEqual(derive_session(), derive_session())

@@ -1,8 +1,11 @@
 """Unit tests for identity derivation from Git and environment variables."""
 
 import os
+import tempfile
 import unittest
 from unittest import mock
+
+from tests.support import isolated_inbox
 
 from agent_inbox.identity import (
     _extract_repo_name_from_url,
@@ -62,11 +65,12 @@ class TestIdentity(unittest.TestCase):
             self.assertEqual(first, derive_session())
 
     def test_derive_identity_from_environment(self):
-        for agent, project in [("claude", "nate-bot"), ("worker-42", "custom-project")]:
-            with self.subTest(agent=agent, project=project), mock.patch.dict(os.environ, {
-                "AGENT_INBOX_AGENT": agent, "AGENT_INBOX_PROJECT": project,
-            }):
-                self.assertEqual(derive_identity(), (agent, project, f"{agent}@{project}"))
+        with tempfile.TemporaryDirectory() as directory, isolated_inbox(directory):
+            for agent, project in [("claude", "nate-bot"), ("worker-42", "custom-project")]:
+                with self.subTest(agent=agent, project=project), mock.patch.dict(os.environ, {
+                    "AGENT_INBOX_AGENT": agent, "AGENT_INBOX_PROJECT": project,
+                }):
+                    self.assertEqual(derive_identity(), (agent, project, f"{agent}@{project}"))
 
 
 if __name__ == "__main__":

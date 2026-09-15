@@ -5,6 +5,8 @@ import threading
 import unittest
 from pathlib import Path
 
+from tests.support import isolated_inbox
+
 from agent_inbox.client import InboxClient
 from agent_inbox.db import get_connection
 from agent_inbox.server import AgentInboxServer
@@ -13,7 +15,7 @@ from agent_inbox.server import AgentInboxServer
 class TestE2EMultiAgentFlow(unittest.TestCase):
 
     def test_cross_project_flow_with_server_restart(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory() as td, isolated_inbox(td):
             db_path = Path(td) / "e2e_inbox.db"
 
             # ----------------------------------------------------
