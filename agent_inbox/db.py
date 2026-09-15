@@ -367,3 +367,6 @@ def init_db(conn: sqlite3.Connection) -> None:
     except Exception:
         conn.rollback()
         raise
+
+    from agent_inbox.search import initialize as initialize_search
+    initialize_search(conn)

@@ -234,13 +234,14 @@ function route(){
     else return null;
     target.tab=['announcements','reservations'].includes(parts[section])?parts[section]:'mail';
     target.thread=parts[section]==='thread'?parts[section+1]:'';
+    target.message=target.thread&&parts[section+2]==='message'?parts[section+3]:'';
     return target;
   }catch{return null;}
 }
 function scopeHash(view=state.view,project=state.project,address=state.address,tab=state.tab){const base=view==='human'?`#project/${enc(project)}`:`#${enc(address)}`;return base+(tab==='mail'?'':'/'+tab);}
 function threadHash(id){return `${scopeHash(state.view,state.project,state.address,'mail')}/thread/${enc(id)}`;}
 function topicLink(text,id){const a=element('a',text,'topic-link');a.href=threadHash(id);return a;}
-function setThreadLink(id){state.selectedThread=id;history.replaceState(null,'',id?threadHash(id):scopeHash());}
+function setThreadLink(id){if(id!==state.selectedThread)state.focusedMessage='';state.selectedThread=id;history.replaceState(null,'',id?threadHash(id)+(state.focusedMessage?'/message/'+enc(state.focusedMessage):''):scopeHash());}
 function clearScope(){state.scopeEpoch++;state.listEpoch++;state.rows=[];state.rowsQuery='';state.overview=null;state.overviewSignature=null;state.openThreads.clear();state.messageOpen.clear();state.cards.clear();state.threadData.clear();state.loads.clear();state.selectedThread='';state.nextCursor=null;$('#search').value='';$('#content').replaceChildren();}
 function updateHeader(){
   $('#scope').textContent=human()?`Human view · ${state.project||'Choose a project'}`:`Agent view · ${state.address||'Choose an inbox'}`;
@@ -249,9 +250,11 @@ function updateHeader(){
   $('#compose').textContent=state.tab==='announcements'?'New announcement':'New message';
   $('#unread').parentElement.hidden=human()||state.tab==='reservations';$('#history-label').hidden=state.tab!=='reservations';
   $('#search').placeholder=human()&&state.tab==='mail'?'Search project conversations…':'Search this view…';
+  $('#search').hidden=state.tab==='mail';
   document.querySelectorAll('[data-view]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.view===state.view)));
   document.querySelectorAll('[data-tab]').forEach(b=>{const selected=b.dataset.tab===state.tab;b.classList.toggle('selected',selected);if(selected)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');});
   document.querySelectorAll('.project-link,.inbox-link').forEach(a=>{const selected=a.classList.contains('project-link')?human()&&a.dataset.project===state.project:!human()&&a.dataset.address===state.address;a.classList.toggle('selected',selected);if(selected)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');});
+  document.dispatchEvent(new Event('inbox:scope'));
 }
 function renderDirectory(){
   const root=$('#inboxes');root.replaceChildren();
@@ -271,9 +274,9 @@ async function applyRoute(){
   const changed=state.view!==target.view||state.project!==target.project||state.address!==address||state.tab!==tab;
   if(changed)clearScope();state.view=target.view;state.project=target.project;state.address=address;state.tab=tab;
   if(address)state.lastAgents.set(state.project,address);
-  state.selectedThread=target.thread||'';if(target.thread)state.openThreads.add(target.thread);
+  state.selectedThread=target.thread||'';state.focusedMessage=target.message||'';state.revealedMessage='';if(target.thread)state.openThreads.add(target.thread);
   save('agent-inbox.location',JSON.stringify({view:state.view,project:state.project,address:state.address,tab:state.tab}));
-  if(state.project)history.replaceState(null,'',state.selectedThread?threadHash(state.selectedThread):scopeHash());updateHeader();if(changed)window.scrollTo(0,0);await refresh();
+  if(state.project)history.replaceState(null,'',state.selectedThread?threadHash(state.selectedThread)+(state.focusedMessage?'/message/'+enc(state.focusedMessage):''):scopeHash());updateHeader();if(changed)window.scrollTo(0,0);await refresh();revealSearchMessage();
 }
 async function connection(){try{const h=await api(hosted?'/v1/hosted/health':'/healthz');$('#connection-label').textContent=`${hosted?'Shared workspace':'Local service'} · v${h.version}`;const dl=$('#connection-details');dl.replaceChildren();for(const [label,value] of [['Service address',location.origin],...(hosted?[['Workspace',h.workspace],['Signed in',state.member?.email]]:[['Listening IP',h.listen_address],['Port',h.port],['Uptime',duration(h.uptime_seconds*1000)]]),['Browser peer IP',h.client_ip],['Server time',date(h.server_time)]]){dl.append(element('dt',label),element('dd',value??'Not recorded'));}}catch(e){$('#connection-label').textContent='Service unavailable';fail(e);}}
 async function reloadWorkspace(){const epoch=++state.directoryEpoch;try{if(hosted)await initializeHosted();const [directory,projects]=await Promise.all([api('/v1/inboxes'),api('/v1/projects')]);if(epoch!==state.directoryEpoch)return;state.inboxes=directory.inboxes;state.projects=projects.projects;renderDirectory();await applyRoute();await connection();}catch(e){if(epoch===state.directoryEpoch)fail(e);}}
@@ -378,8 +381,9 @@ function renderThread(t,target){
     if(index)fields.push(['Since previous message',duration(new Date(m.sent_at)-new Date(t.emails[index-1].sent_at))]);if(!human())fields.push(['Inbox role',m.your_role]);for(const [label,value] of fields)dl.append(element('dt',label),element('dd',value));
     if(m.reply_to_email_id){const dd=element('dd');dd.append(button(m.reply_to_email_id,()=>{const parent=[...target.querySelectorAll('.message')].find(x=>x.dataset.id===m.reply_to_email_id);if(parent){parent.open=true;parent.scrollIntoView({block:'nearest',behavior:'smooth'});}}));dl.append(element('dt','Reply to'),dd);}
     dl.append(element('dt','Recipient receipts'),element('dd',(m.receipts||[]).map(r=>`${r.address} · ${r.kind.toUpperCase()} · ${r.read_at?'read '+date(r.read_at):'unread'}`).join('\n')));headers.append(dl,element('p','API peer is the client address seen by this service, not an agent’s physical location. Historical and synced mail may have no recorded peer.','muted'));body.append(headers);card.append(body);target.append(card);
-  });if(last&&(!human()||hosted))target.append(button('Reply to thread',()=>compose(last),'primary'));
+  });if(last&&(!human()||hosted))target.append(button('Reply to thread',()=>compose(last),'primary'));revealSearchMessage();
 }
+function revealSearchMessage(){const id=state.focusedMessage;if(!id||state.revealedMessage===id)return;const card=document.getElementById(id);if(!card)return;state.revealedMessage=id;state.messageOpen.set(id,true);card.open=true;document.querySelectorAll('.search-target').forEach(e=>e.classList.remove('search-target'));card.classList.add('search-target');requestAnimationFrame(()=>{card.scrollIntoView({block:'center',behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth'});const summary=card.querySelector('summary');summary.tabIndex=-1;summary.focus({preventScroll:true});});}
 function compose(reply=null){if((human()&&!hosted)||!state.project||(!hosted&&!state.address)){notice('Choose a project and inbox to compose.');return;}state.mode=reply?'reply':state.tab==='announcements'?'announcement':'mail';state.reply=reply;state.composeAddress=hosted?`${state.member.human_agent}@${state.project}`:state.address;state.key=crypto.randomUUID();$('#compose-form').reset();$('#compose-error').textContent='';$('#compose-title').textContent=reply?'Reply to thread':state.mode==='announcement'?'New announcement':'New message';$('#sending-as').textContent=`Sending as ${state.composeAddress}`;$('#recipients').hidden=state.mode==='announcement';$('#subject-label').hidden=!!reply;$('#subject').required=!reply;$('#to').required=state.mode!=='announcement';$('#global-label').hidden=state.mode!=='announcement';$('#send').textContent=state.mode==='announcement'?'Publish announcement':'Send message';if(reply){$('#to').value=[...new Set([reply.from,...reply.to])].filter(a=>a!==state.composeAddress).join(', ');$('#cc').value=reply.cc.filter(a=>a!==state.composeAddress&&!$('#to').value.split(', ').includes(a)).join(', ');}$('#composer').showModal();}
 $('#compose-form').addEventListener('input',()=>{state.key=crypto.randomUUID();});
 $('#compose-form').onsubmit=async e=>{e.preventDefault();const sender=state.composeAddress,key=state.key,split=id=>$(id).value.split(',').map(s=>s.trim()).filter(Boolean);let url='/v1/emails',body={from:sender,subject:$('#subject').value,body_markdown:$('#body').value};if(state.mode==='announcement'){url='/v1/announcements';body.all_projects=$('#global').checked;}else{body.to=split('#to');body.cc=split('#cc');if(state.mode==='reply')url=`/v1/emails/${enc(state.reply.email_id)}/reply`;}$('#compose-form').querySelectorAll('input,textarea,button').forEach(e=>e.disabled=true);$('#compose-error').textContent='';try{const result=await api(url,body,key);$('#composer').close();state.threadData.clear();await refresh();notice(state.mode==='announcement'?hosted?'Announcement published.':'Announcement published locally.':`Message accepted: ${result.delivery_status||'local service'}.`);}catch(error){$('#compose-error').textContent=error.message;}finally{$('#compose-form').querySelectorAll('input,textarea,button').forEach(e=>e.disabled=false);}};
@@ -391,10 +395,16 @@ setInterval(()=>{document.querySelectorAll('time[datetime]').forEach(t=>t.textCo
 reloadWorkspace();
 '''
 
+from agent_inbox.search_ui import HTML as SEARCH_HTML, CSS as SEARCH_CSS, JS as SEARCH_JS
+
+HTML = HTML.replace('<main>', '<main>' + SEARCH_HTML).replace('</head>', '<script src="/search.js" defer></script></head>')
+CSS += SEARCH_CSS
+
 ASSETS = {
     '/': ('text/html; charset=utf-8', HTML),
     '/ui': ('text/html; charset=utf-8', HTML),
     '/ui/': ('text/html; charset=utf-8', HTML),
     '/ui.css': ('text/css; charset=utf-8', CSS),
     '/ui.js': ('text/javascript; charset=utf-8', JS),
+    '/search.js': ('text/javascript; charset=utf-8', SEARCH_JS),
 }

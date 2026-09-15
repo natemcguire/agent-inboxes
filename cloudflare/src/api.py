@@ -126,7 +126,7 @@ def authorize(db, principal, method, path, headers, body):
         headers.pop('x-agent-address', None)
         headers.pop('x-agent-session', None)
         if method == 'GET':
-            allowed = (parts[:2] in (['v1','projects'], ['v1','inboxes'], ['v1','announcements'], ['v1','reservations']))
+            allowed = (parts[:2] in (['v1','projects'], ['v1','inboxes'], ['v1','announcements'], ['v1','reservations'], ['v1','search']))
             if not allowed or 'wait' in parts or 'watch' in parts:
                 deny()
             query['observe'] = ['true']
@@ -155,14 +155,14 @@ def authorize(db, principal, method, path, headers, body):
             deny('Project is outside this key’s scope')
         if body.get('project', project) != project or any(p != project for p in query.get('project', [])):
             deny('Project is outside this key’s scope')
-        if url.path in ('/v1/inboxes', '/v1/leases/lookup'):
+        if url.path in ('/v1/inboxes', '/v1/leases/lookup', '/v1/search'):
             query['project'] = [project]
         if url.path == '/v1/projects':
             # The caller is returned only its project in dispatch below.
             pass
         if url.path == '/v1/reservations':
             url = url._replace(path=f'/v1/projects/{quote(project)}/reservations')
-        if parts[1] not in ('inboxes','projects','emails','announcements','reservations','leases','ae'):
+        if parts[1] not in ('inboxes','projects','emails','announcements','reservations','leases','ae','search'):
             deny()
         if url.path == '/v1/leases/claim' and body.get('family') != principal['family']:
             deny('Claim the agent family assigned to this key')

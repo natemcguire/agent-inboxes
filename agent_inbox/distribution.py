@@ -18,7 +18,7 @@ FILES = {'bin/agent-inbox'} | {f'agent_inbox/{name}.py' for name in (
     '__init__', 'cli', 'client', 'config', 'db', 'identity', 'launchagent',
     'models', 'project_setup', 'server', 'service', 'hooks', 'cloud_protocol',
     'cloudsync', 'distribution', 'updates', 'operations', 'recovery', 'ui', 'ae', 'ae_attention', 'ae_cli', 'skills_data',
-    'leases', 'mailing', 'inbox_admin', 'project_registry', 'license_data')}
+    'leases', 'mailing', 'inbox_admin', 'project_registry', 'license_data', 'search', 'search_ui')}
 
 
 def check_url(url):

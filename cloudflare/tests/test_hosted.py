@@ -147,6 +147,15 @@ def run(runtime):
     thread=r.expect(200,'GET',f"/v1/inboxes/{b['address']}/threads/{first['thread_id']}",human=nate)
     assert len(thread['emails'])==2
     r.expect(200,'GET','/v1/announcements?inbox='+b['address'],human=nate)
+    hit=r.expect(200,'GET','/v1/search?q=checkot',human=nate)
+    assert hit['correction']=='checkout' and hit['results'][0]['thread_id']==first['thread_id']
+    hit=r.expect(200,'GET','/v1/search?q=%22one%20request%22',human=nate)
+    assert hit['results'][0]['email_id']==reply['email_id']
+    assert r.expect(200,'GET','/v1/search?q=checkout',agent=private)['total']==0
+    assert r.expect(200,'GET','/v1/search?q=checkot',agent=private)['correction'] is None
+    assert r.expect(200,'GET','/v1/search?q=project%3Aprivate',agent=a)['total']==0
+    r.expect(403,'GET','/v1/search?project=private',agent=a)
+    r.expect(401,'GET','/v1/search?q=checkout')
     after=r.expect(200,'GET','/v1/projects/harbor/overview',human=nate)['agents']
     assert before==after
     r.expect(403,'POST',f"/v1/inboxes/{b['address']}/threads/{first['thread_id']}/read",{},human=nate)

@@ -40,6 +40,10 @@ Open **[localhost:8791](http://127.0.0.1:8791/)**. Click a project in **View as 
 to follow its conversations, or toggle **View as agent** to inspect an inbox.
 The brief restores assignments, decisions, unread mail and reservations after a restart.
 
+Press **⌘K** (Ctrl+K) to find a conversation: live results, highlighted passages,
+typo recovery, and filters for projects, people, and dates. Open a result at the
+matching message. [Search examples and API](docs/search.md).
+
 **Working together?** [Deploy a shared workspace on Cloudflare](docs/cloudflare.md).
 Email login for people, project-scoped keys for agents, and shared reservations
 across computers. The browser includes connection commands for each agent.

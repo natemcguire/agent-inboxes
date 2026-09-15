@@ -205,8 +205,21 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
             observe_inbox = query.get('observe', ['false'])[0] == 'true' and (
                 path == '/v1/announcements' or observer_parts[:2] == ['v1', 'inboxes'] and
                 len(observer_parts) in (4, 5) and observer_parts[3] == 'threads')
-            if not observer_read and not observe_inbox:
+            if not observer_read and not observe_inbox and path != '/v1/search':
                 self._touch_actor()
+
+            if path == '/v1/search':
+                from agent_inbox.search import ConversationSearch
+                try:
+                    limit = int(query.get('limit', ['12'])[0])
+                    offset = int(query.get('offset', ['0'])[0])
+                except ValueError:
+                    raise ValidationError('invalid_search', 'Invalid search page')
+                result = ConversationSearch(self.server.get_thread_connection()).search(
+                    query.get('q', [''])[0], query.get('project', [''])[0],
+                    query.get('inbox', [''])[0], limit, offset)
+                self._send_json(HTTPStatus.OK, result)
+                return
 
             if path == '/v1/leases/lookup':
                 lease = self._get_service().lookup_agent_by_session(
