@@ -9,6 +9,7 @@ import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional
 
+from agent_inbox import __version__
 from agent_inbox.config import get_server_url
 from agent_inbox.models import (
     ConflictError,
@@ -72,6 +73,7 @@ class InboxClient:
         url = f"{self.base_url}{full_path}"
         req_headers = {
             "Accept": "application/json",
+            "User-Agent": f"agent-inboxes/{__version__} (+https://github.com/natemcguire/agent-inboxes)",
         }
         # Identify the calling agent so the server can refresh its lease. Best-effort:
         # identity derivation must never block a request.

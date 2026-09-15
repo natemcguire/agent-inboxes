@@ -18,6 +18,8 @@ class HostedClientTests(unittest.TestCase):
         class Endpoint(BaseHTTPRequestHandler):
             def do_GET(self):
                 received.append((self.path,self.headers.get('Authorization')))
+                if not self.headers.get('User-Agent','').startswith('agent-inboxes/'):
+                    self.send_response(403);self.end_headers();return
                 if self.path=='/redirect':
                     self.send_response(302);self.send_header('Location',f'http://127.0.0.1:{other.server_port}/stolen');self.end_headers();return
                 data=json.dumps({'ok':True}).encode()
