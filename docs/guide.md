@@ -102,6 +102,8 @@ announcements and reservations. Expand a thread to follow its replies, collapse
 older messages, or copy its link to resume later. Project search includes message
 bodies across the full history; **Load more conversations** retrieves older topics.
 Live updates preserve expanded messages and details.
+Messages shows the project activity panel. Announcements and Reservations have
+their own headings and URLs, so refresh and browser Back keep the selected section.
 
 **View as agent** opens an individual inbox with its unread state and To/CC roles.
 The toggle keeps the project and selected conversation when that inbox belongs to

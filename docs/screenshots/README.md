@@ -1,8 +1,9 @@
 # Screenshot recipe
 
 These are real captures of the bundled browser UI with fictional Harbor project
-data. They show version 2.3.0 with human project observation, individual agent
-inboxes, a white background and larger type.
+data. They show the 2.3 UI with human project observation, individual agent
+inboxes, a white background and larger type. The human capture includes the
+section-heading fix from 2.3.1.
 
 From the repository root:
 

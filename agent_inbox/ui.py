@@ -209,6 +209,7 @@ const state = {view:'human',project:'',address:'',tab:'mail',projects:[],inboxes
 const element = (tag,text,cls) => {const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e;};
 const button = (text,fn,cls) => {const b=element('button',text,cls);b.type='button';b.onclick=fn;return b;};
 const human = () => state.view==='human';
+const tabTitles = {mail:'Messages',announcements:'Announcements',reservations:'Reservations'};
 const date = x => x?new Date(x).toLocaleString():'Not recorded';
 function relative(x){const seconds=Math.round((Date.now()-new Date(x).getTime())/1000);if(!Number.isFinite(seconds))return 'Not recorded';if(seconds<0)return date(x);if(seconds<60)return 'just now';if(seconds<3600)return `${Math.floor(seconds/60)}m ago`;if(seconds<86400)return `${Math.floor(seconds/3600)}h ago`;return `${Math.floor(seconds/86400)}d ago`;}
 function time(x){const e=element('time',x?relative(x):'Not recorded');if(x){e.dateTime=x;e.title=`${date(x)} · ${x}`;}return e;}
@@ -218,16 +219,27 @@ const fail = e => notice(e.message,true);
 async function api(path,body,key){const r=await fetch(path,{method:body?'POST':'GET',headers:body?{'Content-Type':'application/json',...(key?{'Idempotency-Key':key}:{})}:{},body:body?JSON.stringify(body):undefined,cache:'no-store'});const data=await r.json();if(!r.ok)throw Error(data.error?.message||`Request failed (${r.status})`);return data;}
 function saved(key){try{return localStorage.getItem(key)||'';}catch{return '';}}
 function save(key,value){try{localStorage.setItem(key,value);}catch{}}
-function route(){try{const parts=location.hash.slice(1).split('/').map(decodeURIComponent);if(parts[0]==='project'&&parts[1])return {view:'human',project:parts[1],thread:parts[2]==='thread'?parts[3]:''};if(parts[0].includes('@'))return {view:'agent',address:parts[0],project:parts[0].split('@')[1],thread:parts[1]==='thread'?parts[2]:''};}catch{}return null;}
-function scopeHash(view=state.view,project=state.project,address=state.address){return view==='human'?`#project/${enc(project)}`:`#${enc(address)}`;}
-function threadHash(id){return `${scopeHash()}/thread/${enc(id)}`;}
+function route(){
+  try{
+    const parts=location.hash.slice(1).split('/').map(decodeURIComponent);
+    let target,section;
+    if(parts[0]==='project'&&parts[1]){target={view:'human',project:parts[1]};section=2;}
+    else if(parts[0].includes('@')){target={view:'agent',address:parts[0],project:parts[0].split('@')[1]};section=1;}
+    else return null;
+    target.tab=['announcements','reservations'].includes(parts[section])?parts[section]:'mail';
+    target.thread=parts[section]==='thread'?parts[section+1]:'';
+    return target;
+  }catch{return null;}
+}
+function scopeHash(view=state.view,project=state.project,address=state.address,tab=state.tab){const base=view==='human'?`#project/${enc(project)}`:`#${enc(address)}`;return base+(tab==='mail'?'':'/'+tab);}
+function threadHash(id){return `${scopeHash(state.view,state.project,state.address,'mail')}/thread/${enc(id)}`;}
 function topicLink(text,id){const a=element('a',text,'topic-link');a.href=threadHash(id);return a;}
 function setThreadLink(id){state.selectedThread=id;history.replaceState(null,'',id?threadHash(id):scopeHash());}
 function clearScope(){state.scopeEpoch++;state.listEpoch++;state.rows=[];state.rowsQuery='';state.overview=null;state.overviewSignature=null;state.openThreads.clear();state.messageOpen.clear();state.cards.clear();state.threadData.clear();state.loads.clear();state.selectedThread='';state.nextCursor=null;$('#search').value='';$('#content').replaceChildren();}
 function updateHeader(){
-  $('#scope').textContent=human()?'Human view · Project overview':`Agent view · ${state.address||'Choose an inbox'}`;
-  $('#title').textContent=human()?(state.project||'Projects'):({mail:'Messages',announcements:'Announcements',reservations:'Reservations'}[state.tab]);
-  $('#project-overview').hidden=!human();$('#compose').hidden=human()||state.tab==='reservations';
+  $('#scope').textContent=human()?`Human view · ${state.project||'Choose a project'}`:`Agent view · ${state.address||'Choose an inbox'}`;
+  $('#title').textContent=tabTitles[state.tab];
+  $('#project-overview').hidden=!human()||state.tab!=='mail';$('#compose').hidden=human()||state.tab==='reservations';
   $('#compose').textContent=state.tab==='announcements'?'New announcement':'New message';
   $('#unread').parentElement.hidden=human()||state.tab==='reservations';$('#history-label').hidden=state.tab!=='reservations';
   $('#search').placeholder=human()&&state.tab==='mail'?'Search project conversations…':'Search this view…';
@@ -249,12 +261,13 @@ async function applyRoute(){
   const candidates=state.inboxes.filter(i=>i.project===target.project);
   const address=candidates.find(i=>i.address===(target.address||state.lastAgents.get(target.project)||(remembered?.project===target.project?remembered.address:'')||state.address))?.address||candidates[0]?.address||'';
   if(target.view==='agent'&&!address)target.view='human';
-  const changed=state.view!==target.view||state.project!==target.project||state.address!==address;
-  if(changed)clearScope();state.view=target.view;state.project=target.project;state.address=address;
+  const tab=target.thread?'mail':(['announcements','reservations'].includes(target.tab)?target.tab:'mail');
+  const changed=state.view!==target.view||state.project!==target.project||state.address!==address||state.tab!==tab;
+  if(changed)clearScope();state.view=target.view;state.project=target.project;state.address=address;state.tab=tab;
   if(address)state.lastAgents.set(state.project,address);
-  if(target.thread){if(state.tab!=='mail'){clearScope();state.tab='mail';}state.selectedThread=target.thread;state.openThreads.add(target.thread);}
-  save('agent-inbox.location',JSON.stringify({view:state.view,project:state.project,address:state.address}));
-  if(state.project)history.replaceState(null,'',state.selectedThread?threadHash(state.selectedThread):scopeHash());updateHeader();await refresh();
+  state.selectedThread=target.thread||'';if(target.thread)state.openThreads.add(target.thread);
+  save('agent-inbox.location',JSON.stringify({view:state.view,project:state.project,address:state.address,tab:state.tab}));
+  if(state.project)history.replaceState(null,'',state.selectedThread?threadHash(state.selectedThread):scopeHash());updateHeader();if(changed)window.scrollTo(0,0);await refresh();
 }
 async function connection(){try{const h=await api('/healthz');$('#connection-label').textContent=`Local service · v${h.version}`;const dl=$('#connection-details');dl.replaceChildren();for(const [label,value] of [['Service address',location.origin],['Listening IP',h.listen_address],['Port',h.port],['Browser peer IP',h.client_ip],['Uptime',duration(h.uptime_seconds*1000)],['Server time',date(h.server_time)]]){dl.append(element('dt',label),element('dd',value??'Not recorded'));}}catch(e){$('#connection-label').textContent='Service unavailable';fail(e);}}
 async function reloadWorkspace(){const epoch=++state.directoryEpoch;try{const [directory,projects]=await Promise.all([api('/v1/inboxes'),api('/v1/projects')]);if(epoch!==state.directoryEpoch)return;state.inboxes=directory.inboxes;state.projects=projects.projects;renderDirectory();await applyRoute();await connection();}catch(e){if(epoch===state.directoryEpoch)fail(e);}}
@@ -270,7 +283,7 @@ async function refresh({quiet=false,append=false}={}){
     if(tab==='mail')url=human()?`${path()}?limit=50&q=${enc($('#search').value)}${append&&state.nextCursor?'&cursor='+enc(state.nextCursor):''}`:`${path()}?observe=true&limit=200&unread=${$('#unread').checked}`;
     else if(tab==='announcements')url=human()?`/v1/projects/${enc(state.project)}/announcements`:`/v1/announcements?observe=true&inbox=${enc(state.address)}&unread=${$('#unread').checked}`;
     else url=`/v1/projects/${enc(state.project)}/reservations?history=${$('#history').checked?'1':'0'}&limit=200`;
-    const [data,overview]=await Promise.all([api(url),human()?api(`/v1/projects/${enc(state.project)}/overview`):Promise.resolve(null)]);
+    const [data,overview]=await Promise.all([api(url),human()&&tab==='mail'?api(`/v1/projects/${enc(state.project)}/overview`):Promise.resolve(null)]);
     if(epoch!==state.listEpoch||scope!==state.scopeEpoch)return;
     const rows=data.threads||data.announcements||data.entries;
     const previousRows=JSON.stringify(state.rows), previous=new Map(state.rows.map(r=>[r.thread_id,r]));
@@ -367,7 +380,7 @@ $('#compose-form').onsubmit=async e=>{e.preventDefault();const sender=state.comp
 $('#composer').addEventListener('cancel',e=>{if($('#send').disabled)e.preventDefault();});$('#cancel').onclick=()=>$('#composer').close();$('#compose').onclick=()=>compose();$('#refresh').onclick=()=>{state.threadData.clear();reloadWorkspace();};$('#unread').onchange=()=>refresh();$('#history').onchange=()=>refresh();
 let searchTimer;$('#search').oninput=()=>{clearTimeout(searchTimer);if(human()&&state.tab==='mail'){setThreadLink('');searchTimer=setTimeout(()=>refresh(),200);}else render();};
 document.querySelectorAll('[data-view]').forEach(b=>b.onclick=()=>{if(b.dataset.view==='agent'&&!state.address){notice('This project has no registered agent inboxes.');return;}const row=state.rows.find(r=>r.thread_id===state.selectedThread),thread=state.threadData.get(state.selectedThread),participants=row?.participants||thread?.emails.flatMap(m=>[m.from,...m.to,...m.cc])||[];const keep=state.selectedThread&&(b.dataset.view==='human'||participants.includes(state.address));location.hash=scopeHash(b.dataset.view)+(keep?'/thread/'+enc(state.selectedThread):'');});
-document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{if(state.tab===b.dataset.tab)return;clearScope();state.tab=b.dataset.tab;history.replaceState(null,'',scopeHash());updateHeader();refresh();});
+document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{if(state.tab!==b.dataset.tab)location.hash=scopeHash(state.view,state.project,state.address,b.dataset.tab);});
 setInterval(()=>{document.querySelectorAll('time[datetime]').forEach(t=>t.textContent=relative(t.dateTime));if($('#live').checked)refresh({quiet:true});},15000);
 reloadWorkspace();
 '''
