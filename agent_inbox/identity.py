@@ -37,56 +37,41 @@ def derive_project(cwd: Optional[Union[str, Path]] = None) -> str:
     """
     Derive the canonical project slug:
     1. AGENT_INBOX_PROJECT environment variable if set.
-    2. Basename of git remote.origin.url.
-    3. Git common worktree or repository root directory name.
+    2. An offline repository-to-project mapping, if registered.
+    3. Basename of git remote.origin.url or repository root directory name.
     4. Fallback to current working directory name.
     """
-    from agent_inbox.cloudsync import enabled, map_project, repository_identity
-    if enabled():
-        from agent_inbox.db import get_connection
-        working = Path(cwd).resolve() if cwd else Path.cwd().resolve()
-        try:
-            result = subprocess.run(["git", "config", "--get", "remote.origin.url"], cwd=working,
-                                    capture_output=True, text=True, timeout=2, check=False)
-            raw_repo = result.stdout.strip() or str(working)
-        except (OSError, subprocess.TimeoutExpired):
-            raw_repo = str(working)
-        repo = repository_identity(raw_repo)
-        conn = get_connection()
-        try:
-            explicit = os.environ.get("AGENT_INBOX_PROJECT")
-            if explicit:
-                map_project(conn, raw_repo, normalize_slug(explicit))
-            row = conn.execute("SELECT slug FROM project_mappings WHERE repo_identity=?", (repo,)).fetchone()
-            if row is not None:
-                return row[0]
-            # Unmapped local work still works offline. Export is held with an
-            # unresolved_project_mapping reason until explicitly resolved.
-        finally:
-            conn.close()
-
-    env_project = os.environ.get("AGENT_INBOX_PROJECT")
-    if env_project and env_project.strip():
-        return normalize_slug(env_project.strip())
-
+    from agent_inbox.cloudsync import enabled, map_project
+    from agent_inbox.db import get_connection
+    from agent_inbox.project_registry import lookup_project
+    env_project = os.environ.get('AGENT_INBOX_PROJECT', '').strip()
     working_dir = Path(cwd).expanduser().resolve() if cwd else Path.cwd().resolve()
-
-    # Try git config remote.origin.url
+    raw_repo = str(working_dir)
+    remote = ''
     try:
-        res = subprocess.run(
-            ["git", "config", "--get", "remote.origin.url"],
-            cwd=str(working_dir),
-            capture_output=True,
-            text=True,
-            timeout=2.0,
-            check=False,
-        )
-        if res.returncode == 0 and res.stdout.strip():
-            repo_name = _extract_repo_name_from_url(res.stdout.strip())
-            if repo_name:
-                return normalize_slug(repo_name)
-    except Exception:
+        res = subprocess.run(['git', 'config', '--get', 'remote.origin.url'],
+                             cwd=str(working_dir), capture_output=True, text=True,
+                             timeout=2, check=False)
+        remote = res.stdout.strip()
+        raw_repo = remote or raw_repo
+    except (OSError, subprocess.TimeoutExpired):
         pass
+    if env_project and not enabled():
+        return normalize_slug(env_project)
+    conn = get_connection()
+    try:
+        if env_project:
+            map_project(conn, raw_repo, normalize_slug(env_project))
+            return normalize_slug(env_project)
+        mapping = lookup_project(conn, raw_repo)
+        if mapping:
+            return mapping['slug']
+    finally:
+        conn.close()
+    if remote:
+        repo_name = _extract_repo_name_from_url(remote)
+        if repo_name:
+            return normalize_slug(repo_name)
 
     # Try git common-dir or top-level
     try:
@@ -160,7 +145,7 @@ def derive_session() -> str:
     1. AGENT_INBOX_SESSION environment variable if set (normalized slug).
     2. A runtime session env var (CLAUDE_CODE_SESSION_ID, CODEX_SESSION_ID, ...),
        hashed to a stable short slug.
-    3. CLAUDE_PID plus process start time, when supplied by the harness.
+    3. AGENT_INBOX_HARNESS_PID or CLAUDE_PID plus process start time.
     4. Parent PID plus process start time as a best-effort fallback; separate
        tool shells require a runtime session ID or stable harness PID.
     """
@@ -175,8 +160,7 @@ def derive_session() -> str:
 
     # A harness may invoke each CLI command through a different shell. Prefer
     # its stable agent PID to that shell's PPID, and include process birth time.
-    claude_pid = os.environ.get("CLAUDE_PID", "")
-    ppid = int(claude_pid) if claude_pid.isdigit() and int(claude_pid) > 0 else os.getppid()
+    ppid = harness_pid() or os.getppid()
     start_time = ""
     try:
         res = subprocess.run(
@@ -240,3 +224,49 @@ def derive_identity(cwd: Optional[Union[str, Path]] = None) -> Tuple[str, str, s
     project = derive_project(cwd)
     address = f"{agent}@{project}"
     return agent, project, address
+
+
+def process_started_at(pid):
+    """OS-observed birth fingerprint; missing/unverifiable evidence is not live."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        return None
+    try:
+        result = subprocess.run(['ps', '-o', 'lstart=', '-p', str(pid)],
+                                capture_output=True, text=True, timeout=2, check=False)
+        return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def harness_pid():
+    """Never use the short-lived CLI PID as evidence that an agent is alive."""
+    for name in ('AGENT_INBOX_HARNESS_PID', 'CLAUDE_PID'):
+        raw = os.environ.get(name, '')
+        if raw.isdigit() and int(raw) > 1:
+            return int(raw)
+    return None
+
+
+def resolve_identity(client, cwd=None):
+    """Resolve explicit identity or this session's name, never another session's."""
+    agent, project, address = derive_identity(cwd)
+    session = client.session_id or derive_session()
+    if os.environ.get('AGENT_INBOX_AGENT', '').strip():
+        result = dict(agent=agent, project=project, address=address, session=session, source='environment')
+    else:
+        lease = client.lookup_lease(project, session)
+        result = dict(lease, source='lease') if lease else dict(
+            agent=agent, project=project, address=address, session=session, source='unbound')
+    if result['source'] != 'unbound':
+        client.address = result['address']
+    return result
+
+
+def resolve_address(client):
+    from agent_inbox.models import ValidationError
+    identity = resolve_identity(client)
+    if identity['source'] == 'unbound':
+        raise ValidationError('unbound_identity',
+            'No name is bound to this session. Run eval "$(agent-inbox claim)" '
+            'or explicitly set AGENT_INBOX_AGENT; no mailbox was read or changed.')
+    return identity['address']

@@ -51,6 +51,7 @@ class TestE2EMultiAgentFlow(unittest.TestCase):
                     subject="Sail API response shape",
                     body_markdown="I added `draft_id`. Can you check the consumer?",
                     idempotency_key=idempotency_token,
+                    create_missing=True,
                 )
                 eml_01_id = send_res["email_id"]
                 thr_01_id = send_res["thread_id"]
@@ -62,6 +63,7 @@ class TestE2EMultiAgentFlow(unittest.TestCase):
                     subject="Sail API response shape",
                     body_markdown="I added `draft_id`. Can you check the consumer?",
                     idempotency_key=idempotency_token,
+                    create_missing=True,
                 )
                 self.assertEqual(send_repeat["email_id"], eml_01_id)
                 self.assertEqual(send_repeat["thread_id"], thr_01_id)

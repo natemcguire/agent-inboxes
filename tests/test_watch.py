@@ -112,6 +112,7 @@ class TestWatchAndSessions(unittest.TestCase):
                 to_addrs=["receiver@watch-proj"],
                 subject="Wake up",
                 body_markdown="New mail while you were blocked.",
+                create_missing=True,
             )
 
         t = threading.Thread(target=send_later, daemon=True)
@@ -150,6 +151,7 @@ class TestWatchAndSessions(unittest.TestCase):
             to_addrs=["peer@watch-proj"],
             subject="Session stamp",
             body_markdown="Which claude sent this?",
+            create_missing=True,
         )
         thread = s2.get_thread("peer@watch-proj", send_res["thread_id"])
         self.assertEqual(thread["emails"][0]["sender_session"], "s-11111111")

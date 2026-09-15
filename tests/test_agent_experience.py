@@ -95,7 +95,7 @@ class AgentExperienceTests(unittest.TestCase):
 
     def test_mail_roles_subscription_and_context_budget(self):
         svc=InboxService(self.conn)
-        message=svc.send_email('sender@project',['alpha@project'],['observer@project'],'Decision','<script>untrusted</script>','mail-token')
+        message=svc.send_email('sender@project',['alpha@project'],['observer@project'],'Decision','<script>untrusted</script>','mail-token', create_missing=True)
         task=self.command('task.create',{'title':'Act on decision','thread_id':message['thread_id']})
         context=self.ae.context('observer@project','observer')
         self.assertEqual(context['sections']['unread_threads'][0]['your_roles'],['cc'])
@@ -167,7 +167,7 @@ class AgentExperienceTests(unittest.TestCase):
         batch=self.ae.watch('alpha@project','a',start['cursor'],start['source'],timeout=1,coalesce=.2)
         self.assertGreaterEqual(time.monotonic()-before,.18)
         self.assertEqual(batch['wake_reason'],'batch')
-        InboxService(self.conn).send_email('sender@project',['alpha@project'],[],'Blocker','Please review','urgent-mail')
+        InboxService(self.conn).send_email('sender@project',['alpha@project'],[],'Blocker','Please review','urgent-mail', create_missing=True)
         before=time.monotonic()
         urgent=self.ae.watch('alpha@project','a',batch['cursor'],start['source'],timeout=1,coalesce=1,policy='to-me')
         self.assertLess(time.monotonic()-before,.5)

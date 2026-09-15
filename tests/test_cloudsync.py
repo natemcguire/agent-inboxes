@@ -62,7 +62,7 @@ class CloudTest(unittest.TestCase):
         self.engine = SyncEngine(self.http,'dev_local')
 
     def send(self, token='local', body='body'):
-        return self.service.send_email('bob@local',['alice@remote'],[],'Local',body,token)['email_id']
+        return self.service.send_email('bob@local',['alice@remote'],[],'Local',body,token, create_missing=True)['email_id']
 
     def status(self, mid):
         return dict(self.conn.execute('SELECT * FROM cloud_envelopes WHERE message_id=?',(mid,)).fetchone())
@@ -301,12 +301,14 @@ class CloudTest(unittest.TestCase):
         from agent_inbox.cli import build_parser,cmd_reserve
         save_config({'enabled':True})
         args=build_parser().parse_args(['reserve','file','--json'])
-        client=mock.Mock(); client.acquire_reservations.return_value={'reservations':[]}
-        with mock.patch('agent_inbox.cli.derive_identity',return_value=('bob','local','bob@local')),mock.patch('agent_inbox.cli.derive_project',return_value='local'):
+        client=mock.Mock(); client.address=None; client.acquire_reservations.return_value={'reservations':[]}
+        with mock.patch('agent_inbox.cli.resolve_address',return_value='bob@local'),mock.patch('agent_inbox.cli.derive_project',return_value='local'):
             for failure in (False,True):
                 if failure: client.acquire_reservations.side_effect=ValueError('bad')
                 out=io.StringIO()
-                with contextlib.redirect_stdout(out),contextlib.redirect_stderr(io.StringIO()): cmd_reserve(args,client)
+                with contextlib.redirect_stdout(out),contextlib.redirect_stderr(io.StringIO()): result=cmd_reserve(args,client)
+                self.assertEqual(result, 1 if failure else 0)
+                client.acquire_reservations.assert_called()
                 self.assertIn(LOCAL_WARNING,json.loads(out.getvalue())['warnings'])
 
     def test_ack_snapshot_change_is_not_acknowledged(self):
@@ -406,7 +408,7 @@ class CloudTest(unittest.TestCase):
         self.assertEqual(self.conn.execute('SELECT MIN(joined_at) FROM thread_inboxes').fetchone()[0],'2019-01-01T00:00:00.000Z')
 
     def test_unmapped_legacy_mail_waits_for_explicit_mapping(self):
-        mid=self.service.send_email('bob@unmapped',['alice@remote'],[],'Legacy','body','legacy')['email_id']
+        mid=self.service.send_email('bob@unmapped',['alice@remote'],[],'Legacy','body','legacy', create_missing=True)['email_id']
         self.engine.sync_once(self.conn)
         self.http.push.assert_not_called()
         self.assertEqual(self.status(mid)['reason'],'unresolved_project_mapping')

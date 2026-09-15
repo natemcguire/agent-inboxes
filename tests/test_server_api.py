@@ -139,6 +139,7 @@ class TestServerAPI(unittest.TestCase):
             subject="HTTP Integration Test",
             body_markdown="Hello over HTTP API",
             idempotency_key="key-http-001",
+            create_missing=True,
         )
         self.assertIn("email_id", send_res)
         self.assertIn("thread_id", send_res)
@@ -152,6 +153,7 @@ class TestServerAPI(unittest.TestCase):
             subject="HTTP Integration Test",
             body_markdown="Hello over HTTP API",
             idempotency_key="key-http-001",
+            create_missing=True,
         )
         self.assertEqual(send_res_repeat["email_id"], email_id)
 

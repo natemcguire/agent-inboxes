@@ -90,22 +90,33 @@ workers have separate lifetimes.
 A mailbox address is lowercase `agent-slug@project-slug`.
 
 Project identity comes from an explicit `AGENT_INBOX_PROJECT` override, otherwise
-the Git origin repository basename, otherwise the Git root/directory fallback.
-Agent identity comes from `AGENT_INBOX_AGENT`, otherwise runtime-family detection.
-`whoami` derives and registers the mailbox. Session IDs distinguish executions
-sharing the same address; `AGENT_INBOX_SESSION` can explicitly supply one.
+the offline repository registry, the Git origin repository basename, or the Git
+root/directory fallback. `project register`, `lookup` and `list` work without the
+server. Hosted identities normalize casing/transports; filesystem identities
+preserve case. Lookup exits 4 for a missing mapping and 5 for conflicting legacy
+mappings that need repair.
+
+Agent identity comes from `AGENT_INBOX_AGENT` or this session's existing name
+binding. Without either, runtime-family detection is diagnostic: `whoami` reports
+an unbound identity and acting/reading commands exit 2 with a claim remedy.
+`whoami` registers bound or explicitly named callers. Session IDs distinguish
+executions sharing an address; `AGENT_INBOX_SESSION` can explicitly supply one.
 
 Session precedence is explicit `AGENT_INBOX_SESSION`, then recognized runtime
 session variables (including `CLAUDE_CODE_SESSION_ID`, legacy `CLAUDE_SESSION_ID`,
-and Codex session identifiers), then `CLAUDE_PID` plus process birth time, then
+and Codex session identifiers), then `AGENT_INBOX_HARNESS_PID` or `CLAUDE_PID`
+plus process birth time, then
 parent PID plus process birth time. Runtime values are hashed into short session
 slugs. A shell-parent fallback is best effort; harnesses that launch a fresh shell
 for each command must provide a stable runtime ID, agent PID or explicit override.
 
-`claim` atomically selects the lowest free family name: `codex`, `codex-2`, etc.
-The current implementation searches up to 99 slots. A name becomes reclaimable
-following two hours without lease activity. This name lease is separate from a
-15-minute file reservation.
+`claim` atomically recovers this session's historical binding before searching
+up to 99 free family names: `codex`, `codex-2`, etc. It skips sender-only services.
+A name becomes reclaimable after 12 hours without lease activity and without a
+matching live harness process fingerprint. The server obtains process birth time
+from the OS; a short-lived CLI PID is not liveness evidence. Existing session
+bindings are refreshed by normal requests or optional silent `heartbeat` calls.
+This name lease is separate from a 15-minute file reservation.
 
 ```sh
 eval "$(agent-inbox claim)"
@@ -125,8 +136,10 @@ The logical hierarchy is Project → Inbox → Thread → Email.
   Markdown body, timestamp, optional parent, and an ordered reference chain.
 - Recipient membership and read timestamps are stored separately. Reading mail
   for one mailbox must not mark another mailbox's copy read.
-- Sending to valid addresses can provision their inboxes. A successful local
-  send means durable local acceptance, not that another agent has read it.
+- Recipients and explicit senders must be registered. Unknown addresses return
+  404 with nearby suggestions; `send --create-missing` explicitly enables old
+  auto-provisioning for migrations. A successful local send means durable local
+  acceptance, not that another agent has read it.
 - Send/reply requests require an `Idempotency-Key`. A transport retry reuses its
   key; a genuinely new message uses a new key. Do not use key reuse to edit mail.
 - A reply remains in its parent's thread. A new topic requires a new thread.
@@ -153,6 +166,20 @@ AE context preserves To/CC roles and treats message content as untrusted data. T
 A read receipt is not task acceptance or task completion. Those require an
 explicit response or other evidence of the work.
 
+`*@project` sends to registered agent inboxes in a known project, excluding the
+sender and inboxes registered with role `service`. A service may send but cannot
+receive mail or appear as an active agent. Empty project broadcasts are retained
+and delivered to agents registering within seven days of send time. No literal
+wildcard inbox is created. `GET /v1/emails/{id}/status` and `agent-inbox status`
+report recipients' read timestamps without marking anything read.
+
+Explicit `inboxes merge` and `inboxes delete` commands provide transactional
+maintenance with `--dry-run` previews. Merge retains email/thread IDs and receipt
+state. Delete refuses history without `--force`; forced deletion removes the
+inbox's sent mail from all recipients. Active reservations and unfinished AE
+assignments must be released/handed off first; cloud-bound data is refused.
+See the [README cleanup contract](../README.md#inbox-cleanup).
+
 ## 5. Delivery and attention
 
 Agents check unread mail and announcements at session start, before long work, and before handoff.
@@ -163,6 +190,11 @@ and its unified event interface for mail, announcements, tasks and reservations.
 Mail delivery and scheduling are separate: receiving mail does not guarantee that
 a model has interrupted its current action or begun the requested task. Preserve
 context checkpoints alongside event subscriptions.
+
+`watch` only waits within a running turn: it exits 3 on timeout and does not
+re-arm or launch idle agents. Its cursor tracks recipient deliveries, including
+late broadcasts and newly merged receipts. Reset saved mail-watch cursors once
+when upgrading from 2.1; AE source/event cursors retain their existing meaning.
 
 ### Durable announcements
 
@@ -255,6 +287,11 @@ Default TTL is 15 minutes. The server bounds requested TTL to 1 minute–2 hours
 renewal extends from now by the recorded TTL; it may continue while work is active.
 Reading mail does not implicitly renew file reservations. Reacquiring your own
 active path renews it; ownership includes session identity, not just mailbox name.
+
+The holder must belong to the requested project. Acquisition request keys record
+the original holder, session, paths and options; a changed retry is rejected.
+An identical retry returns current reservation state without acquiring again,
+including after expiry or release. Use a new key for a new acquisition.
 
 Release can target keys or all leases owned by the current holder/session in the
 project. Missing/non-owned keys are reported without releasing another holder's

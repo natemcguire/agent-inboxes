@@ -21,7 +21,7 @@ from agent_inbox.config import (
     get_port,
     get_server_url,
 )
-from agent_inbox.identity import derive_agent, derive_identity, derive_project, derive_repo_key, derive_session
+from agent_inbox.identity import derive_agent, derive_project, derive_repo_key, derive_session, resolve_address, resolve_identity
 from agent_inbox.launchagent import (
     install_launchagent,
     load_launchagent,
@@ -41,6 +41,12 @@ def _print_error(message: str, code: Optional[str] = None) -> None:
         sys.stderr.write(f"Error: {message}\n")
 
 
+def _resolved_identity(client):
+    address = client.address or resolve_address(client)
+    agent, project = address.split('@', 1)
+    return agent, project, address
+
+
 def _read_body(body_arg: Optional[str], body_file_arg: Optional[str]) -> str:
     """Read body from text argument, file, or stdin."""
     if body_file_arg is not None:
@@ -56,10 +62,15 @@ def _read_body(body_arg: Optional[str], body_file_arg: Optional[str]) -> str:
 
 
 def cmd_whoami(args: argparse.Namespace, client: InboxClient) -> int:
-    """Print and auto-create the derived inbox address and session id."""
+    """Show resolution source; register only a bound or explicitly named inbox."""
     try:
-        _, _, address = derive_identity()
-        res = client.put_inbox(address)
+        identity = resolve_identity(client)
+        address = identity['address']
+        res = dict(identity)
+        if identity['source'] != 'unbound':
+            res.update(client.put_inbox(address))
+        else:
+            print('No name is bound to this session. Run eval "$(agent-inbox claim)" before acting.', file=sys.stderr)
         if args.json:
             print(json.dumps(res, indent=2))
         else:
@@ -135,10 +146,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
 def cmd_announcements(args, client):
     try:
         if args.command == "announce":
-            sender = args.from_addr or derive_identity()[2]
+            sender = args.from_addr or _resolved_identity(client)[2]
+            if not args.from_addr:
+                client.put_inbox(sender)
             result = client.post_announcement(sender, args.subject, _read_body(args.body, args.body_file), args.all_projects, args.idempotency_key)
         else:
-            viewer = args.inbox or derive_identity()[2]
+            viewer = args.inbox or _resolved_identity(client)[2]
             if args.ack:
                 result = client.acknowledge_announcement(args.ack, viewer)
             else:
@@ -156,7 +169,10 @@ def cmd_send(args: argparse.Namespace, client: InboxClient) -> int:
     try:
         from_addr = args.from_addr
         if not from_addr:
-            _, _, from_addr = derive_identity()
+            _, _, from_addr = _resolved_identity(client)
+
+        if not args.from_addr:
+            client.put_inbox(from_addr)
 
         # Parse recipients (support multiple --to / --cc and comma-separated)
         to_list = []
@@ -175,6 +191,7 @@ def cmd_send(args: argparse.Namespace, client: InboxClient) -> int:
             cc_addrs=cc_list,
             subject=args.subject,
             body_markdown=body,
+            create_missing=args.create_missing,
         )
 
         if args.json:
@@ -211,8 +228,10 @@ def cmd_reply(args: argparse.Namespace, client: InboxClient) -> int:
     try:
         from_addr = args.from_addr
         if not from_addr:
-            _, _, from_addr = derive_identity()
+            _, _, from_addr = _resolved_identity(client)
 
+        if not args.from_addr:
+            client.put_inbox(from_addr)
         body = _read_body(args.body, args.body_file)
 
         email_id = args.email_id
@@ -289,7 +308,7 @@ def cmd_list(args: argparse.Namespace, client: InboxClient) -> int:
     try:
         inbox = args.inbox
         if not inbox:
-            _, _, inbox = derive_identity()
+            _, _, inbox = _resolved_identity(client)
 
         threads = client.list_threads(inbox, unread=args.unread, limit=args.limit)
 
@@ -330,7 +349,7 @@ def cmd_read(args: argparse.Namespace, client: InboxClient) -> int:
     try:
         inbox = args.inbox
         if not inbox:
-            _, _, inbox = derive_identity()
+            _, _, inbox = _resolved_identity(client)
 
         thread_data = client.get_thread(inbox, args.thread_id)
 
@@ -470,7 +489,7 @@ def cmd_reserve(args: argparse.Namespace, client: InboxClient) -> int:
 def _cmd_reserve(args: argparse.Namespace, client: InboxClient) -> int:
     """Acquire advisory reservations: file paths OR named resources (all-or-nothing)."""
     try:
-        _, _, address = derive_identity()
+        _, _, address = _resolved_identity(client)
         project = derive_project()
         ttl_seconds = _parse_duration(args.ttl) if args.ttl else None
         resources = args.resource or None
@@ -546,7 +565,7 @@ def _cmd_reserve(args: argparse.Namespace, client: InboxClient) -> int:
 
 def _cmd_renew_or_release(args: argparse.Namespace, client: InboxClient, action: str) -> int:
     try:
-        _, _, address = derive_identity()
+        _, _, address = _resolved_identity(client)
         project = derive_project()
         keys = list(args.paths or []) + [f"res://{r}" for r in (args.resource or [])]
         if not args.all and not keys:
@@ -592,7 +611,7 @@ def cmd_reservations(args: argparse.Namespace, client: InboxClient) -> int:
         project = args.project or derive_project()
         holder = None
         if args.mine:
-            _, _, holder = derive_identity()
+            holder = resolve_identity(client)['address']
         payload = client.list_reservations(project, holder=holder, history=args.history)
         reservations = payload.get("reservations", [])
         if args.json:
@@ -626,13 +645,13 @@ def cmd_reservations(args: argparse.Namespace, client: InboxClient) -> int:
 def cmd_watch(args: argparse.Namespace, client: InboxClient) -> int:
     """Block until new unread mail arrives (long-poll), then print a summary.
 
-    Designed to run as a background task whose exit wakes a coding agent:
-    exit 0 = mail arrived, exit 3 = timed out with no mail, exit 1 = error.
+    Waits within a running turn; it does not launch or wake an idle agent.
+    Exit 0 = mail arrived, exit 3 = timeout, exit 1 = error.
     """
     try:
         address = args.for_addr
         if not address:
-            _, _, address = derive_identity()
+            _, _, address = _resolved_identity(client)
 
         overall = max(1.0, float(args.timeout))
         deadline = time.monotonic() + overall
@@ -760,19 +779,19 @@ def cmd_claim(args: argparse.Namespace, client: InboxClient) -> int:
     try:
         project = derive_project()
         if getattr(args, "release", False):
-            agent = derive_agent()
+            agent = resolve_address(client).split('@')[0]
             result = client.release_lease(agent, project)
             verb = "Released" if result.get("released") else "No active lease for"
             print(f"{verb} {agent}@{project}.", file=sys.stderr)
             return 0
         family = args.family or derive_agent()
         # A family like "claude-2" from an inherited env var collapses to its base
-        # so re-claiming from a stale shell still yields the lowest free slot.
+        # so re-claiming can recover this session's existing family slot.
         base = family.rsplit("-", 1)[0] if family.rsplit("-", 1)[-1].isdigit() else family
         result = client.claim_lease(base, project)
         slot = result["agent"]
         print(f"export AGENT_INBOX_AGENT={slot}")
-        print(f"Claimed {slot}@{project} (lease expires after 2h idle; release with `agent-inbox claim --release`).", file=sys.stderr)
+        print(f"Claimed {slot}@{project} (name is retained for this session; reuse requires 12h idle and no live holder; release with `agent-inbox claim --release`).", file=sys.stderr)
         return 0
     except InboxError as e:
         _print_error(str(e))
@@ -856,6 +875,9 @@ def build_parser() -> argparse.ArgumentParser:
         version=f"%(prog)s {__version__}",
     )
 
+    from agent_inbox.license_data import TEXT as license_text
+    parser.add_argument('--license', action='version', version=license_text)
+
     subparsers = parser.add_subparsers(dest="command", help="Sub-commands")
 
     from agent_inbox.ae_cli import add_parser as add_ae_parser
@@ -878,8 +900,28 @@ def build_parser() -> argparse.ArgumentParser:
     for command in (p_login, p_status, p_replay, p_retry, p_map):
         command.add_argument("--db", help="Local database (defaults to service database)")
 
+    p_project = subparsers.add_parser('project', help='Offline repository/project registry')
+    registry = p_project.add_subparsers(dest='project_action', required=True)
+    for action in ('register', 'lookup', 'list'):
+        p = registry.add_parser(action)
+        p.add_argument('--db')
+        p.add_argument('--json', action='store_true')
+        if action != 'list': p.add_argument('--repo', required=True)
+        if action == 'register': p.add_argument('--slug', '--project', dest='slug', required=True)
+
+    p_service = subparsers.add_parser('service', help='Register a sender-only service identity')
+    sc = p_service.add_subparsers(dest='service_action', required=True)
+    sr = sc.add_parser('register')
+    sr.add_argument('address')
+    sr.add_argument('--display-name')
+    sr.add_argument('--json', action='store_true')
+
+    p_delivery = subparsers.add_parser('status', help='Inspect delivery/read status without marking mail read')
+    p_delivery.add_argument('email_id')
+    p_delivery.add_argument('--json', action='store_true')
+
     # whoami
-    p_whoami = subparsers.add_parser("whoami", help="Derive and auto-create active inbox address")
+    p_whoami = subparsers.add_parser("whoami", help="Show identity and register a bound or explicitly named inbox")
     p_whoami.add_argument("--json", action="store_true", help="Output JSON")
 
     # serve
@@ -912,6 +954,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--body-file", help="Read message body from file or - for stdin")
     p_send.add_argument("--from", dest="from_addr", help="Sender address (defaults to derived identity)")
     p_send.add_argument("--json", action="store_true", help="Output JSON")
+    p_send.add_argument('--create-missing', action='store_true', help='Explicitly create unregistered sender/recipients (migration only)')
 
     # reply
     p_reply = subparsers.add_parser("reply", help="Reply to an email in a thread")
@@ -969,7 +1012,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_rsv.add_argument("--json", action="store_true", help="Output JSON")
 
     # watch
-    p_watch = subparsers.add_parser("watch", help="Block until new unread mail arrives (long-poll push subscription)")
+    p_watch = subparsers.add_parser("watch", help="Block until new unread mail arrives (within-turn long-poll)")
     p_watch.add_argument("--timeout", type=float, default=300.0, help="Overall seconds to wait before exiting 3 (default: 300)")
     p_watch.add_argument("--for", dest="for_addr", help="Inbox address to watch (defaults to derived identity)")
     p_watch.add_argument("--after", type=int, default=None, help="Only wake for mail newer than this cursor (from a previous watch response)")
@@ -980,6 +1023,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_inboxes.add_argument("--project", help="Filter by project slug (defaults to current project)")
     p_inboxes.add_argument("--all", action="store_true", help="List all inboxes across all projects")
     p_inboxes.add_argument("--json", action="store_true", help="Output JSON")
+
+    maintenance = p_inboxes.add_subparsers(dest='inboxes_action')
+    merge = maintenance.add_parser('merge', help='Consolidate inbox history into another inbox')
+    merge.add_argument('--from', dest='source', required=True)
+    merge.add_argument('--to', dest='target', required=True)
+    delete = maintenance.add_parser('delete', help='Delete an empty inbox; --force also destroys its mail')
+    delete.add_argument('address')
+    delete.add_argument('--force', action='store_true')
+    for p in (merge, delete):
+        p.add_argument('--dry-run', action='store_true', help='Show counts and activity dates without changing data')
+        p.add_argument('--json', action='store_true')
 
     p_update = subparsers.add_parser("update", help="Check for and install a verified runtime update")
     p_update.add_argument("--check", action="store_true", help="Only report availability; do not install")
@@ -1002,6 +1056,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_hc = subparsers.add_parser("hook-check")
     p_hc.add_argument("--format", dest="hc_format", choices=["plain", "json"], default="plain")
+    subparsers.add_parser('heartbeat', help='Silently refresh this session name; for opt-in harness activity hooks')
 
     p_prompt = subparsers.add_parser("prompt", help="Print the compact agent onboarding prompt")
     p_prompt.add_argument("--copy", action="store_true", help="Also copy the prompt to the clipboard (macOS)")
@@ -1037,6 +1092,45 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Every CLI interaction identifies its agent session so the service can
     # distinguish concurrent same-family agents sharing one inbox address.
     client = InboxClient(session_id=derive_session(), repo_key=derive_repo_key())
+
+    if args.command == 'heartbeat':
+        try:
+            client._request('POST', '/v1/leases/heartbeat', body={'project': derive_project()}, timeout=2)
+        except Exception:
+            pass
+        return 0
+
+    if args.command == 'project':
+        from agent_inbox.project_registry import run
+        return run(args)
+    if args.command in ('service', 'status') or (args.command == 'inboxes' and args.inboxes_action):
+        try:
+            if args.command == 'service':
+                result = client.put_inbox(args.address, args.display_name, role='service')
+            elif args.command == 'status':
+                result = client.email_status(args.email_id)
+            else:
+                payload = {'dry_run': args.dry_run}
+                if args.inboxes_action == 'merge': payload.update(source=args.source, target=args.target)
+                else: payload.update(address=args.address, force=args.force)
+                result = client._request('POST', '/v1/inboxes/' + args.inboxes_action, body=payload)
+            print(json.dumps(result, indent=2))
+            return 0
+        except InboxError as exc:
+            _print_error(exc.message, exc.code)
+            return 1
+
+    # Refuse an unbound family fallback BEFORE any mailbox or reservation I/O.
+    acting = {'send': 'from_addr', 'reply': 'from_addr', 'announce': 'from_addr',
+              'list': 'inbox', 'threads': 'inbox', 'read': 'inbox', 'announcements': 'inbox',
+              'watch': 'for_addr', 'reserve': None, 'renew': None, 'release': None}
+    if args.command in acting:
+        explicit = getattr(args, acting[args.command], None) if acting[args.command] else None
+        try:
+            client.address = explicit or resolve_address(client)
+        except InboxError as exc:
+            _print_error(exc.message, exc.code)
+            return 2 if exc.code == 'unbound_identity' else 1
 
     if args.command == "cloud":
         return cmd_cloud(args, client)

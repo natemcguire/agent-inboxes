@@ -60,14 +60,16 @@ def add_parser(subparsers):
 
 def run(args):
     from agent_inbox.client import InboxClient
-    from agent_inbox.identity import derive_identity,derive_session
+    from agent_inbox.identity import resolve_address,derive_session
     from urllib.parse import quote
     try:
         command=args.ae_command
         if command=='setup':
             print(json.dumps({'broker_required':False,'message':'No extra setup required. Start agent-inbox serve.'}));return 0
-        actor=args.actor or derive_identity()[2];session=args.session or derive_session()
+        session=args.session or derive_session()
         client=InboxClient(session_id=session)
+        actor=args.actor or resolve_address(client)
+        client.address=actor
         if command in ('brief','watch'):
             query={'actor':actor,'session':session,'after':args.after,'source':args.source,'limit':args.limit,'policy':args.policy}
             if command=='watch':query.update(timeout=args.timeout,coalesce=args.coalesce)
@@ -102,4 +104,4 @@ def run(args):
             result=client._request('POST','/v1/ae/command',body={'actor':actor,'session':session,'request_id':args.request_id or str(uuid.uuid4()),'operation':operation,'payload':payload})
         print(json.dumps(result));return 3 if command=='watch' and not result['changed'] and not result['has_more'] else 0
     except Exception as exc:
-        print(f'AE error: {exc}',file=sys.stderr);return 1
+        print(f'AE error: {exc}',file=sys.stderr);return 2 if getattr(exc, 'code', '') == 'unbound_identity' else 1

@@ -33,6 +33,7 @@ class InboxClient:
         # Optional worktree-safe repository identity; sent as X-Repo-Key so
         # same-basename repos don't cross-conflict on file reservations.
         self.repo_key = repo_key
+        self.address = None
 
     def _request(
         self,
@@ -58,12 +59,17 @@ class InboxClient:
         # identity derivation must never block a request.
         try:
             from agent_inbox.identity import derive_identity
-            req_headers["X-Agent-Address"] = derive_identity()[2]
+            if self.address or os.environ.get('AGENT_INBOX_AGENT', '').strip():
+                req_headers["X-Agent-Address"] = self.address or derive_identity()[2]
         except Exception:
             pass
         if self.session_id:
             req_headers["X-Agent-Session"] = self.session_id
             req_headers["X-Agent-Pid"] = str(os.getpid())
+            from agent_inbox.identity import harness_pid
+            pid = harness_pid()
+            if pid:
+                req_headers['X-Agent-Harness-Pid'] = str(pid)
         if self.repo_key:
             req_headers["X-Repo-Key"] = self.repo_key
         if headers:
@@ -84,7 +90,10 @@ class InboxClient:
                     return {}
                 return json.loads(resp_body)
         except urllib.error.HTTPError as e:
-            raw_err = e.read().decode("utf-8")
+            try:
+                raw_err = e.read().decode("utf-8")
+            finally:
+                e.close()
             try:
                 err_json = json.loads(raw_err)
                 err_data = err_json.get("error", {})
@@ -115,8 +124,14 @@ class InboxClient:
             ) from e
 
     def claim_lease(self, family: str, project: str) -> Dict[str, Any]:
-        """Claim the lowest free agent slot for a runtime family in a project."""
+        """Recover this session's name, or claim a free family slot in a project."""
         return self._request("POST", "/v1/leases/claim", body={"family": family, "project": project})
+
+    def lookup_lease(self, project, session):
+        return self._request('GET', '/v1/leases/lookup', query={'project': project, 'session': session}).get('lease')
+
+    def email_status(self, email_id):
+        return self._request('GET', '/v1/emails/' + urllib.parse.quote(email_id, safe='') + '/status')
 
     def release_lease(self, agent: str, project: str) -> Dict[str, Any]:
         """Release this agent's lease so the slot frees immediately."""
@@ -130,12 +145,14 @@ class InboxClient:
         """Check service health."""
         return self._request("GET", "/healthz")
 
-    def put_inbox(self, address: str, display_name: Optional[str] = None) -> Dict[str, Any]:
+    def put_inbox(self, address: str, display_name: Optional[str] = None, role=None) -> Dict[str, Any]:
         """Idempotently register or touch an inbox."""
         encoded_addr = urllib.parse.quote(address, safe="@")
         body = {}
         if display_name is not None:
             body["display_name"] = display_name
+        if role is not None:
+            body['role'] = role
         return self._request("PUT", f"/v1/inboxes/{encoded_addr}", body=body)
 
     def list_inboxes(self, project: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -163,6 +180,7 @@ class InboxClient:
         subject: str = "",
         body_markdown: str = "",
         idempotency_key: Optional[str] = None,
+        create_missing: bool = False,
     ) -> Dict[str, Any]:
         """Start a thread and send the first email."""
         key = idempotency_key or str(uuid.uuid4())
@@ -172,6 +190,7 @@ class InboxClient:
             "cc": cc_addrs or [],
             "subject": subject,
             "body_markdown": body_markdown,
+            "create_missing": create_missing,
         }
         headers = {"Idempotency-Key": key}
         return self._request("POST", "/v1/emails", body=body, headers=headers)

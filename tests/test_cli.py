@@ -44,6 +44,9 @@ class TestCLI(unittest.TestCase):
             "AGENT_INBOX_PROJECT": "test-project",
         })
         self.env_patch.start()
+        from agent_inbox.service import InboxService
+        for address in ('target@other-project', 'filetest@other-project'):
+            InboxService(self.db_conn).ensure_inbox(address)
 
     def tearDown(self):
         self.env_patch.stop()

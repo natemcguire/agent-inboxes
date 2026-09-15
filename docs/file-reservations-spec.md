@@ -39,11 +39,21 @@ CREATE INDEX IF NOT EXISTS idx_reservations_active
 ```
 
 A reservation is **active** iff `released_at IS NULL AND expires_at > now`.
-Rows are never deleted; release/expiry/takeover set `released_at` +
-`released_by`, giving a free audit log. Expiry is lazy: any read or write that
+Ordinary release/expiry/takeover retain rows and set `released_at` +
+`released_by` for an audit log. Explicit forced inbox deletion can remove that
+inbox's reservation history. Expiry is lazy: any read or write that
 touches reservations first sweeps expired-but-unreleased rows for that project
 (sets `released_at = expires_at`, `released_by = 'expired'`). No background
 timer needed.
+
+The holder's address must belong to the requested project. Name claims, AE task
+ownership and file leases are separate; accepting or handing off work does not
+acquire or transfer file reservations.
+
+Acquisition request keys are bound to the original project, holder, session,
+paths and options. Reusing a key for a different request returns a conflict.
+Identical retries return current reservation state, including inactive rows,
+without acquiring again. A new acquisition requires a new request key.
 
 ### Path normalization
 

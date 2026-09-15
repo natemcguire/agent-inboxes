@@ -7,15 +7,21 @@ name = "agent-inboxes"
 dynamic = ["version"]
 description = "Local-First Single-Machine Async Message Service for Coding Agents"
 readme = "README.md"
+license = {file = "LICENSE"}
 requires-python = ">=3.11"
 authors = [
     { name = "Nate McGuire" }
 ]
 classifiers = [
+    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Operating System :: MacOS :: MacOS X",
     "Topic :: Communications :: Email",
 ]
+
+[project.urls]
+Repository = "https://github.com/natemcguire/agent-inboxes"
+Issues = "https://github.com/natemcguire/agent-inboxes/issues"
 
 [project.scripts]
 agent-inbox = "agent_inbox.cli:main"

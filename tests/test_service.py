@@ -48,6 +48,7 @@ class TestInboxService(unittest.TestCase):
             subject="Sail API response shape",
             body_markdown="I added `draft_id`. Can you check the consumer?",
             client_token="token-001",
+            create_missing=True,
         )
         self.assertTrue(res1["email_id"].startswith("eml_"))
         self.assertTrue(res1["thread_id"].startswith("thr_"))
@@ -61,6 +62,7 @@ class TestInboxService(unittest.TestCase):
             subject="Sail API response shape",
             body_markdown="I added `draft_id`. Can you check the consumer?",
             client_token="token-001",
+            create_missing=True,
         )
         self.assertEqual(res1["email_id"], res2["email_id"])
         self.assertEqual(res1["thread_id"], res2["thread_id"])
@@ -82,6 +84,7 @@ class TestInboxService(unittest.TestCase):
                 subject="Test",
                 body_markdown="Body",
                 client_token="tok-dup1",
+                create_missing=True,
             )
 
         # Recipient across to and cc
@@ -93,6 +96,7 @@ class TestInboxService(unittest.TestCase):
                 subject="Test",
                 body_markdown="Body",
                 client_token="tok-dup2",
+                create_missing=True,
             )
 
     def test_send_email_missing_to_rejected(self):
@@ -104,6 +108,7 @@ class TestInboxService(unittest.TestCase):
                 subject="Test",
                 body_markdown="Body",
                 client_token="tok-empty-to",
+                create_missing=True,
             )
 
     def test_reply_all_default_and_reference_chaining(self):
@@ -115,6 +120,7 @@ class TestInboxService(unittest.TestCase):
             subject="Initial Topic",
             body_markdown="Message 1",
             client_token="tok-init",
+            create_missing=True,
         )
         eml_1_id = initial["email_id"]
         thread_id = initial["thread_id"]
@@ -174,6 +180,7 @@ class TestInboxService(unittest.TestCase):
             subject="Shared Task",
             body_markdown="Please review",
             client_token="tok-shared",
+            create_missing=True,
         )
         thread_id = initial["thread_id"]
 
@@ -227,6 +234,7 @@ class TestInboxService(unittest.TestCase):
             subject="Self follow-up topic",
             body_markdown="First thought",
             client_token="tok-self-1",
+            create_missing=True,
         )
         eml_1_id = initial["email_id"]
 
@@ -251,6 +259,7 @@ class TestInboxService(unittest.TestCase):
             subject="Thread 1",
             body_markdown="Body 1",
             client_token="tok-t1",
+            create_missing=True,
         )
         time.sleep(0.01)
         t2 = self.service.send_email(
@@ -260,6 +269,7 @@ class TestInboxService(unittest.TestCase):
             subject="Thread 2",
             body_markdown="Body 2",
             client_token="tok-t2",
+            create_missing=True,
         )
         time.sleep(0.01)
         t3 = self.service.send_email(
@@ -269,6 +279,7 @@ class TestInboxService(unittest.TestCase):
             subject="Thread 3",
             body_markdown="Body 3",
             client_token="tok-t3",
+            create_missing=True,
         )
 
         # Thread 3 was created last, so it's top

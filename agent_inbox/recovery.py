@@ -76,15 +76,19 @@ def merge_databases(inputs, output):
                         projects[row['id']] = dst.execute('SELECT id FROM projects WHERE slug=?', (row['slug'],)).fetchone()[0]
                     for row in src.execute('SELECT * FROM inboxes'):
                         project = projects[row['project_id']]
-                        dst.execute('INSERT OR IGNORE INTO inboxes(project_id,local_part,display_name,created_at,last_seen_at) VALUES (?,?,?,?,?)',
-                                    (project,row['local_part'],row['display_name'],row['created_at'],row['last_seen_at']))
+                        existing = dst.execute('SELECT role FROM inboxes WHERE project_id=? AND local_part=?', (project,row['local_part'])).fetchone()
+                        if existing and existing['role'] != row['role']:
+                            raise RecoveryError('Conflicting inbox roles')
+                        dst.execute('INSERT OR IGNORE INTO inboxes(project_id,local_part,display_name,created_at,last_seen_at,role) VALUES (?,?,?,?,?,?)',
+                                    (project,row['local_part'],row['display_name'],row['created_at'],row['last_seen_at'],row['role']))
                         inboxes[row['id']] = dst.execute('SELECT id FROM inboxes WHERE project_id=? AND local_part=?', (project,row['local_part'])).fetchone()[0]
                     definitions = [
                         ('threads', ('id',), {'home_project_id': projects}, {'last_email_at','activity_id'}),
                         ('thread_inboxes', ('thread_id','inbox_id'), {'inbox_id': inboxes}, {'joined_at'}),
                         ('emails', ('id',), {'from_inbox_id': inboxes}, {'delivery_id','cloud_synced_at'}),
-                        ('email_recipients', ('email_id','inbox_id'), {'inbox_id': inboxes}, {'read_at'}),
+                        ('email_recipients', ('email_id','inbox_id'), {'inbox_id': inboxes}, {'read_at','delivery_id'}),
                         ('email_references', ('email_id','position'), {}, set()),
+                        ('email_broadcasts', ('email_id','project_id'), {'project_id': projects}, set()),
                         ('announcements', ('id',), {}, set()),
                         ('announcement_receipts', ('announcement_id','inbox_id'), {'inbox_id': inboxes}, {'read_at'}),
                         ('project_mappings', ('repo_identity',), {}, set()),

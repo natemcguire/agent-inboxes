@@ -628,13 +628,23 @@ class SyncWorker(threading.Thread):
 def repository_identity(value):
     """Canonical clone identity; credentials and transport do not distinguish repos."""
     import re
+    if not isinstance(value, str) or not value.strip():
+        from agent_inbox.models import ValidationError
+        raise ValidationError('invalid_repository', 'A nonempty repository identity is required')
     value = value.strip()
+    # Filesystem identities preserve case; hosted repository identities do not.
+    if value.startswith(('/', '.', '~', 'file://')):
+        path = urllib.parse.urlsplit(value).path if value.startswith('file://') else value
+        return str(Path(path).expanduser().resolve())
     if re.match(r'^[^/@]+@[^/:]+:', value):
         host, path = value.split('@', 1)[1].split(':', 1)
         value = 'https://' + host + '/' + path
+    elif '://' not in value and '/' in value:
+        first = value.split('/', 1)[0]
+        value = 'https://' + (value if '.' in first or ':' in first else 'github.com/' + value)
     p = urllib.parse.urlsplit(value)
     if p.hostname:
-        return p.hostname.lower() + (':' + str(p.port) if p.port and p.port not in (22,443,80) else '') + '/' + p.path.strip('/').removesuffix('.git')
+        return p.hostname.lower() + (':' + str(p.port) if p.port and p.port not in (22,443,80) else '') + '/' + p.path.strip('/').removesuffix('.git').lower()
     # A bare token is a literal identity, not a filesystem path: resolving it
     # against the CWD minted identities like /Users/x/<slug> for checkouts that
     # never existed. Only path-shaped or actually-present values canonicalize.
@@ -650,10 +660,11 @@ def map_project(conn, repo, slug):
     require(type(slug) is str and re.fullmatch(SLUG, slug), 'Explicit canonical slug required')
     repo = repository_identity(repo)
     with transaction(conn):
-        existing = conn.execute('SELECT slug FROM project_mappings WHERE repo_identity=?', (repo,)).fetchone()
+        from agent_inbox.project_registry import lookup_project
+        existing = lookup_project(conn, repo)
         # One identity keeps one slug forever, but many identities (clones of
         # the same repository, per the spec) may legitimately share a slug.
-        require(existing is None or existing[0] == slug, 'Repository mapping cannot be changed')
+        require(existing is None or existing['slug'] == slug, 'Repository mapping cannot be changed')
         conn.execute('INSERT INTO project_mappings VALUES (?,?) ON CONFLICT(repo_identity) DO NOTHING', (repo, slug))
         conn.execute("UPDATE cloud_envelopes SET state='pending',reason=NULL,retry_at=0 WHERE state='retryable' AND reason='unresolved_project_mapping'")
         conn.execute('UPDATE cloud_state SET push_retry_at=0 WHERE id=1')

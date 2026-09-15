@@ -2,6 +2,10 @@
 
 > **Agent Experience: durable context, work queues, messaging and reservations with bounded briefs and policy-based watching.**
 
+Open source under the [MIT License](LICENSE). Python 3.11+ and its standard
+library are sufficient for local use. Run `agent-inbox --license` to print the
+license, including from a standalone runtime archive.
+
 ---
 
 ## 1. Overview & Architecture
@@ -12,8 +16,8 @@
 1. **Python 3.11+ Standard Library:** No pip packages, native broker, Node build or external account is needed for local AE.
 2. **Loopback Only (`127.0.0.1:8791`):** Strictly binds to IPv4 localhost. Because the service is unauthenticated, this is enforced, not just a default: `serve` refuses to start and raises an error if `--host` or `AGENT_INBOX_HOST` is set to anything other than `127.0.0.1`/`localhost` (e.g. `0.0.0.0` or a LAN address). It never rebinds silently. Port `8791` was chosen to avoid collisions with standard local services (Codey `3456`, ntfy `8082`, WhatsApp bridge `8085`, webhook listener `8086`, Miniwatcher `8585`, TinyCam `8788`).
 3. **Transactional SQLite (`~/.agent-inboxes/inbox.db`):** WAL mode enabled (`PRAGMA journal_mode = WAL`), foreign keys enforced (`PRAGMA foreign_keys = ON`), 5000ms busy timeout (`PRAGMA busy_timeout = 5000`).
-4. **Strict Local Permissions:** The database file is always locked to mode `0600` (`rw-------`). A directory the service creates for its data — the default `~/.agent-inboxes/` — is set to `0700` (`rwx------`). If you point `--db`/`AGENT_INBOX_DB` at a file inside a **pre-existing shared directory** (e.g. `/tmp`), the service leaves that directory's permissions untouched rather than rewriting a directory it does not own. Only the loopback server opens the database directly; CLI clients interact via HTTP.
-5. **Durable & Immutable:** Messages are immutable and retained indefinitely in v1. All timestamps are formatted as UTC RFC 3339 strings ending in `Z`. Identifiers are opaque prefixed UUIDs (`thr_...`, `eml_...`).
+4. **Strict Local Permissions:** The database file is always locked to mode `0600` (`rw-------`). A directory the service creates for its data — the default `~/.agent-inboxes/` — is set to `0700` (`rwx------`). If you point `--db`/`AGENT_INBOX_DB` at a file inside a **pre-existing shared directory** (e.g. `/tmp`), the service leaves that directory's permissions untouched rather than rewriting a directory it does not own. Mail, tasks and reservations use the loopback HTTP server. Offline registry, setup and recovery commands also access SQLite directly.
+5. **Durable History:** Ordinary messaging does not edit or expire stored messages. Explicit inbox maintenance can consolidate or delete history as described below. All timestamps are formatted as UTC RFC 3339 strings ending in `Z`. Identifiers are opaque prefixed UUIDs (`thr_...`, `eml_...`).
 6. **Per-Recipient Independent Read State:** Every recipient tracks read status independently via `read_at`. Marking a thread read for one agent does not alter another recipient's read state. Senders are not tracked as unread.
 7. **Idempotent Delivery:** `POST /v1/emails` and `POST /v1/emails/{id}/reply` require an `Idempotency-Key` header. Retrying with the same token returns the original email record without creating duplicates.
 
@@ -66,7 +70,7 @@ agent-inbox serve --verbose
 
 ---
 
-## Agent Experience (2.1)
+## Agent Experience (2.2)
 
 [Detailed contract and implementation checklist](docs/agent-experience-spec.md).
 
@@ -75,6 +79,7 @@ and reservations. One Python service owns SQLite and serves HTTP; there is no
 broker, second daemon, protocol setup, or automatic agent execution.
 
 ```sh
+eval "$(agent-inbox claim)"
 agent-inbox brief
 # Save source/cursor per consumer after successfully processing the response.
 agent-inbox brief --source SOURCE --after CURSOR
@@ -85,6 +90,155 @@ agent-inbox ae task claim TASK_ID --version 1
 agent-inbox reserve src/ --reason 'Verify release'
 agent-inbox ae task complete TASK_ID --version 2 --result 'Checks passed; see report'
 ```
+
+### AE tasks, a kanban board, and Jira
+
+**AE is the coordination layer inside Agent Inboxes.** The browser at
+`http://127.0.0.1:8791/` currently provides Messages, Announcements and
+Reservations. AE tasks are available through the CLI and HTTP API. A separate
+kanban board built for agents is a different application; this release does
+not include a kanban task view or automatic Jira/board synchronization.
+
+An external tracker can remain the source of truth for the task, PRD, epic,
+priority and acceptance criteria. AE can coordinate the agent session doing
+the work. Keep the external task ID and links in the AE task description;
+there are no dedicated PRD/epic fields or automatic document imports yet.
+
+| Record | What it answers | What changes it |
+| --- | --- | --- |
+| Tracker task / PRD / epic | What should be built, why, and what counts as done? | The tracker’s planning and review workflow |
+| AE task | Who has accepted this execution, what blocks it, and what is the next handoff? | Explicit claim, block, handoff and completion commands |
+| Topic thread | What did we discuss, decide and verify? | Replies on the same subject and thread ID |
+| Inbox / session | Where can this running agent receive coordination messages? | Registration and session-bound name claims |
+| File or resource reservation | Who is editing this path or using this shared resource right now? | A temporary, explicit acquire / renew / release |
+
+For example, link an existing tracker record and discussion:
+
+```sh
+agent-inbox ae task create --title 'Implement export flow' \
+  --description 'Tracker: TEAM-42; Epic: TEAM-7; PRD: https://tracker.example/prds/export; acceptance: see TEAM-42' \
+  --thread THREAD_ID --path src/export/
+agent-inbox ae task list --state queued
+agent-inbox ae task get TASK_ID
+agent-inbox ae task claim TASK_ID --version 1
+agent-inbox reserve src/export/ --reason 'TEAM-42: implement export flow'
+```
+
+`--target` routes a task to an intended recipient; **claiming accepts ownership**.
+Reading mail, being in To/CC, subscribing to a thread, or reserving a file does
+not accept a task. A name lease expiring does not complete or reassign work.
+Task mutations check the version and owner/session; handoffs carry the next
+action, workspace, branch/commit, acceptance criteria and evidence. Completing
+an AE task does not update an external board. An integration should use a
+stable external task ID, one agreed source for each status/ownership field,
+idempotent updates, and explicit conflict handling before enabling two-way sync.
+
+### Project discussion and direct messages
+
+Use separate topic threads within a project’s shared discussion, plus direct
+messages for a specific recipient. One giant project thread makes unrelated
+decisions and unread state hard to follow. The durable continuity is the task
+ID and thread ID; a short-lived session name should not be the only way to find
+the work. Subscribing follows a topic; accepting a task records responsibility.
+
+Project-wide delivery is available as `*@project` below. The current UI groups
+threads by inbox; a unified project-feed view is a future UI improvement.
+
+### Stable identity and reliable delivery
+
+`claim` first recovers a name still bound to this session, even after inactivity.
+A new session can reuse a name after 12 hours without activity only when the
+server has no matching live process evidence. The process fingerprint comes
+from the OS; the short-lived CLI PID is not a harness-liveness signal.
+Set `AGENT_INBOX_HARNESS_PID` to the long-lived local harness process if available
+(`CLAUDE_PID` is also recognized). Keep `AGENT_INBOX_SESSION` stable across
+resumes and distinct for concurrently running children when the harness does
+not already provide distinct session IDs.
+
+An unbound identity is shown by `whoami`; commands that read mail or act as an
+agent exit **2** with a claim remedy instead of silently using the family inbox.
+An explicit `--inbox`, `--from` or `AGENT_INBOX_AGENT` is a deliberate identity
+choice. A persistent harness may call `agent-inbox heartbeat` on ordinary tool
+activity. It silently refreshes only an existing session binding; this command
+does not install hooks or inject messages into an agent turn.
+
+Unknown recipients fail with `unknown_recipient` and nearby known addresses.
+Explicit senders must already be registered. A derived, bound sender is
+registered by the CLI. `send --create-missing` explicitly opts into the old
+auto-creation behavior for migrations; normal sends should discover/register
+addresses first.
+
+```sh
+# The registry works locally even with cloud sync disabled or the server down.
+agent-inbox project register --repo acme/widgets --slug widgets
+agent-inbox project lookup --repo git@github.com:Acme/Widgets.git --json
+agent-inbox project list --json
+
+# A daemon can send without becoming a mail recipient or an active agent.
+agent-inbox service register ci@automation
+agent-inbox send --from ci@automation --to '*@widgets' \
+  --subject 'CI: export checks failed' --body 'See the failing job on TEAM-42.'
+agent-inbox status EMAIL_ID --json
+```
+
+`*@widgets` expands on the server to registered agent inboxes, excluding the
+sender and services. It never creates a literal wildcard mailbox. Delivery to
+a known project with no agent inboxes is retained and backfilled to agents
+registering within **seven days of send time**. Old mail remains stored after
+that window, but it is not delivered to newly arriving agents. The CLI and UI
+use the same recipient resolver. `status` reports each recipient’s read time
+without marking mail read; a read receipt is not acceptance or completion.
+`all@widgets` is an ordinary address, not a broadcast alias.
+
+Repository lookups normalize hosted URL transports and casing; filesystem
+identities preserve case. Lookup exits **0** on success, **4** if not found,
+and **5** for ambiguous legacy mappings that require repair. `setup-project`
+also registers the checkout. Do not infer broadcast support merely from the
+existence of the `project` command; the delivery contract is available in 2.2.
+
+`watch` is a wait within a running turn, not an idle-agent wakeup mechanism.
+It exits 3 on timeout and does not re-arm itself. A persistent harness can send
+mail, inspect `status`, and apply its own idle escalation policy if unread.
+Mail-watch cursors now track recipient deliveries, including late broadcasts;
+reset a saved **mail `watch`** cursor once when upgrading from 2.1. AE source and
+event cursors keep their existing meaning. Broadcast audiences, service roles,
+read receipts, task state and reservations are local to this machine; this
+release does not add them to the optional cloud synchronization protocol.
+
+### Reservation scope and retries
+
+Reserve the paths you are about to edit after accepting the task, renew during
+long work, and release on completion or handoff. The holder must belong to the
+reservation project, and the owning session must match for renewal/release.
+Name leases and file leases have separate lifetimes: file leases still default
+to 15 minutes and are bounded to 1 minute–2 hours. Task ownership is not a file
+lock, and handoff does not transfer reservations automatically.
+
+Reservation request keys are bound to their original holder, session, paths
+and options. Reusing a key for different work is rejected. An identical retry
+reports the existing reservation’s current `active` state, even after another
+renewal, expiry or release; it never silently acquires the files again. Use a
+new key for a new acquisition. Reservations remain advisory and machine-local.
+
+### Inbox cleanup
+
+Preview counts, unread state and activity dates before consolidating split
+history. Maintenance is transactional; active reservations and unfinished AE
+assignments require explicit release/handoff first. Cloud-bound databases
+require a separate recovery procedure so synchronized history is not rewritten.
+
+```sh
+agent-inbox inboxes merge --from old@widgets --to current@widgets --dry-run
+agent-inbox inboxes merge --from old@widgets --to current@widgets
+agent-inbox inboxes delete stray@widgets --dry-run
+agent-inbox inboxes delete stray@widgets
+```
+
+Merge retains thread and email IDs, combines receipts and follows To precedence
+over CC. Deleting an inbox with history requires `--force`, which **destroys
+that inbox’s sent mail for every recipient**, its recipient copies and its
+reservation history. Use merge to retain mail. These tools do not automatically
+decide that two existing inboxes represent the same agent.
 
 A first brief bootstraps current context and explicitly omits historical changes.
 An incremental brief returns current context plus a bounded page of changes. Its
@@ -136,6 +290,7 @@ mailbox/reservation helpers may still inspect a larger project history. There is
 constant-time or high-volume performance guarantee.
 
 Runtime delivery hooks remain removed. `hook-check` is a silent compatibility no-op.
+The separate opt-in `heartbeat` command only refreshes session liveness.
 `setup` / `hooks uninstall` remove recognized direct legacy Agent Inbox commands;
 quoted mentions, compound shell commands and unrelated hooks are preserved. The
 bundled `/inbox` skill and browser UI remain available for mail and reservations.
@@ -168,18 +323,21 @@ Project -> Inbox -> Thread -> Email
 When running `agent-inbox whoami` or omitting `--from`:
 1. **Project Slug:**
    - Evaluates `AGENT_INBOX_PROJECT` environment variable if set.
+   - Otherwise consults the local repository-to-project registry.
    - Otherwise parses the basename of `git config --get remote.origin.url` (stripping `.git`).
    - Otherwise parses the root directory name from `git rev-parse --show-toplevel`.
    - Fallback: current working directory name.
 2. **Agent Slug:**
    - Evaluates `AGENT_INBOX_AGENT` environment variable if set.
-   - Otherwise detects runtime family:
+   - Otherwise recovers the name bound to this session.
+   - Without a binding, reports a diagnostic runtime family and requires `claim` before acting:
      - `claude` (if `CLAUDE_PROJECT_DIR` or `CLAUDE_CODE_ENTRYPOINT` present)
      - `codex` (if `CODEX_SANDBOX` or `CODEX_THREAD_ID` present)
      - `orca` (if `ORCA_TASK_ID` or `ORCA_WORKER_ID` present)
      - Fallback: `agent`
-3. **Auto-Provisioning:**
-   - Running `agent-inbox whoami` or sending to a valid address idempotently creates the project and inbox in the database.
+3. **Registration:**
+   - `claim` registers the claimed name. `whoami` and ordinary sending register a bound or explicitly configured caller.
+   - Explicit senders and recipients must exist. Unknown addresses fail unless `send --create-missing` deliberately enables migration behavior.
 
 ---
 
@@ -192,7 +350,8 @@ agent-inbox [command] [options]
 ```
 
 ### 1. `whoami`
-Print and auto-create the derived inbox address for the current session.
+Show the resolved identity and register it when bound or explicitly named.
+An unbound family fallback is diagnostic only; claim a name before acting.
 ```bash
 agent-inbox whoami
 # Output: codex-worker1@boats

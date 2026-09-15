@@ -61,6 +61,7 @@ class ReliabilityTests(unittest.TestCase):
                 with patch('agent_inbox.server.get_connection', side_effect=capture):
                     for _ in range(30):
                         self.assertEqual(client.healthz()['db'],'ok')
+                    client.put_inbox('sender@p')
                     ann = client.post_announcement('sender@p','Topic','Body',client_token='http-key')
                     self.assertEqual(client.list_announcements('late@p')[0]['id'],ann['id'])
                     client.acknowledge_announcement(ann['id'],'late@p')
@@ -74,7 +75,7 @@ class ReliabilityTests(unittest.TestCase):
                     entries = client.list_reservations_everything()
                     self.assertEqual(len(entries), 61)
                     self.assertEqual(sum(row['active'] for row in entries), 1)
-                    sent = client.send_email('sender@p',['owner@p'],['observer@p'],'Work','You are the owner')
+                    sent = client.send_email('sender@p',['owner@p'],['observer@p'],'Work','You are the owner', create_missing=True)
                     view = client.get_thread('observer@p',sent['thread_id'])
                     self.assertEqual(view['reading_as'],'observer@p')
                     self.assertEqual(view['emails'][0]['your_role'],'cc')
@@ -127,8 +128,8 @@ class ReliabilityTests(unittest.TestCase):
             a,b,out = [Path(tmp)/name for name in ('a.db','b.db','out.db')]
             left,right = get_connection(a),get_connection(b)
             try:
-                InboxService(left).send_email('alice@one',['bob@one'],[],'One','Left','left-token')
-                msg = InboxService(right).send_email('alice@two',['bob@two'],[],'Two','Right','right-token')
+                InboxService(left).send_email('alice@one',['bob@one'],[],'One','Left','left-token', create_missing=True)
+                msg = InboxService(right).send_email('alice@two',['bob@two'],[],'Two','Right','right-token', create_missing=True)
                 InboxService(right).acquire_reservations('two',['src/'],'alice@two','runtime',client_token='reservation-token')
                 merge_databases([a,b],out)
                 merged = get_connection(out)

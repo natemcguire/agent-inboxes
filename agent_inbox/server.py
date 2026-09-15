@@ -111,7 +111,10 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
             raw = self.rfile.read(length).decode("utf-8")
             if not raw.strip():
                 return {}
-            return json.loads(raw)
+            result = json.loads(raw)
+            if not isinstance(result, dict):
+                raise ValidationError('invalid_json', 'Request body must be a JSON object')
+            return result
         except (ValueError, json.JSONDecodeError) as e:
             raise ValidationError("invalid_json", f"Request body must be valid JSON: {str(e)}")
 
@@ -129,7 +132,7 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
             addr = self.headers.get("X-Agent-Address", "").strip()
             if addr and "@" in addr:
                 agent, project = addr.split("@", 1)
-                self._get_service().touch_lease(agent, project)
+                self._get_service().touch_lease(agent, project, self._get_session_id(), self._get_harness_pid())
         except Exception:
             pass
 
@@ -174,6 +177,10 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                 pass
         return None
 
+    def _get_harness_pid(self):
+        raw = self.headers.get('X-Agent-Harness-Pid', '')
+        return int(raw) if raw.isdigit() and 1 < int(raw) <= 2**31 - 1 else None
+
     def _touch_session(self, service: InboxService, address: str) -> Optional[str]:
         """Record session activity for the acting address if a session header
         is present. Returns the session id (or None). Never fails the request."""
@@ -192,6 +199,16 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
             query = urllib.parse.parse_qs(parsed.query)
+
+            if path == '/v1/leases/lookup':
+                lease = self._get_service().lookup_agent_by_session(
+                    query.get('project', [''])[0], query.get('session', [''])[0], recover=True)
+                self._send_json(HTTPStatus.OK, {'lease': lease})
+                return
+            if path.startswith('/v1/emails/') and path.endswith('/status'):
+                email_id = urllib.parse.unquote(path.removeprefix('/v1/emails/').removesuffix('/status'))
+                self._send_json(HTTPStatus.OK, self._get_service().email_status(email_id))
+                return
 
             if path.startswith("/v1/ae/"):
                 from agent_inbox.ae import AgentExperience
@@ -436,7 +453,7 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                 body = self._read_json_body()
                 display_name = body.get("display_name")
                 service = self._get_service()
-                result = service.ensure_inbox(address, display_name=display_name)
+                result = service.ensure_inbox(address, display_name=display_name, role=body.get('role'))
                 sid = self._touch_session(service, address)
                 if sid:
                     result["session_id"] = sid
@@ -468,17 +485,36 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, result)
                 return
 
+            if path in ('/v1/inboxes/merge', '/v1/inboxes/delete'):
+                body = self._read_json_body()
+                service = self._get_service()
+                if path.endswith('/merge'):
+                    result = service.merge_inboxes(body.get('source'), body.get('target'), body.get('dry_run', False))
+                else:
+                    result = service.delete_inbox(body.get('address'), body.get('force', False), body.get('dry_run', False))
+                self._send_json(HTTPStatus.OK, result)
+                return
+
             # POST /v1/leases/claim | /v1/leases/release
+            if path == '/v1/leases/heartbeat':
+                body = self._read_json_body()
+                service = self._get_service()
+                lease = service.lookup_agent_by_session(body.get('project', ''), self._get_session_id(), recover=True)
+                if lease:
+                    service.touch_lease(lease['agent'], lease['project'], self._get_session_id(), self._get_harness_pid())
+                self._send_json(HTTPStatus.OK, {'refreshed': lease is not None})
+                return
             if path == "/v1/leases/claim":
                 body = self._read_json_body()
                 service = self._get_service()
-                result = service.claim_agent(body.get("family", ""), body.get("project", ""))
+                result = service.claim_agent(body.get("family", ""), body.get("project", ""),
+                                             self._get_session_id(), self._get_harness_pid())
                 self._send_json(HTTPStatus.OK, result)
                 return
             if path == "/v1/leases/release":
                 body = self._read_json_body()
                 service = self._get_service()
-                result = service.release_agent(body.get("agent", ""), body.get("project", ""))
+                result = service.release_agent(body.get("agent", ""), body.get("project", ""), self._get_session_id())
                 self._send_json(HTTPStatus.OK, result)
                 return
 
@@ -486,7 +522,7 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                 body = self._read_json_body()
                 result = self._get_service().post_announcement(
                     body.get("from"), body.get("subject"), body.get("body_markdown"),
-                    self._get_idempotency_key(), body.get("all_projects", False))
+                    self._get_idempotency_key(), body.get("all_projects", False), require_sender=True)
                 self._send_json(HTTPStatus.CREATED, result)
                 return
             if len(parts) == 4 and parts[:2] == ["v1", "announcements"] and parts[3] == "read":
@@ -506,6 +542,8 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
 
                 service = self._get_service()
                 sender_session = self._get_session_id()
+                if type(body.get('create_missing', False)) is not bool:
+                    raise ValidationError('invalid_create_missing', 'create_missing must be boolean')
                 res = service.send_email(
                     from_addr=from_addr,
                     to_addrs=to_addrs,
@@ -514,6 +552,8 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     body_markdown=body_markdown,
                     client_token=idempotency_key,
                     sender_session=sender_session,
+                    create_missing=body.get('create_missing', False),
+                    require_sender=True,
                 )
                 from agent_inbox.cloudsync import enabled
                 res["delivery_status"] = "queued locally" if enabled() else "local only"
@@ -543,6 +583,7 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     to_addrs=to_addrs,
                     cc_addrs=cc_addrs,
                     sender_session=sender_session,
+                    require_sender=True,
                 )
                 from agent_inbox.cloudsync import enabled
                 res["delivery_status"] = "queued locally" if enabled() else "local only"

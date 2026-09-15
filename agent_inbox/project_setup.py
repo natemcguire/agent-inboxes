@@ -10,17 +10,17 @@ END_MARKER = "<!-- agent-inboxes:end -->"
 MANAGED_BLOCK = """<!-- agent-inboxes:start -->
 ## Agent Inboxes
 
-Run `agent-inbox brief` at session start and after context loss. It restores assignments, dependencies, decisions, unread mail and reservations. Save its source/cursor per consumer after processing. Use `agent-inbox ae watch --source <source> --after <cursor> --policy my-work --coalesce 30 --timeout 60` for batched changes with urgent bypass. Drain `has_more` even when events are empty. An incremental brief's cursor is distinct from its snapshot_cursor; never advance past omitted history or treat delivery as acknowledgment. Use `ae task list` for omitted queue entries, `task get`/`task history` for full details. Handoffs should include next action, workspace, branch/commit, acceptance criteria and evidence. Run `whoami` before reservations: an explicit AE actor does not change the reservation CLI's project/session. Task ownership does not replace file reservations. There is no MQTT/NATS dependency or automatic turn injection.
+At session start and after context loss, run `agent-inbox whoami`; if unbound, run `eval "$(agent-inbox claim)"`. Then run `agent-inbox brief`. It restores assignments, dependencies, decisions, unread mail and reservations. Save its source/cursor per consumer after processing. Use `agent-inbox ae watch --source <source> --after <cursor> --policy my-work --coalesce 30 --timeout 60` for batched changes with urgent bypass. Drain `has_more` even when events are empty. An incremental brief's cursor is distinct from its snapshot_cursor; never advance past omitted history or treat delivery as acknowledgment. Use `ae task list` for omitted queue entries, `task get`/`task history` for full details. Handoffs should include next action, workspace, branch/commit, acceptance criteria and evidence. Run `whoami` before reservations: an explicit AE actor does not change the reservation CLI's project/session. Task ownership does not replace file reservations. There is no MQTT/NATS dependency or automatic turn injection.
 
 If the `agent-inbox` command is not installed on this machine, ignore this section.
 
-Use the local `agent-inbox` CLI for durable coordination with agents in other sessions, worktrees, or projects. Your address is `<agent>@<project>`: the project is derived from Git, and the agent name comes from `AGENT_INBOX_AGENT` or your runtime family. Run `agent-inbox whoami` before using it. When several agents of the same family may run concurrently in one project, claim a unique slot at session start with `eval "$(agent-inbox claim)"` — it assigns the lowest free name (`claude`, `claude-2`, `claude-3`, ...) and the lease expires after 2 hours idle. Agents sharing one address are still told apart by session id — `agent-inbox whoami` shows yours (override with `AGENT_INBOX_SESSION`) and mail is stamped with the sender's session.
+Use the local `agent-inbox` CLI for durable coordination with agents in other sessions, worktrees, or projects. Your address is `<agent>@<project>`: the project is derived from Git, and the agent name comes from `AGENT_INBOX_AGENT` or your runtime family. Run `agent-inbox whoami` before using it. An unbound identity must claim a name before reading, sending or reserving; explicit address overrides are deliberate choices. When several agents of the same family may run concurrently in one project, claim a unique slot at session start with `eval "$(agent-inbox claim)"` — it recovers this session’s name or assigns the lowest free name (`claude`, `claude-2`, `claude-3`, ...) with name reuse requiring 12 hours idle without a live holder. Agents sharing one address are still told apart by session id — `agent-inbox whoami` shows yours (override with `AGENT_INBOX_SESSION`) and mail is stamped with the sender's session.
 
 Polling checkpoints:
 - At session start, run `agent-inbox announcements --unread` and `agent-inbox list --unread` and handle relevant mail before new work.
 - Immediately before a task expected to take more than 10 minutes, check unread mail again.
 - After finishing or handing off work, send any required completion reply, then check unread mail once more before ending the session.
-- To subscribe to push delivery, run `agent-inbox watch` as a background task: it blocks until new mail arrives (exit 0) or times out (exit 3), and returns matching mail metadata. Harness scheduling determines when you receive it. Relaunch it after handling the mail.
+- To wait within a running turn, run `agent-inbox watch` as a background task: it blocks until new mail arrives (exit 0) or times out (exit 3), and returns matching mail metadata. It does not launch an idle agent or re-arm itself. A persistent harness must schedule idle wakeups. Relaunch it after handling the mail.
 - Do not busy-poll in a loop; use `watch` or these checkpoints.
 
 Addressing:
@@ -59,7 +59,7 @@ Core commands:
 `agent-inbox list --unread`
 `agent-inbox read <thread-id>`
 `agent-inbox reply <email-id> --body-file <path-or->`
-`agent-inbox watch [--timeout N]` (background push subscription)
+`agent-inbox watch [--timeout N]` (wait within a running turn)
 <!-- agent-inboxes:end -->"""
 
 
@@ -85,6 +85,18 @@ def setup_project(target_dir: Optional[Union[str, Path]] = None) -> List[Path]:
     Returns list of updated or created file paths.
     """
     root = Path(target_dir).resolve() if target_dir else Path.cwd().resolve()
+    from agent_inbox.identity import derive_project
+    from agent_inbox.project_registry import register_project
+    from agent_inbox.db import get_connection
+    import subprocess
+    remote = subprocess.run(['git', 'config', '--get', 'remote.origin.url'], cwd=root,
+                            capture_output=True, text=True, timeout=2, check=False)
+    slug = derive_project(root)
+    conn = get_connection()
+    try:
+        register_project(conn, remote.stdout.strip() or str(root), slug)
+    finally:
+        conn.close()
     agents_file = root / "AGENTS.md"
     claude_file = root / "CLAUDE.md"
 
@@ -145,8 +157,8 @@ def setup_global() -> List[tuple]:
 
 
 ONBOARDING_PROMPT = """This machine runs Agent Inboxes, a local mail service for coding agents (http://127.0.0.1:8791).
-Your address is <agent>@<project>, derived automatically - run `agent-inbox whoami` to see and create it.
-If agents of your family may run concurrently in this project, first run `eval "$(agent-inbox claim)"` to take a unique slot (claude, claude-2, ...; lease expires after 2h idle).
+Your address is <agent>@<project>. Run `agent-inbox whoami` to inspect it; if unbound, run `eval "$(agent-inbox claim)"` before reading, sending or reserving.
+If agents of your family may run concurrently in this project, first run `eval "$(agent-inbox claim)"` to take a unique slot (claude, claude-2, ...; same-session recovery; 12h idle reuse window).
 Protocol: restore context with `agent-inbox brief`; run `agent-inbox list --unread` at session start and before any task over ~10 minutes; handle relevant mail first.
 Send cross-session requests, blockers, handoffs and completion notices with
 `agent-inbox send --to <address> --subject "<topic>" --body-file -` and use `agent-inbox reply <email-id> --body-file -` on existing threads.

@@ -155,6 +155,7 @@ class TestThreadMembershipEnforced(unittest.TestCase):
             subject="Private",
             body_markdown="members only",
             client_token="tok-membership-1",
+            create_missing=True,
         )
         self.thread_id = sent["thread_id"]
 

@@ -146,10 +146,15 @@ def _session_active_cutoff_iso() -> str:
     return cutoff.strftime("%Y-%m-%dT%H:%M:%S.") + f"{cutoff.microsecond // 1000:03d}Z"
 
 
-class InboxService:
+from agent_inbox.leases import AgentLeases
+from agent_inbox.mailing import ProjectMail
+from agent_inbox.inbox_admin import InboxMaintenance
+
+
+class InboxService(AgentLeases, ProjectMail, InboxMaintenance):
     """Encapsulates transactional operations on the SQLite database."""
 
-    def post_announcement(self, sender, subject, body_markdown, client_token, all_projects=False):
+    def post_announcement(self, sender, subject, body_markdown, client_token, all_projects=False, require_sender=False):
         sender = normalize_address(sender)
         if not isinstance(all_projects, bool):
             raise ValidationError("validation_error", "all_projects must be boolean")
@@ -165,6 +170,8 @@ class InboxService:
                     raise ConflictError("idempotency_conflict", "Announcement key was used for different content")
                 result = dict(old)
             else:
+                if require_sender:
+                    self.require_inbox(sender, sender=True)
                 self.ensure_inbox(sender)
                 result = dict(id="ann_" + uuid.uuid4().hex, project=project, sender=sender,
                               subject=subject, body_markdown=body_markdown,
@@ -204,83 +211,6 @@ class InboxService:
         self.conn = conn
 
 
-    # ------------------------------------------------------------------
-    # Agent leases: lowest-free-slot claiming for concurrent same-family
-    # agents (claude, claude-2, claude-3, ...). A lease is free when it has
-    # never been claimed or its last_seen is older than LEASE_EXPIRY_SECONDS.
-    # ------------------------------------------------------------------
-
-    LEASE_EXPIRY_SECONDS = 2 * 60 * 60
-
-    def _lease_expiry_cutoff(self) -> str:
-        from datetime import datetime, timedelta, timezone
-        cutoff = datetime.now(timezone.utc) - timedelta(seconds=self.LEASE_EXPIRY_SECONDS)
-        return cutoff.strftime("%Y-%m-%dT%H:%M:%S.") + f"{cutoff.microsecond // 1000:03d}Z"
-
-    def claim_agent(self, family: str, project_slug: str) -> dict:
-        """Atomically claim the lowest free slot for a runtime family in a project."""
-        family = normalize_slug(family)
-        project_slug = normalize_slug(project_slug)
-        if not family or not project_slug:
-            raise ValidationError("invalid_lease", "family and project are required")
-        cutoff = self._lease_expiry_cutoff()
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
-            slot = None
-            for n in range(1, 100):
-                candidate = family if n == 1 else f"{family}-{n}"
-                row = self.conn.execute(
-                    "SELECT last_seen FROM agent_leases WHERE agent_slug = ? COLLATE NOCASE AND project_slug = ? COLLATE NOCASE",
-                    (candidate, project_slug),
-                ).fetchone()
-                if row is None or row["last_seen"] < cutoff:
-                    slot = candidate
-                    break
-            if slot is None:
-                raise ConflictError("lease_exhausted", f"No free slot for {family} in {project_slug} (99 concurrent leases)")
-            self.conn.execute(
-                """
-                INSERT INTO agent_leases (agent_slug, project_slug)
-                VALUES (?, ?)
-                ON CONFLICT(agent_slug, project_slug) DO UPDATE SET
-                  claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                  last_seen  = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                """,
-                (slot, project_slug),
-            )
-            self.conn.execute("COMMIT")
-        except Exception:
-            try:
-                self.conn.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise
-        return {"agent": slot, "project": project_slug, "address": f"{slot}@{project_slug}"}
-
-    def release_agent(self, agent_slug: str, project_slug: str) -> dict:
-        """Free a lease so the slot can be reclaimed immediately."""
-        agent_slug = normalize_slug(agent_slug)
-        project_slug = normalize_slug(project_slug)
-        cur = self.conn.execute(
-            "DELETE FROM agent_leases WHERE agent_slug = ? COLLATE NOCASE AND project_slug = ? COLLATE NOCASE",
-            (agent_slug, project_slug),
-        )
-        return {"released": cur.rowcount > 0, "agent": agent_slug, "project": project_slug}
-
-    def touch_lease(self, agent_slug: str, project_slug: str) -> None:
-        """Refresh last_seen for an EXISTING lease; never creates one."""
-        try:
-            self.conn.execute(
-                """
-                UPDATE agent_leases
-                SET last_seen = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                WHERE agent_slug = ? COLLATE NOCASE AND project_slug = ? COLLATE NOCASE
-                """,
-                (normalize_slug(agent_slug), normalize_slug(project_slug)),
-            )
-        except Exception:
-            pass
-
     def _get_inbox_id(self, address: str) -> Optional[int]:
         """Look up inbox ID by address."""
         local_part, project_slug = parse_address(address)
@@ -318,7 +248,7 @@ class InboxService:
             raise NotFoundError("project_error", f"Could not create or find project '{slug}'")
         return row[0]
 
-    def ensure_inbox(self, address: str, display_name: Optional[str] = None) -> dict:
+    def ensure_inbox(self, address: str, display_name: Optional[str] = None, role=None) -> dict:
         """Idempotently ensure an inbox exists. Updates last_seen_at.
 
         When called outside an existing transaction (e.g. the standalone
@@ -329,6 +259,8 @@ class InboxService:
         caller's transaction wrap it. Autocommit mode (isolation_level=None) makes
         ``in_transaction`` a reliable signal here.
         """
+        if role not in (None, 'agent', 'service'):
+            raise ValidationError('invalid_role', 'role must be agent or service')
         owns_txn = not self.conn.in_transaction
         if owns_txn:
             self.conn.execute("BEGIN IMMEDIATE")
@@ -339,13 +271,16 @@ class InboxService:
 
             row = self.conn.execute(
                 """
-                SELECT id, display_name, created_at FROM inboxes
+                SELECT id, display_name, created_at, role FROM inboxes
                 WHERE project_id = ? AND local_part = ? COLLATE NOCASE
                 """,
                 (project_id, local_part),
             ).fetchone()
 
             if row:
+                if role is not None and role != row['role']:
+                    raise ConflictError('role_conflict', 'An existing inbox cannot change role; use a separate service identity')
+                role = row['role']
                 inbox_id = row["id"]
                 created_at = row["created_at"]
                 new_display = display_name if display_name is not None else row["display_name"]
@@ -357,11 +292,15 @@ class InboxService:
             else:
                 self.conn.execute(
                     """
-                    INSERT INTO inboxes (project_id, local_part, display_name, created_at, last_seen_at)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO inboxes (project_id, local_part, display_name, created_at, last_seen_at, role)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (project_id, local_part, display_name, now, now),
+                    (project_id, local_part, display_name, now, now, role or "agent"),
                 )
+                inbox_id = self._get_inbox_id(address)
+                role = role or 'agent'
+                if role == 'agent':
+                    self.backfill_broadcasts(inbox_id, project_id, now)
                 created_at = now
                 created = True
 
@@ -375,6 +314,7 @@ class InboxService:
         return {
             "address": f"{local_part}@{project_slug}",
             "created": created,
+            "role": role,
             "created_at": created_at,
             "last_seen_at": now,
         }
@@ -391,6 +331,8 @@ class InboxService:
         norm_addr = normalize_address(address)
         self.ensure_inbox(norm_addr)
         inbox_id = self._get_inbox_id(norm_addr)
+        if self.conn.execute('SELECT role FROM inboxes WHERE id=?', (inbox_id,)).fetchone()[0] == 'service':
+            return
         now = utc_now_iso()
         self.conn.execute(
             """
@@ -428,9 +370,9 @@ class InboxService:
         cutoff = _session_active_cutoff_iso()
         base_query = """
             SELECT i.id AS inbox_id, i.local_part, p.slug as project_slug, i.display_name,
-                   i.created_at, i.last_seen_at,
+                   i.created_at, i.last_seen_at, i.role,
                    (SELECT COUNT(*) FROM sessions s
-                    WHERE s.inbox_id = i.id AND s.last_seen_at >= ?) AS active_sessions
+                    WHERE s.inbox_id = i.id AND i.role='agent' AND s.last_seen_at >= ?) AS active_sessions
             FROM inboxes i
             JOIN projects p ON i.project_id = p.id
         """
@@ -452,6 +394,7 @@ class InboxService:
                 "project": r["project_slug"],
                 "local_part": r["local_part"],
                 "display_name": r["display_name"],
+                "role": r["role"],
                 "created_at": r["created_at"],
                 "last_seen_at": r["last_seen_at"],
                 "active_sessions": r["active_sessions"],
@@ -468,6 +411,8 @@ class InboxService:
         body_markdown: str,
         client_token: str,
         sender_session: Optional[str] = None,
+        create_missing: bool = False,
+        require_sender: bool = False,
     ) -> dict:
         """
         Start a thread and send its first email atomically.
@@ -496,9 +441,17 @@ class InboxService:
         norm_from = normalize_address(from_addr)
         if not to_addrs or not isinstance(to_addrs, list):
             raise ValidationError("missing_recipients", "'to' recipient list cannot be empty")
+        if cc_addrs is not None and not isinstance(cc_addrs, list):
+            raise ValidationError('invalid_recipients', "'cc' must be a list")
+        if any(not isinstance(a, str) for a in to_addrs + (cc_addrs or [])):
+            raise ValidationError('invalid_recipients', 'Recipient addresses must be strings')
+        if type(create_missing) is not bool:
+            raise ValidationError('invalid_create_missing', 'create_missing must be boolean')
         
-        norm_to = [normalize_address(a) for a in to_addrs]
-        norm_cc = [normalize_address(a) for a in (cc_addrs or [])]
+        # Validate the shape before acquiring the writer; recipient lookup and
+        # fan-out happen under the same transaction as delivery.
+        norm_to = [a.strip().lower() if isinstance(a, str) else a for a in to_addrs]
+        norm_cc = [a.strip().lower() if isinstance(a, str) else a for a in (cc_addrs or [])]
 
         if not subject or not isinstance(subject, str) or not subject.strip():
             raise ValidationError("missing_subject", "Subject is required and cannot be empty")
@@ -531,22 +484,25 @@ class InboxService:
                     "sent_at": existing["sent_at"],
                 }
 
-            # Auto-provision from, to, cc
+            if require_sender:
+                self.require_inbox(norm_from, sender=True, create_missing=create_missing)
             self.ensure_inbox(norm_from)
+            norm_to, to_projects = self.expand_recipients(to_addrs, norm_from, 'to', create_missing)
+            norm_cc, cc_projects = self.expand_recipients(cc_addrs or [], norm_from, 'cc', create_missing)
+            if set(norm_to) & set(norm_cc):
+                raise ValidationError('duplicate_recipient', 'Recipient cannot appear in both to and cc')
             from_inbox_id = self._get_inbox_id(norm_from)
             from_local, from_proj = parse_address(norm_from)
             home_project_id = self.ensure_project(from_proj)
 
             to_inbox_ids = []
             for addr in norm_to:
-                self.ensure_inbox(addr)
-                inbox_id = self._get_inbox_id(addr)
+                inbox_id = self.require_inbox(addr, create_missing=create_missing)
                 to_inbox_ids.append((addr, inbox_id))
 
             cc_inbox_ids = []
             for addr in norm_cc:
-                self.ensure_inbox(addr)
-                inbox_id = self._get_inbox_id(addr)
+                inbox_id = self.require_inbox(addr, create_missing=create_missing)
                 cc_inbox_ids.append((addr, inbox_id))
 
             thread_id = generate_thread_id()
@@ -570,6 +526,8 @@ class InboxService:
                 """,
                 (email_id, thread_id, from_inbox_id, subject.strip(), body_markdown, client_token, sent_at, sender_session),
             )
+
+            self.store_broadcasts(email_id, to_projects, cc_projects, sent_at)
 
             # Insert recipients
             pos = 0
@@ -614,6 +572,8 @@ class InboxService:
         to_addrs: Optional[List[str]] = None,
         cc_addrs: Optional[List[str]] = None,
         sender_session: Optional[str] = None,
+        create_missing: bool = False,
+        require_sender: bool = False,
     ) -> dict:
         """
         Reply to an existing email in a thread.
@@ -666,6 +626,9 @@ class InboxService:
         norm_from = normalize_address(from_addr)
         if not body_markdown or not isinstance(body_markdown, str):
             raise ValidationError("missing_body", "body_markdown is required")
+        for audience in (to_addrs, cc_addrs):
+            if audience is not None and (not isinstance(audience, list) or any(not isinstance(a, str) for a in audience)):
+                raise ValidationError('invalid_recipients', 'Recipients must be lists of addresses')
 
         self.conn.execute("BEGIN IMMEDIATE")
         try:
@@ -757,8 +720,8 @@ class InboxService:
                     if not norm_to and not norm_cc:
                         norm_to = [parent_from_addr]
             else:
-                norm_to = [normalize_address(a) for a in (to_addrs or [])]
-                norm_cc = [normalize_address(a) for a in (cc_addrs or [])]
+                norm_to = list(to_addrs or [])
+                norm_cc = list(cc_addrs or [])
                 if not norm_to:
                     raise ValidationError("missing_recipients", "'to' recipient list cannot be empty")
 
@@ -771,20 +734,23 @@ class InboxService:
                 if addr in norm_cc:
                     raise ValidationError("duplicate_recipient", f"Recipient '{addr}' cannot appear in both 'to' and 'cc'")
 
-            # Auto-provision
+            if require_sender:
+                self.require_inbox(norm_from, sender=True, create_missing=create_missing)
             self.ensure_inbox(norm_from)
+            norm_to, to_projects = self.expand_recipients(norm_to, norm_from, 'to', create_missing)
+            norm_cc, cc_projects = self.expand_recipients(norm_cc, norm_from, 'cc', create_missing)
+            if set(norm_to) & set(norm_cc):
+                raise ValidationError('duplicate_recipient', 'Recipient cannot appear in both to and cc')
             from_inbox_id = self._get_inbox_id(norm_from)
 
             to_inbox_ids = []
             for addr in norm_to:
-                self.ensure_inbox(addr)
-                inbox_id = self._get_inbox_id(addr)
+                inbox_id = self.require_inbox(addr, create_missing=create_missing)
                 to_inbox_ids.append((addr, inbox_id))
 
             cc_inbox_ids = []
             for addr in norm_cc:
-                self.ensure_inbox(addr)
-                inbox_id = self._get_inbox_id(addr)
+                inbox_id = self.require_inbox(addr, create_missing=create_missing)
                 cc_inbox_ids.append((addr, inbox_id))
 
             # Build references chain: parent's references + parent_id
@@ -807,6 +773,8 @@ class InboxService:
                 """,
                 (email_id, thread_id, from_inbox_id, subject, body_markdown, reply_to_email_id, client_token, sent_at, sender_session),
             )
+
+            self.store_broadcasts(email_id, to_projects, cc_projects, sent_at)
 
             # Insert recipients
             pos = 0
@@ -1037,8 +1005,8 @@ class InboxService:
     def watch_state(self, address: str, after: int = 0) -> dict:
         """One non-blocking check of the long-poll watch condition.
 
-        The cursor is the max SQLite rowid over emails delivered to this inbox.
-        ``changed`` is True when an UNREAD delivered email exists with rowid
+        The cursor is a monotonic local delivery ID for this inbox’s receipts.
+        ``changed`` is True when an UNREAD delivered email exists with delivery ID
         greater than ``after``; ``latest`` then describes the newest such email.
         """
         norm_addr = normalize_address(address)
@@ -1048,7 +1016,7 @@ class InboxService:
 
         cursor_row = self.conn.execute(
             """
-            SELECT COALESCE(MAX(e.rowid), 0) AS cursor
+            SELECT COALESCE(MAX(er.delivery_id), 0) AS cursor
             FROM emails e JOIN email_recipients er ON er.email_id = e.id
             WHERE er.inbox_id = ?
             """,
@@ -1074,8 +1042,8 @@ class InboxService:
             JOIN email_recipients er ON er.email_id = e.id
             JOIN inboxes i ON e.from_inbox_id = i.id
             JOIN projects p ON i.project_id = p.id
-            WHERE er.inbox_id = ? AND er.read_at IS NULL AND e.rowid > ?
-            ORDER BY e.rowid DESC
+            WHERE er.inbox_id = ? AND er.read_at IS NULL AND er.delivery_id > ?
+            ORDER BY er.delivery_id DESC
             LIMIT 1
             """,
             (inbox_id, after),
@@ -1264,6 +1232,12 @@ class InboxService:
                         conflict_rows.append(row)
         return conflicts, conflict_rows, own_by_path
 
+    @staticmethod
+    def _validate_reservation_scope(project_slug, holder):
+        if normalize_slug(project_slug) != parse_address(holder)[1]:
+            raise ValidationError('reservation_project_mismatch',
+                'The holder address must belong to the reservation project; check whoami first')
+
     def acquire_reservations(
         self,
         project_slug: str,
@@ -1310,27 +1284,35 @@ class InboxService:
         ttl = RESERVATION_DEFAULT_TTL_SECONDS if ttl_seconds is None else int(ttl_seconds)
         ttl = max(RESERVATION_MIN_TTL_SECONDS, min(ttl, RESERVATION_MAX_TTL_SECONDS))
         norm_holder = normalize_address(holder_addr)
+        self._validate_reservation_scope(project_slug, norm_holder)
         reason = (reason or "").strip()
 
-        # Idempotent replay of a retried acquire call.
-        existing = self.conn.execute(
-            self._RESERVATION_SELECT + " WHERE r.client_token = ?",
-            (client_token,),
-        ).fetchall()
-        if existing:
-            now = utc_now_iso()
-            return {"reservations": [self._reservation_dict(r, now) for r in existing]}
-
-        self.conn.execute("BEGIN IMMEDIATE")
+        import json
+        fingerprint = json.dumps({'project': normalize_slug(project_slug), 'holder': norm_holder,
+            'session': session or None, 'paths': norm_paths, 'ttl': ttl,
+            'reason': reason, 'force': bool(force), 'repo_key': repo_key}, sort_keys=True)
+        self.conn.execute('BEGIN IMMEDIATE')
         try:
-            existing = self.conn.execute(
-                "SELECT id FROM reservations WHERE client_token = ?", (client_token,)
-            ).fetchall()
-            if existing:
-                self.conn.execute("COMMIT")
-                return self.acquire_reservations(  # replay path above (no txn)
-                    project_slug, paths, holder_addr, session, reason, ttl_seconds, force, client_token
-                )
+            previous = self.conn.execute('SELECT * FROM reservation_requests WHERE client_token=?', (client_token,)).fetchone()
+            if previous:
+                if previous['fingerprint'] != fingerprint:
+                    raise ConflictError('idempotency_conflict', 'Reservation key was already used for a different request')
+                ids = json.loads(previous['reservation_ids'])
+                rows = self.conn.execute(self._RESERVATION_SELECT +
+                    ' WHERE r.id IN (' + ','.join('?' for _ in ids) + ') ORDER BY r.id', ids).fetchall()
+                self.conn.commit()
+                return {'reservations': [self._reservation_dict(r, utc_now_iso()) for r in rows], 'replayed': True}
+            legacy = self.conn.execute(self._RESERVATION_SELECT + ' WHERE r.client_token=?', (client_token,)).fetchall()
+            if legacy:
+                if ({r['path'] for r in legacy} != set(norm_paths) or any(
+                    r['reservation_project'] != normalize_slug(project_slug) or
+                    f"{r['local_part']}@{r['project_slug']}" != norm_holder or
+                    (r['holder_session'] or None) != (session or None) for r in legacy)):
+                    raise ConflictError('idempotency_conflict', 'Reservation key belongs to a different legacy request')
+                self.conn.execute('INSERT INTO reservation_requests VALUES (?,?,?)',
+                    (client_token, fingerprint, json.dumps([r['id'] for r in legacy])))
+                self.conn.commit()
+                return {'reservations': [self._reservation_dict(r, utc_now_iso()) for r in legacy], 'replayed': True}
 
             self.ensure_inbox(norm_holder)
             inbox_id = self._get_inbox_id(norm_holder)
@@ -1382,6 +1364,9 @@ class InboxService:
                         (project_id, np, inbox_id, session, reason, ttl, now, expires_at,
                          client_token, None if is_resource_key(np) else repo_key),
                     )
+            request_ids = [r[0] for r in self.conn.execute('SELECT id FROM reservations WHERE client_token=? ORDER BY id', (client_token,))]
+            self.conn.execute('INSERT INTO reservation_requests VALUES (?,?,?)',
+                              (client_token, fingerprint, json.dumps(request_ids)))
             self.conn.execute("COMMIT")
         except BaseException:
             if self.conn.in_transaction:
@@ -1466,6 +1451,7 @@ class InboxService:
     ) -> dict:
         """Shared implementation for renew (release=False) and release (=True)."""
         norm_holder = normalize_address(holder_addr)
+        self._validate_reservation_scope(project_slug, norm_holder)
         self.ensure_inbox(norm_holder)
         inbox_id = self._get_inbox_id(norm_holder)
         project_id = self.ensure_project(project_slug)
@@ -1566,6 +1552,7 @@ class InboxService:
     ) -> List[dict]:
         """Non-mutating conflict check used by the wait long-poll."""
         norm_holder = normalize_address(holder_addr)
+        self._validate_reservation_scope(project_slug, norm_holder)
         self.ensure_inbox(norm_holder)
         inbox_id = self._get_inbox_id(norm_holder)
         project_id = self.ensure_project(project_slug)

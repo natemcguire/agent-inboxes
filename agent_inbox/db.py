@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS inboxes (
   project_id   INTEGER NOT NULL REFERENCES projects(id),
   local_part   TEXT NOT NULL COLLATE NOCASE,
   display_name TEXT,
+  role         TEXT NOT NULL DEFAULT 'agent' CHECK (role IN ('agent', 'service')),
   created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   last_seen_at TEXT,
   UNIQUE (project_id, local_part)
@@ -100,6 +101,7 @@ CREATE TABLE IF NOT EXISTS email_recipients (
   kind     TEXT NOT NULL CHECK (kind IN ('to', 'cc')),
   position INTEGER NOT NULL,
   read_at  TEXT,
+  delivery_id INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (email_id, inbox_id)
 );
 
@@ -111,9 +113,20 @@ CREATE TABLE IF NOT EXISTS email_references (
   UNIQUE (email_id, referenced_email_id)
 );
 
+CREATE TABLE IF NOT EXISTS email_broadcasts (
+  email_id TEXT NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+  project_id INTEGER NOT NULL REFERENCES projects(id),
+  kind TEXT NOT NULL CHECK (kind IN ('to', 'cc')),
+  expires_at TEXT NOT NULL,
+  PRIMARY KEY (email_id, project_id)
+);
+
 CREATE TABLE IF NOT EXISTS agent_leases (
   agent_slug   TEXT NOT NULL COLLATE NOCASE,
   project_slug TEXT NOT NULL COLLATE NOCASE,
+  session_id   TEXT,
+  holder_pid   INTEGER,
+  holder_pid_started TEXT,
   claimed_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   last_seen    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   PRIMARY KEY (agent_slug, project_slug)
@@ -137,6 +150,12 @@ CREATE TABLE IF NOT EXISTS reservations (
 CREATE INDEX IF NOT EXISTS idx_reservations_active
   ON reservations(project_id, path) WHERE released_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_reservations_token ON reservations(client_token);
+
+CREATE TABLE IF NOT EXISTS reservation_requests (
+  client_token TEXT PRIMARY KEY,
+  fingerprint TEXT NOT NULL,
+  reservation_ids TEXT NOT NULL
+);
 
 CREATE INDEX IF NOT EXISTS idx_emails_thread_sent ON emails(thread_id, sent_at, id);
 CREATE INDEX IF NOT EXISTS idx_recipients_unread ON email_recipients(inbox_id, read_at, email_id);
@@ -228,6 +247,36 @@ def init_db(conn: sqlite3.Connection) -> None:
     place; fresh databases already contain them from the schema above.
     """
     conn.executescript(SCHEMA_SQL)
+
+    # Name ownership survives inactivity; process evidence only extends liveness.
+    lease_columns = {row[1] for row in conn.execute('PRAGMA table_info(agent_leases)')}
+    for name, declaration in [('session_id', 'TEXT'), ('holder_pid', 'INTEGER'),
+                              ('holder_pid_started', 'TEXT')]:
+        if name not in lease_columns:
+            conn.execute(f'ALTER TABLE agent_leases ADD COLUMN {name} {declaration}')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_leases_session ON agent_leases(project_slug, session_id)')
+    if 'role' not in {row[1] for row in conn.execute('PRAGMA table_info(inboxes)')}:
+        conn.execute("ALTER TABLE inboxes ADD COLUMN role TEXT NOT NULL DEFAULT 'agent' CHECK (role IN ('agent', 'service'))")
+    if 'delivery_id' not in {row[1] for row in conn.execute('PRAGMA table_info(email_recipients)')}:
+        conn.execute('ALTER TABLE email_recipients ADD COLUMN delivery_id INTEGER NOT NULL DEFAULT 0')
+    conn.executescript('''
+        CREATE TABLE IF NOT EXISTS mail_receipt_counter (id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL);
+        INSERT OR IGNORE INTO mail_receipt_counter VALUES (1,0);
+        CREATE TRIGGER IF NOT EXISTS allocate_mail_receipt AFTER INSERT ON email_recipients BEGIN
+          UPDATE mail_receipt_counter SET value=value+1 WHERE id=1;
+          UPDATE email_recipients SET delivery_id=(SELECT value FROM mail_receipt_counter WHERE id=1)
+          WHERE email_id=NEW.email_id AND inbox_id=NEW.inbox_id;
+        END;
+    ''')
+    conn.execute('BEGIN IMMEDIATE')
+    try:
+        for row in conn.execute('SELECT rowid FROM email_recipients WHERE delivery_id=0 ORDER BY rowid').fetchall():
+            conn.execute('UPDATE mail_receipt_counter SET value=value+1 WHERE id=1')
+            conn.execute('UPDATE email_recipients SET delivery_id=(SELECT value FROM mail_receipt_counter WHERE id=1) WHERE rowid=?', (row[0],))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
     # v1.1: emails.sender_session (nullable) — stamps which agent session sent
     # an email when several same-family agents share one inbox address.

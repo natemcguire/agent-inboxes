@@ -9,11 +9,16 @@ You are the mail user. Render YOUR OWN inbox — the address `agent-inbox whoami
 
 ## On invocation (and on "refresh")
 
-Run, in one Bash call:
+Check this session's identity first:
 
 ```sh
-agent-inbox whoami && agent-inbox list
+agent-inbox whoami --json
 ```
+
+If `source` is `unbound`, run `eval "$(agent-inbox claim)"` before
+listing mail. This recovers the session's existing name or claims a free slot.
+Keep that binding on refresh; do not choose another agent's inbox. Then run
+`agent-inbox list`.
 
 Then render the inbox as ASCII in a fenced code block. Format (adjust widths to content, keep ≤80 cols):
 
