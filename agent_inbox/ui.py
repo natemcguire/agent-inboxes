@@ -3,7 +3,7 @@
 HTML = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>Agent Inbox</title><link rel="stylesheet" href="/ui.css"><script src="/ui.js" defer></script></head>
 <body><aside><a class="brand" href="/">Agent Inbox</a>
-<label for="identity">Inbox address</label><form id="identity-form"><input id="identity" list="addresses" placeholder="you@project" required pattern="[a-zA-Z0-9][a-zA-Z0-9._-]*@[a-zA-Z0-9][a-zA-Z0-9._-]*"><datalist id="addresses"></datalist><button>Open inbox</button></form>
+<h2 class="sidebar-title" id="inboxes-title">Inboxes</h2><div id="inboxes" class="inbox-list" role="navigation" aria-labelledby="inboxes-title"><p class="muted">Loading inboxes…</p></div>
 <nav aria-label="Workspace"><button data-tab="mail" class="selected" aria-current="page">Messages</button><button data-tab="announcements">Announcements</button><button data-tab="reservations">Reservations</button></nav>
 <div class="aside-bottom" id="connection">Connecting…</div></aside>
 <main><header><div><p class="scope" id="scope">Choose an inbox</p><h1 id="title">Messages</h1></div><div class="actions"><button id="refresh">Refresh</button><button id="compose" class="primary">New message</button></div></header>
@@ -38,13 +38,18 @@ label { display: block; color: var(--muted); font-size: 16px; }
 label input:not([type=checkbox]), label textarea { margin: 8px 0 20px; font-size: 18px; }
 input[type=checkbox] { width: 17px; height: 17px; margin: 0 7px 0 0; vertical-align: -2px; accent-color: #40454b; }
 aside { padding: 40px 24px; background: #fff; border-right: 1px solid var(--line); display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh; min-width: 0; }
-.brand { font-size: 25px; color: #202124; text-decoration: none; font-weight: 650; margin-bottom: 36px; }
-#identity { margin: 8px 0 10px; font-size: 16px; }
-#identity-form button { width: 100%; font-size: 17px; }
-nav { display: grid; gap: 6px; margin-top: 32px; }
+.brand { font-size: 25px; color: #202124; text-decoration: none; font-weight: 650; margin-bottom: 30px; flex-shrink: 0; }
+.sidebar-title { font-size: 17px; font-weight: 600; margin: 0 0 10px; flex-shrink: 0; }
+.inbox-list { min-height: 0; overflow-y: auto; margin: 0 -8px; padding: 0 8px; }
+.inbox-group + .inbox-group { margin-top: 18px; }
+.inbox-group h3 { font-size: 15px; font-weight: 500; color: var(--muted); margin: 0 0 4px; overflow-wrap: anywhere; }
+.inbox-link { display: block; color: inherit; text-decoration: none; font-size: 17px; padding: 10px 12px; border-radius: 5px; overflow-wrap: anywhere; }
+.inbox-link:hover { background: #f5f6f7; }
+.inbox-link.selected { background: var(--selected); font-weight: 600; }
+nav { display: grid; gap: 6px; margin-top: 24px; padding-top: 18px; border-top: 1px solid var(--line); flex-shrink: 0; }
 nav button { text-align: left; border-color: transparent; padding: 12px; }
 nav button.selected { background: var(--selected); font-weight: 600; }
-.aside-bottom { margin-top: auto; padding-top: 36px; font-size: 15px; color: var(--muted); }
+.aside-bottom { margin-top: auto; padding-top: 24px; font-size: 15px; color: var(--muted); flex-shrink: 0; }
 main { padding: 40px 44px; min-width: 0; }
 header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 20px; }
 .scope { font-size: 16px; color: var(--muted); margin: 0 0 6px; overflow-wrap: anywhere; }
@@ -100,8 +105,7 @@ dialog::backdrop { background: #0005; }
   aside { position: static; width: auto; height: auto; border-right: 0; border-bottom: 1px solid var(--line); padding: 24px 20px 16px; }
   .brand { margin-bottom: 22px; }
   .aside-bottom { display: none; }
-  #identity-form { display: flex; gap: 8px; align-items: center; }
-  #identity-form button { width: auto; white-space: nowrap; padding: 10px 12px; }
+  .inbox-list { max-height: 260px; }
   nav { display: flex; flex-wrap: wrap; margin-top: 16px; gap: 2px; }
   nav button { font-size: 16px; padding: 10px 8px; }
   main { padding: 26px 20px; }
@@ -120,7 +124,7 @@ dialog::backdrop { background: #0005; }
 JS = r'''
 'use strict';
 const $=s=>document.querySelector(s), enc=encodeURIComponent;
-const state={address:'',tab:'mail',rows:[],thread:null,epoch:0,readEpoch:0,mode:'mail',reply:null,key:null};
+const state={address:'',inboxes:[],directoryEpoch:0,tab:'mail',rows:[],thread:null,epoch:0,readEpoch:0,mode:'mail',reply:null,key:null};
 const element=(tag,text,cls)=>{const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e;};
 const button=(text,fn,cls)=>{const b=element('button',text,cls);b.type='button';b.onclick=fn;return b;};
 const date=x=>x?new Date(x).toLocaleString():'—';
@@ -129,8 +133,13 @@ async function api(path,body,key){const r=await fetch(path,{method:body?'POST':'
 function fail(e){notice(e.message,true);}
 function path(){return `/v1/inboxes/${enc(state.address)}/threads`;}
 function reset(){state.epoch++;state.readEpoch++;state.thread=null;state.rows=[];$('#content').replaceChildren();}
+function linkedAddress(){try{return decodeURIComponent(location.hash.slice(1));}catch{return '';}}
+function selectInbox(address){if(address!==state.address){reset();state.address=address;$('#search').value='';}$('#scope').textContent=address||'Choose an inbox';document.querySelectorAll('.inbox-link').forEach(a=>{const selected=a.dataset.address===address;a.classList.toggle('selected',selected);if(selected)a.setAttribute('aria-current','true');else a.removeAttribute('aria-current');});if(address&&linkedAddress()!==address)history.replaceState(null,'',`#${enc(address)}`);}
+function renderInboxes(){const root=$('#inboxes');root.replaceChildren();let project=null,group;for(const inbox of state.inboxes){const name=inbox.address.split('@')[1];if(name!==project){project=name;group=element('section',undefined,'inbox-group');group.append(element('h3',project));root.append(group);}const link=element('a',inbox.address,'inbox-link');link.href=`#${enc(inbox.address)}`;link.dataset.address=inbox.address;group.append(link);}if(!state.inboxes.length)root.append(element('p','Registered inboxes will appear here.','muted'));selectInbox(state.address);}
+async function reloadWorkspace(){const epoch=++state.directoryEpoch;try{const {inboxes}=await api('/v1/inboxes');if(epoch!==state.directoryEpoch)return;state.inboxes=inboxes.sort((a,b)=>a.project.localeCompare(b.project)||a.address.localeCompare(b.address));const requested=linkedAddress()||state.address;renderInboxes();selectInbox(inboxes.some(i=>i.address===requested)?requested:inboxes[0]?.address||'');await refresh();}catch(e){if(epoch===state.directoryEpoch){if(!state.inboxes.length)$('#inboxes').replaceChildren(element('p','Could not load inboxes. Use Refresh to try again.','muted'));fail(e);}}}
+window.addEventListener('hashchange',()=>{const address=linkedAddress();if(state.inboxes.some(i=>i.address===address)){selectInbox(address);refresh();}});
 async function refresh(){const epoch=++state.epoch;state.readEpoch++;state.thread=null;state.rows=[];$('#content').replaceChildren(element('div','Loading…','empty'));notice('');try{
- if(!state.address){$('#content').replaceChildren(element('div','Enter an agent@project address to open its workspace.','empty'));return;}
+ if(!state.address){$('#content').replaceChildren(element('div','Choose an inbox from the sidebar to get started.','empty'));return;}
  const address=state.address;let data;
  if(state.tab==='mail')data=(await api(`${path()}?limit=200&unread=${$('#unread').checked}`)).threads;
  else if(state.tab==='announcements')data=(await api(`/v1/announcements?inbox=${enc(address)}&unread=${$('#unread').checked}`)).announcements;
@@ -145,13 +154,12 @@ function render(){const q=$('#search').value.toLowerCase();const rows=state.rows
 async function readThread(id){const epoch=state.epoch,reading=++state.readEpoch,address=state.address;try{const result=await api(`${path()}/${enc(id)}`);if(epoch!==state.epoch||reading!==state.readEpoch||address!==state.address)return;state.thread=result;renderThread();}catch(e){if(epoch===state.epoch&&reading===state.readEpoch)fail(e);}}
 function renderThread(){const t=state.thread,detail=$('#detail');if(!t||!detail)return;detail.replaceChildren(element('h2',t.subject),element('p',`Reading as ${t.reading_as}`,'meta'));document.querySelectorAll('.thread').forEach(b=>b.classList.toggle('active',b.dataset.id===t.thread_id));const address=state.address;detail.append(button('Mark read',async()=>{try{await api(`/v1/inboxes/${enc(address)}/threads/${enc(t.thread_id)}/read`,{});if(address===state.address){notice('Marked read.');await refresh();}}catch(e){fail(e);}}));for(const m of t.emails){const card=element('article',undefined,'message');card.append(element('span',`Your role: ${m.your_role}`,'pill'),element('p',`From ${m.from} · ${date(m.sent_at)}`,'meta'),element('p',`To: ${m.to.join(', ')}${m.cc.length?' · CC: '+m.cc.join(', '):''}`,'meta'),element('pre',m.body_markdown));detail.append(card);}const latest=t.emails.at(-1);if(latest)detail.append(button('Reply to thread',()=>compose(latest),'primary'));
 }
-function compose(reply=null){if(!state.address){notice('Open an inbox before composing.',true);$('#identity').focus();return;}state.mode=reply?'reply':state.tab==='announcements'?'announcement':'mail';state.reply=reply;state.key=crypto.randomUUID();$('#compose-form').reset();$('#compose-error').textContent='';$('#compose-title').textContent=reply?'Reply to thread':state.mode==='announcement'?'New announcement':'New message';$('#sending-as').textContent=`Sending as ${state.address}`;$('#recipients').hidden=state.mode==='announcement';$('#subject-label').hidden=!!reply;$('#subject').required=!reply;$('#to').required=state.mode!=='announcement';$('#global-label').hidden=state.mode!=='announcement';$('#send').textContent=state.mode==='announcement'?'Publish announcement':'Send message';if(reply){$('#to').value=[...new Set([reply.from,...reply.to])].filter(a=>a!==state.address).join(', ');$('#cc').value=reply.cc.filter(a=>a!==state.address&&!$('#to').value.split(', ').includes(a)).join(', ');}$('#composer').showModal();}
+function compose(reply=null){if(!state.address){notice('Choose an inbox before composing.',true);$('.inbox-link')?.focus();return;}state.mode=reply?'reply':state.tab==='announcements'?'announcement':'mail';state.reply=reply;state.key=crypto.randomUUID();$('#compose-form').reset();$('#compose-error').textContent='';$('#compose-title').textContent=reply?'Reply to thread':state.mode==='announcement'?'New announcement':'New message';$('#sending-as').textContent=`Sending as ${state.address}`;$('#recipients').hidden=state.mode==='announcement';$('#subject-label').hidden=!!reply;$('#subject').required=!reply;$('#to').required=state.mode!=='announcement';$('#global-label').hidden=state.mode!=='announcement';$('#send').textContent=state.mode==='announcement'?'Publish announcement':'Send message';if(reply){$('#to').value=[...new Set([reply.from,...reply.to])].filter(a=>a!==state.address).join(', ');$('#cc').value=reply.cc.filter(a=>a!==state.address&&!$('#to').value.split(', ').includes(a)).join(', ');}$('#composer').showModal();}
 $('#compose-form').addEventListener('input',()=>{state.key=crypto.randomUUID();});
 $('#compose-form').onsubmit=async e=>{e.preventDefault();const sender=state.address,key=state.key;const split=id=>$(id).value.split(',').map(s=>s.trim()).filter(Boolean);let url='/v1/emails',body={from:sender,subject:$('#subject').value,body_markdown:$('#body').value};if(state.mode==='announcement'){url='/v1/announcements';body.all_projects=$('#global').checked;}else{body.to=split('#to');body.cc=split('#cc');if(state.mode==='reply')url=`/v1/emails/${enc(state.reply.email_id)}/reply`;}$('#compose-form').querySelectorAll('input,textarea,button').forEach(e=>e.disabled=true);$('#compose-error').textContent='';try{const result=await api(url,body,key);$('#composer').close();await refresh();notice(state.mode==='announcement'?'Announcement published locally.':`Message accepted: ${result.delivery_status||'local service'}.`);}catch(error){$('#compose-error').textContent=error.message;}finally{$('#compose-form').querySelectorAll('input,textarea,button').forEach(e=>e.disabled=false);}};
-$('#composer').addEventListener('cancel',e=>{if($('#send').disabled)e.preventDefault();});$('#cancel').onclick=()=>$('#composer').close();$('#compose').onclick=()=>compose();$('#refresh').onclick=refresh;$('#unread').onchange=refresh;$('#history').onchange=refresh;$('#search').oninput=render;
-$('#identity-form').onsubmit=e=>{e.preventDefault();reset();state.address=$('#identity').value.trim().toLowerCase();$('#scope').textContent=state.address;refresh();};
+$('#composer').addEventListener('cancel',e=>{if($('#send').disabled)e.preventDefault();});$('#cancel').onclick=()=>$('#composer').close();$('#compose').onclick=()=>compose();$('#refresh').onclick=reloadWorkspace;$('#unread').onchange=refresh;$('#history').onchange=refresh;$('#search').oninput=render;
 document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{reset();state.tab=b.dataset.tab;document.querySelectorAll('[data-tab]').forEach(x=>{x.classList.toggle('selected',x===b);if(x===b)x.setAttribute('aria-current','page');else x.removeAttribute('aria-current');});$('#title').textContent=b.textContent.replace(/^[^A-Za-z]+/,'');$('#compose').hidden=state.tab==='reservations';$('#compose').textContent=state.tab==='announcements'?'New announcement':'New message';$('#unread').parentElement.hidden=state.tab==='reservations';$('#history-label').hidden=state.tab!=='reservations';$('#footer').textContent=state.tab==='reservations'?'Use the CLI to reserve, renew or release. Showing active reservations and up to 200 finished records.':'Showing up to 200 records.';$('#search').value='';refresh();});
-(async()=>{try{const health=await api('/healthz');$('#connection').textContent=`Local service · v${health.version}`;const {inboxes}=await api('/v1/inboxes');for(const i of inboxes){const o=element('option');o.value=i.address;o.label=`${i.active_sessions} active sessions`;$('#addresses').append(o);}if(inboxes.length===1&&!state.address){$('#identity').value=inboxes[0].address;state.address=inboxes[0].address;$('#scope').textContent=state.address;await refresh();}}catch(e){$('#connection').textContent='Service unavailable';fail(e);}})();
+(async()=>{try{const health=await api('/healthz');$('#connection').textContent=`Local service · v${health.version}`;}catch(e){$('#connection').textContent='Service unavailable';fail(e);}await reloadWorkspace();})();
 '''
 
 ASSETS = {
