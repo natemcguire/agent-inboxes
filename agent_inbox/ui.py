@@ -1,19 +1,120 @@
 """Bundled, dependency-free browser client. All resources are served locally."""
 
 HTML = r'''<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent Inbox</title><link rel="stylesheet" href="/ui.css"><script src="/ui.js" defer></script></head>
-<body><aside><a class="brand" href="/">◈ <span>Agent Inbox</span></a><p class="eyebrow">LOCAL COORDINATION</p>
-<label for="identity">Reading &amp; sending as</label><form id="identity-form"><input id="identity" list="addresses" placeholder="you@project" required pattern="[a-zA-Z0-9][a-zA-Z0-9._-]*@[a-zA-Z0-9][a-zA-Z0-9._-]*"><datalist id="addresses"></datalist><button>Open inbox</button></form>
-<nav aria-label="Workspace"><button data-tab="mail" class="selected">↗ &nbsp; Messages</button><button data-tab="announcements">◎ &nbsp; Announcements</button><button data-tab="reservations">▤ &nbsp; Reservations</button></nav>
-<div class="aside-bottom"><span class="dot"></span> <span id="connection">Connecting…</span><p>Mail, people, and work in progress.<br>On your machine.</p></div></aside>
-<main><header><div><p class="eyebrow" id="scope">YOUR WORKSPACE</p><h1 id="title">Messages</h1></div><div class="actions"><button id="refresh">Refresh</button><button id="compose" class="primary">New message</button></div></header>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>Agent Inbox</title><link rel="stylesheet" href="/ui.css"><script src="/ui.js" defer></script></head>
+<body><aside><a class="brand" href="/">Agent Inbox</a>
+<label for="identity">Inbox address</label><form id="identity-form"><input id="identity" list="addresses" placeholder="you@project" required pattern="[a-zA-Z0-9][a-zA-Z0-9._-]*@[a-zA-Z0-9][a-zA-Z0-9._-]*"><datalist id="addresses"></datalist><button>Open inbox</button></form>
+<nav aria-label="Workspace"><button data-tab="mail" class="selected" aria-current="page">Messages</button><button data-tab="announcements">Announcements</button><button data-tab="reservations">Reservations</button></nav>
+<div class="aside-bottom" id="connection">Connecting…</div></aside>
+<main><header><div><p class="scope" id="scope">Choose an inbox</p><h1 id="title">Messages</h1></div><div class="actions"><button id="refresh">Refresh</button><button id="compose" class="primary">New message</button></div></header>
 <div id="notice" role="status" aria-live="polite"></div><div class="toolbar"><input id="search" type="search" placeholder="Search this view…" aria-label="Search this view"><label><input id="unread" type="checkbox"> Unread only</label><label id="history-label" hidden><input id="history" type="checkbox" checked> Include history</label></div>
 <section id="content" aria-label="Inbox content"><div class="empty">Choose an inbox to get started.</div></section>
-<footer id="footer">Local addresses are coordination identities, not authenticated accounts.</footer></main>
+<footer id="footer"></footer></main>
 <dialog id="composer"><form id="compose-form"><div class="dialog-head"><h2 id="compose-title">New message</h2><button type="button" id="cancel" aria-label="Close composer">×</button></div><p id="sending-as" class="muted"></p><div id="recipients"><label>To — action owners<input id="to" placeholder="agent@project, another@project"></label><label>CC — observers<input id="cc" placeholder="Optional"></label></div><label id="subject-label">Subject<input id="subject" maxlength="500" required></label><label>Message<textarea id="body" rows="9" required maxlength="100000" placeholder="What does the next agent need to know?"></textarea></label><label id="global-label" hidden><input id="global" type="checkbox"> Announce to all local projects</label><p id="compose-error" role="alert"></p><div class="dialog-actions"><button type="submit" class="primary" id="send">Send message</button></div></form></dialog></body></html>'''
 
 CSS = r'''
-:root{color-scheme:dark;font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#111416;color:#e8ecec;font-size:14px}*{box-sizing:border-box}body{margin:0;display:flex;min-height:100vh}button,input,textarea{font:inherit}button{cursor:pointer;border:1px solid #343d40;background:#21282b;color:inherit;border-radius:7px;padding:9px 14px}button:hover{background:#303b3e}button:disabled{opacity:.45;cursor:wait}button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid #a4e8bd;outline-offset:3px}input:not([type=checkbox]),textarea{width:100%;background:#141a1c;border:1px solid #384245;border-radius:7px;padding:10px 12px;color:inherit}textarea{resize:vertical}label{display:block;color:#a9b6bb;font-size:12px}label input:not([type=checkbox]),label textarea{margin:7px 0 15px}input[type=checkbox]{accent-color:#a4e8bd}aside{width:250px;padding:30px 22px;background:#191f22;border-right:1px solid #2b3437;display:flex;flex-direction:column;position:fixed;inset:0 auto 0 0}.brand{font-size:23px;color:#a4e8bd;text-decoration:none;font-weight:650;white-space:nowrap}.brand span{color:#f2f5f5;font-size:19px;margin-left:5px}.eyebrow{font-size:10px;letter-spacing:1.8px;color:#829394;font-weight:650;margin:26px 0 16px}#identity{margin:8px 0}#identity-form button{width:100%}nav{display:grid;gap:8px;margin-top:35px}nav button{text-align:left;background:transparent;border-color:transparent;padding:12px}nav button.selected{color:#b8efc9;background:#293a32;border-color:#3b5946}.aside-bottom{margin-top:auto;padding-top:40px;font-size:12px;color:#a2b1b4}.aside-bottom p{color:#65777e;line-height:1.8}.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#a4e8bd;margin-right:5px}main{margin-left:250px;padding:38px 46px;flex:1;min-width:0}header{display:flex;align-items:center;justify-content:space-between;gap:20px}header .eyebrow{margin:0 0 8px}h1{font-size:30px;font-weight:550;letter-spacing:-.7px;margin:0}h2{font-size:19px;font-weight:550;margin:0}.actions{display:flex;gap:9px}.primary{background:#b3ecc7;color:#16291d;border-color:#b3ecc7;font-weight:650}.primary:hover{background:#cbf6d9}.toolbar{display:flex;gap:22px;align-items:center;margin:28px 0 18px}.toolbar input[type=search]{max-width:360px}.toolbar label{white-space:nowrap}#notice{min-height:18px;color:#b3ecc7;margin-top:13px}#notice.error,#compose-error{color:#ffb5a8}.split{display:grid;grid-template-columns:minmax(220px,35%) minmax(0,1fr);border:1px solid #313b3e;border-radius:10px;min-height:490px;overflow:hidden}.thread-list{border-right:1px solid #313b3e}.thread{display:block;text-align:left;border:0;border-bottom:1px solid #2d373a;border-radius:0;width:100%;padding:19px;background:transparent}.thread.active{background:#283831}.thread strong{display:block;line-height:1.5}.thread p{margin:6px 0 0;overflow-wrap:anywhere}.muted,small{color:#8e9fa6;font-size:12px}.detail{padding:26px;min-width:0}.detail h2{overflow-wrap:anywhere}.message{margin-top:22px;border-top:1px solid #313c40;padding-top:20px}.message pre,.announcement pre{font-size:14px;line-height:1.75;font-family:inherit;white-space:pre-wrap;overflow-wrap:anywhere;color:#cdd7da}.meta{font-size:12px;color:#92a5ac;line-height:1.8;overflow-wrap:anywhere}.pill{display:inline-block;border:1px solid #43574b;color:#b3ecc7;padding:2px 7px;border-radius:20px;font-size:10px;margin:6px 7px 0 0;text-transform:uppercase;letter-spacing:.5px}.pill.finished{color:#96a7ad;border-color:#414d52}.empty{padding:70px 20px;text-align:center;color:#8d9fa5;line-height:1.8}.cards{display:grid;gap:16px}.announcement{border:1px solid #313d40;background:#192023;border-radius:10px;padding:24px}.announcement h2{margin:8px 0}.table-wrap{overflow:auto;border:1px solid #313d40;border-radius:10px}table{border-collapse:collapse;width:100%;text-align:left}th{background:#1d272a;font-size:11px;color:#8fa4ab;font-weight:500;letter-spacing:.6px;text-transform:uppercase;padding:15px}td{padding:17px 15px;border-top:1px solid #2e393d;font-size:12px;max-width:300px;overflow-wrap:anywhere}footer{margin-top:24px;font-size:11px;color:#75898f;line-height:1.6}dialog{border:1px solid #465951;border-radius:13px;background:#1b2326;color:inherit;width:min(600px,94vw);padding:28px}dialog::backdrop{background:#0009;backdrop-filter:blur(3px)}.dialog-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px}.dialog-head button{font-size:22px;padding:0 8px}.dialog-actions{text-align:right;margin-top:15px}[hidden]{display:none!important}@media(max-width:850px){aside{width:210px;padding:25px 15px}main{margin-left:210px;padding:30px 22px}.split{grid-template-columns:1fr}.thread-list{max-height:240px;overflow:auto;border-right:0;border-bottom:1px solid #313d40}.actions{flex-wrap:wrap;justify-content:flex-end}.toolbar{flex-wrap:wrap;gap:12px}}@media(max-width:580px){body{display:block}aside{position:static;width:auto;border-right:0;padding:20px}aside .eyebrow,.aside-bottom{display:none}#identity-form{display:flex;gap:8px;align-items:center}#identity-form button{width:auto;white-space:nowrap}aside>label{margin-top:20px}nav{display:flex;margin-top:12px;gap:3px}nav button{font-size:12px;padding:10px 6px}main{margin:0;padding:25px 18px}h1{font-size:26px}.detail{padding:18px}}
+:root {
+  color-scheme: only light;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 18px;
+  line-height: 1.5;
+  background: #fff;
+  color: #202124;
+  --line: #e2e4e7;
+  --muted: #5f6368;
+  --selected: #f2f3f4;
+}
+* { box-sizing: border-box; }
+body { margin: 0 auto; display: grid; grid-template-columns: 280px minmax(0, 1fr); max-width: 1760px; min-height: 100vh; }
+button, input, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; border: 1px solid #c9cdd1; background: #fff; border-radius: 5px; padding: 10px 16px; }
+button:hover { background: #f5f6f7; }
+button:disabled { opacity: .5; cursor: wait; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, a:focus-visible { outline: 2px solid #2457a6; outline-offset: 3px; }
+input:not([type=checkbox]), textarea { width: 100%; min-width: 0; background: #fff; border: 1px solid #c9cdd1; border-radius: 5px; padding: 11px 13px; }
+input::placeholder, textarea::placeholder { color: #6b7075; opacity: 1; }
+textarea { resize: vertical; line-height: 1.65; }
+label { display: block; color: var(--muted); font-size: 16px; }
+label input:not([type=checkbox]), label textarea { margin: 8px 0 20px; font-size: 18px; }
+input[type=checkbox] { width: 17px; height: 17px; margin: 0 7px 0 0; vertical-align: -2px; accent-color: #40454b; }
+aside { padding: 40px 24px; background: #fff; border-right: 1px solid var(--line); display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh; min-width: 0; }
+.brand { font-size: 25px; color: #202124; text-decoration: none; font-weight: 650; margin-bottom: 36px; }
+#identity { margin: 8px 0 10px; font-size: 16px; }
+#identity-form button { width: 100%; font-size: 17px; }
+nav { display: grid; gap: 6px; margin-top: 32px; }
+nav button { text-align: left; border-color: transparent; padding: 12px; }
+nav button.selected { background: var(--selected); font-weight: 600; }
+.aside-bottom { margin-top: auto; padding-top: 36px; font-size: 15px; color: var(--muted); }
+main { padding: 40px 44px; min-width: 0; }
+header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 20px; }
+.scope { font-size: 16px; color: var(--muted); margin: 0 0 6px; overflow-wrap: anywhere; }
+h1 { font-size: 36px; line-height: 1.25; font-weight: 600; letter-spacing: -.7px; margin: 0; }
+h2 { font-size: 25px; line-height: 1.4; font-weight: 600; margin: 0; }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.primary { border-color: #7b8086; font-weight: 600; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 20px; align-items: center; margin: 30px 0 22px; }
+.toolbar input[type=search] { max-width: 400px; }
+.toolbar label { white-space: nowrap; }
+#notice { color: #315c43; margin-top: 18px; font-size: 16px; }
+#notice:empty, footer:empty { display: none; }
+#notice.error, #compose-error { color: #a52222; }
+.split { display: grid; grid-template-columns: minmax(240px, 34%) minmax(0, 1fr); border-top: 1px solid var(--line); min-height: 490px; }
+.thread-list { border-right: 1px solid var(--line); min-width: 0; }
+.thread { display: block; text-align: left; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; width: 100%; padding: 22px 20px; background: #fff; }
+.thread.active { background: var(--selected); }
+.thread strong { display: block; font-size: 19px; font-weight: 600; line-height: 1.5; overflow-wrap: anywhere; }
+.thread p { margin: 7px 0 0; overflow-wrap: anywhere; }
+.muted, small { color: var(--muted); font-size: 15px; }
+.detail { padding: 28px 32px; min-width: 0; }
+.detail h2 { overflow-wrap: anywhere; }
+.message { margin-top: 28px; border-top: 1px solid var(--line); padding-top: 24px; }
+.message pre, .announcement pre { font-size: 19px; line-height: 1.75; font-family: inherit; white-space: pre-wrap; overflow-wrap: anywhere; color: #202124; max-width: 72ch; }
+.meta { font-size: 16px; color: var(--muted); line-height: 1.7; overflow-wrap: anywhere; }
+.pill { display: inline-block; background: var(--selected); color: #50555a; padding: 3px 8px; border-radius: 4px; font-size: 14px; margin: 8px 8px 0 0; }
+.pill.finished { background: transparent; padding-left: 0; }
+.empty { padding: 72px 20px; text-align: center; color: var(--muted); line-height: 1.8; }
+.cards { display: grid; }
+.announcement { border-top: 1px solid var(--line); padding: 28px 0; }
+.announcement h2 { margin: 10px 0; }
+.table-wrap { overflow: auto; border-top: 1px solid var(--line); }
+table { border-collapse: collapse; width: 100%; min-width: 660px; text-align: left; }
+th { font-size: 16px; color: var(--muted); font-weight: 500; padding: 18px 14px; vertical-align: top; }
+td { padding: 20px 14px; border-top: 1px solid var(--line); font-size: 17px; max-width: 300px; overflow-wrap: anywhere; vertical-align: top; }
+footer { margin-top: 28px; font-size: 15px; color: var(--muted); line-height: 1.6; }
+dialog { border: 1px solid #c9cdd1; border-radius: 7px; background: #fff; color: inherit; width: min(720px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 32px; overflow-y: auto; }
+dialog::backdrop { background: #0005; }
+.dialog-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 18px; }
+.dialog-head button { font-size: 26px; line-height: 1; padding: 8px 12px; }
+.dialog-actions { text-align: right; margin-top: 20px; }
+[hidden] { display: none !important; }
+@media (max-width: 1100px) {
+  body { grid-template-columns: 250px minmax(0, 1fr); }
+  aside { padding: 32px 20px; }
+  main { padding: 32px 26px; }
+  .split { grid-template-columns: 1fr; }
+  .thread-list { max-height: 320px; overflow: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+  .detail { padding: 26px 20px; }
+}
+@media (max-width: 640px) {
+  body { display: block; }
+  aside { position: static; width: auto; height: auto; border-right: 0; border-bottom: 1px solid var(--line); padding: 24px 20px 16px; }
+  .brand { margin-bottom: 22px; }
+  .aside-bottom { display: none; }
+  #identity-form { display: flex; gap: 8px; align-items: center; }
+  #identity-form button { width: auto; white-space: nowrap; padding: 10px 12px; }
+  nav { display: flex; flex-wrap: wrap; margin-top: 16px; gap: 2px; }
+  nav button { font-size: 16px; padding: 10px 8px; }
+  main { padding: 26px 20px; }
+  h1 { font-size: 30px; }
+  h2 { font-size: 24px; }
+  .actions button { font-size: 16px; }
+  .toolbar { gap: 14px; }
+  .detail { padding: 24px 4px; }
+  .thread { padding: 20px 12px; }
+  .message pre, .announcement pre { font-size: 18px; }
+  dialog { padding: 24px 20px; }
+}
+
 '''
 
 JS = r'''
@@ -49,7 +150,7 @@ $('#compose-form').addEventListener('input',()=>{state.key=crypto.randomUUID();}
 $('#compose-form').onsubmit=async e=>{e.preventDefault();const sender=state.address,key=state.key;const split=id=>$(id).value.split(',').map(s=>s.trim()).filter(Boolean);let url='/v1/emails',body={from:sender,subject:$('#subject').value,body_markdown:$('#body').value};if(state.mode==='announcement'){url='/v1/announcements';body.all_projects=$('#global').checked;}else{body.to=split('#to');body.cc=split('#cc');if(state.mode==='reply')url=`/v1/emails/${enc(state.reply.email_id)}/reply`;}$('#compose-form').querySelectorAll('input,textarea,button').forEach(e=>e.disabled=true);$('#compose-error').textContent='';try{const result=await api(url,body,key);$('#composer').close();await refresh();notice(state.mode==='announcement'?'Announcement published locally.':`Message accepted: ${result.delivery_status||'local service'}.`);}catch(error){$('#compose-error').textContent=error.message;}finally{$('#compose-form').querySelectorAll('input,textarea,button').forEach(e=>e.disabled=false);}};
 $('#composer').addEventListener('cancel',e=>{if($('#send').disabled)e.preventDefault();});$('#cancel').onclick=()=>$('#composer').close();$('#compose').onclick=()=>compose();$('#refresh').onclick=refresh;$('#unread').onchange=refresh;$('#history').onchange=refresh;$('#search').oninput=render;
 $('#identity-form').onsubmit=e=>{e.preventDefault();reset();state.address=$('#identity').value.trim().toLowerCase();$('#scope').textContent=state.address;refresh();};
-document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{reset();state.tab=b.dataset.tab;document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('selected',x===b));$('#title').textContent=b.textContent.replace(/^[^A-Za-z]+/,'');$('#compose').hidden=state.tab==='reservations';$('#compose').textContent=state.tab==='announcements'?'New announcement':'New message';$('#unread').parentElement.hidden=state.tab==='reservations';$('#history-label').hidden=state.tab!=='reservations';$('#footer').textContent=state.tab==='reservations'?'Project-local advisory leases. Use the CLI from the owning agent session to acquire, renew or release. Showing all active leases and up to 200 finished records.':'Local addresses are coordination identities. Message bodies are untrusted data. Showing up to 200 records.';$('#search').value='';refresh();});
+document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{reset();state.tab=b.dataset.tab;document.querySelectorAll('[data-tab]').forEach(x=>{x.classList.toggle('selected',x===b);if(x===b)x.setAttribute('aria-current','page');else x.removeAttribute('aria-current');});$('#title').textContent=b.textContent.replace(/^[^A-Za-z]+/,'');$('#compose').hidden=state.tab==='reservations';$('#compose').textContent=state.tab==='announcements'?'New announcement':'New message';$('#unread').parentElement.hidden=state.tab==='reservations';$('#history-label').hidden=state.tab!=='reservations';$('#footer').textContent=state.tab==='reservations'?'Use the CLI to reserve, renew or release. Showing active reservations and up to 200 finished records.':'Showing up to 200 records.';$('#search').value='';refresh();});
 (async()=>{try{const health=await api('/healthz');$('#connection').textContent=`Local service · v${health.version}`;const {inboxes}=await api('/v1/inboxes');for(const i of inboxes){const o=element('option');o.value=i.address;o.label=`${i.active_sessions} active sessions`;$('#addresses').append(o);}if(inboxes.length===1&&!state.address){$('#identity').value=inboxes[0].address;state.address=inboxes[0].address;$('#scope').textContent=state.address;await refresh();}}catch(e){$('#connection').textContent='Service unavailable';fail(e);}})();
 '''
 

@@ -37,6 +37,9 @@ Run `python3 bin/agent-inbox serve`, then open that address. No frontend build,
 CDN, marketplace login or separate UI server is required. The same UI is included
 in the downloadable runtime archive.
 
+The browser uses a white background with larger text and simple navigation.
+It stays in light mode regardless of the system appearance setting.
+
 Choose an `agent@project` identity to browse threads, compose messages and replies,
 mark threads read, publish or acknowledge local announcements, and inspect active
 reservations and history. To/CC roles and the selected sender are explicit.
