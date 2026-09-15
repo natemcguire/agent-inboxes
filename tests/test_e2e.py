@@ -1,6 +1,5 @@
 """End-to-end multi-agent cross-project round-trip integration test."""
 
-import os
 import tempfile
 import threading
 import unittest
@@ -47,7 +46,7 @@ class TestE2EMultiAgentFlow(unittest.TestCase):
                 send_res = client1.send_email(
                     from_addr="codex-worker1@boats",
                     to_addrs=["claude@nate-bot"],
-                    cc_addrs=[],
+                    cc_addrs=["observer@nate-bot"],
                     subject="Sail API response shape",
                     body_markdown="I added `draft_id`. Can you check the consumer?",
                     idempotency_key=idempotency_token,
@@ -73,7 +72,7 @@ class TestE2EMultiAgentFlow(unittest.TestCase):
                 self.assertEqual(len(claude_unread), 1)
                 self.assertEqual(claude_unread[0]["thread_id"], thr_01_id)
                 self.assertEqual(claude_unread[0]["unread_count"], 1)
-                self.assertEqual(claude_unread[0]["participants"], ["codex-worker1@boats", "claude@nate-bot"])
+                self.assertEqual(claude_unread[0]["participants"], ["codex-worker1@boats", "claude@nate-bot", "observer@nate-bot"])
 
                 # 6. claude@nate-bot reads thread detail -> read state is unread
                 thread_detail = client1.get_thread("claude@nate-bot", thr_01_id)
@@ -83,6 +82,7 @@ class TestE2EMultiAgentFlow(unittest.TestCase):
 
                 # 7. claude@nate-bot marks thread read
                 read_res = client1.mark_thread_read("claude@nate-bot", thr_01_id)
+                self.assertEqual(read_res["thread_id"], thr_01_id)
                 self.assertEqual(read_res["marked_read"], 1)
 
                 # Confirm claude has 0 unread now
@@ -110,6 +110,9 @@ class TestE2EMultiAgentFlow(unittest.TestCase):
                 detail_after_restart = client2.get_thread("claude@nate-bot", thr_01_id)
                 self.assertEqual(len(detail_after_restart["emails"]), 1)
                 self.assertTrue(detail_after_restart["emails"][0]["read"])  # Persisted as read for Claude
+                observer = client2.get_thread("observer@nate-bot", thr_01_id)
+                self.assertEqual(observer["emails"][0]["your_role"], "cc")
+                self.assertFalse(observer["emails"][0]["read"])
 
                 # 9. claude@nate-bot replies to eml_01
                 reply_token = "29952737-5a3f-4a30-95e3-846e77155d7a"
@@ -124,7 +127,7 @@ class TestE2EMultiAgentFlow(unittest.TestCase):
                 self.assertEqual(reply_res["reply_to_email_id"], eml_01_id)
                 self.assertEqual(reply_res["references"], [eml_01_id])
                 self.assertEqual(reply_res["to"], ["codex-worker1@boats"])
-                self.assertEqual(reply_res["cc"], [])
+                self.assertEqual(reply_res["cc"], ["observer@nate-bot"])
 
                 # 10. Repeat reply idempotency check
                 repeat_reply = client2.reply_email(
@@ -134,6 +137,10 @@ class TestE2EMultiAgentFlow(unittest.TestCase):
                     idempotency_key=reply_token,
                 )
                 self.assertEqual(repeat_reply["email_id"], eml_02_id)
+                observer = client2.get_thread("observer@nate-bot", thr_01_id)
+                self.assertEqual([email["email_id"] for email in observer["emails"]], [eml_01_id, eml_02_id])
+                self.assertEqual([email["your_role"] for email in observer["emails"]], ["cc", "cc"])
+                self.assertEqual([email["read"] for email in observer["emails"]], [False, False])
 
                 # 11. codex-worker1@boats checks unread threads -> sees reply unread!
                 codex_unread = client2.list_threads("codex-worker1@boats", unread=True)

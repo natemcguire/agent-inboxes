@@ -21,16 +21,25 @@ class TestInboxService(unittest.TestCase):
         self.conn.close()
         self.tmp_dir.cleanup()
 
-    def test_ensure_inbox_idempotency(self):
+    def test_ensure_inbox_commits_and_is_idempotent(self):
         # Create inbox
+        self.assertFalse(self.conn.in_transaction)
         r1 = self.service.ensure_inbox("codex-worker1@boats", display_name="Codex 1")
+        self.assertFalse(self.conn.in_transaction)
         self.assertEqual(r1["address"], "codex-worker1@boats")
         self.assertTrue(r1["created"])
         self.assertIsNotNone(r1["created_at"])
         self.assertIsNotNone(r1["last_seen_at"])
+        observer = get_connection(self.db_path)
+        try:
+            created = InboxService(observer).list_inboxes("boats")
+            self.assertEqual([inbox["address"] for inbox in created], ["codex-worker1@boats"])
+        finally:
+            observer.close()
 
         # Update inbox
         r2 = self.service.ensure_inbox("codex-worker1@boats", display_name="Codex Worker One")
+        self.assertFalse(self.conn.in_transaction)
         self.assertEqual(r2["address"], "codex-worker1@boats")
         self.assertFalse(r2["created"])
         self.assertEqual(r2["created_at"], r1["created_at"])
@@ -39,6 +48,15 @@ class TestInboxService(unittest.TestCase):
         inboxes = self.service.list_inboxes("boats")
         self.assertEqual(len(inboxes), 1)
         self.assertEqual(inboxes[0]["display_name"], "Codex Worker One")
+
+    def test_ensure_inbox_inert_inside_open_transaction(self):
+        # A caller must still be able to roll back both the new project and inbox.
+        self.conn.execute("BEGIN IMMEDIATE")
+        self.service.ensure_inbox("agent@proj2")
+        self.assertTrue(self.conn.in_transaction)
+        self.conn.execute("ROLLBACK")
+        self.assertIsNone(self.conn.execute("SELECT 1 FROM projects WHERE slug='proj2'").fetchone())
+        self.assertEqual(self.service.list_inboxes("proj2"), [])
 
     def test_send_email_and_idempotency(self):
         res1 = self.service.send_email(

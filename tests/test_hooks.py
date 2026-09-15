@@ -25,9 +25,6 @@ class TestBuildNotice(unittest.TestCase):
         self.patcher.stop()
         self.tmp.cleanup()
 
-    def test_no_threads_is_silent(self):
-        self.assertIsNone(hooks.build_notice("claude@p", []))
-
     def test_emits_once_then_dedups(self):
         threads = [_thread("Release: coordinate", "2026-09-07T14:32:00.000Z")]
         first = hooks.build_notice("claude@p", threads, now=1000.0)
@@ -55,7 +52,8 @@ class TestBuildNotice(unittest.TestCase):
         t2 = [_thread("Claim: a", "2026-09-07T14:40:00.000Z")]  # newer activity
         self.assertIsNotNone(hooks.build_notice("claude@p", t2, now=1010.0))
 
-    def test_drained_inbox_clears_stamp(self):
+    def test_empty_inbox_is_silent_and_clears_stamp(self):
+        self.assertIsNone(hooks.build_notice("claude@p", []))
         threads = [_thread("Release: x", "2026-09-07T14:32:00.000Z")]
         hooks.build_notice("claude@p", threads, now=1000.0)
         self.assertIsNone(hooks.build_notice("claude@p", [], now=1001.0))  # drained

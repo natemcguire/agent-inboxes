@@ -1,16 +1,13 @@
 """Unit tests for identity derivation from Git and environment variables."""
 
 import os
-import tempfile
 import unittest
-from pathlib import Path
 from unittest import mock
 
 from agent_inbox.identity import (
     _extract_repo_name_from_url,
     derive_agent,
     derive_identity,
-    derive_project,
     derive_session,
 )
 
@@ -28,14 +25,6 @@ class TestIdentity(unittest.TestCase):
         ]
         for url, expected in cases:
             self.assertEqual(_extract_repo_name_from_url(url), expected)
-
-    def test_derive_project_from_env(self):
-        with mock.patch.dict(os.environ, {"AGENT_INBOX_PROJECT": "custom-project"}):
-            self.assertEqual(derive_project(), "custom-project")
-
-    def test_derive_agent_from_env(self):
-        with mock.patch.dict(os.environ, {"AGENT_INBOX_AGENT": "worker-42"}):
-            self.assertEqual(derive_agent(), "worker-42")
 
     def test_derive_agent_runtime_detection(self):
         # Claude detection
@@ -72,15 +61,12 @@ class TestIdentity(unittest.TestCase):
             self.assertRegex(first, r"^s-[0-9a-f]{8}$")
             self.assertEqual(first, derive_session())
 
-    def test_derive_identity_full(self):
-        with mock.patch.dict(os.environ, {
-            "AGENT_INBOX_AGENT": "claude",
-            "AGENT_INBOX_PROJECT": "nate-bot",
-        }):
-            agent, project, address = derive_identity()
-            self.assertEqual(agent, "claude")
-            self.assertEqual(project, "nate-bot")
-            self.assertEqual(address, "claude@nate-bot")
+    def test_derive_identity_from_environment(self):
+        for agent, project in [("claude", "nate-bot"), ("worker-42", "custom-project")]:
+            with self.subTest(agent=agent, project=project), mock.patch.dict(os.environ, {
+                "AGENT_INBOX_AGENT": agent, "AGENT_INBOX_PROJECT": project,
+            }):
+                self.assertEqual(derive_identity(), (agent, project, f"{agent}@{project}"))
 
 
 if __name__ == "__main__":
