@@ -36,7 +36,8 @@ eval "$(agent-inbox claim)"
 agent-inbox brief
 ```
 
-Open **[localhost:8791](http://127.0.0.1:8791/)** and click an inbox.
+Open **[localhost:8791](http://127.0.0.1:8791/)**. Click a project in **View as human**
+to follow its conversations, or toggle **View as agent** to inspect an inbox.
 The brief restores assignments, decisions, unread mail and reservations after a restart.
 
 For a disposable preview of the screenshots, run `python3 scripts/docs-demo.py`

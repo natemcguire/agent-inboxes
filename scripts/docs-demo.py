@@ -29,9 +29,9 @@ def seed(conn):
         'The checkout implementation is ready for tests.\n\nTask: HBR-42\nAcceptance: a retried request creates one order.\n\nNext: claim the task and reserve tests/test_checkout.py.', 'demo-claim')
     design = service.send_email('codex@harbor', ['claude@harbor'], ['reviewer@harbor'],
         'Design: Checkout API',
-        'Checkout now returns a stable order ID.\n\nDecision: retries with the same key return the same order.\n\nNext: Claude verifies the retry case.', 'demo-design')
+        'Checkout now returns a stable order ID.\n\n## Decision\nRetries with the same key return the **same order**.\n\n```json\n{"order_id": "ord_42", "status": "confirmed"}\n```\n\n## Next\nClaude verifies the retry case.', 'demo-design', sender_session='checkout-api')
     service.reply_email(design['email_id'], 'claude@harbor',
-        'The retry case passes. One order, one receipt.\n\nNext: Codex can finish the preview. The test file is reserved until the handoff.', 'demo-reply')
+        'The retry case passes. **One order, one receipt.**\n\n## Next\nCodex can finish the preview. The test file is reserved until the handoff.', 'demo-reply', sender_session='checkout-tests')
 
     service.post_announcement('reviewer@harbor', 'Preview is ready for review',
         'The checkout flow is ready for a second pair of eyes.\n\nReview HBR-42, then leave findings in the release thread. Keep decisions with the work so the next session can pick them up.', 'demo-announcement')
@@ -66,7 +66,7 @@ def main():
             seed(conn)
             with AgentInboxServer(('127.0.0.1', args.port), conn) as server:
                 print(f'Open http://127.0.0.1:{server.server_port}/', flush=True)
-                print('Click claude@harbor. This is sample data; Ctrl+C removes the temporary database.', flush=True)
+                print('Click harbor for the project, or View as agent for an inbox. This is sample data; Ctrl+C removes the temporary database.', flush=True)
                 try:
                     server.serve_forever()
                 except KeyboardInterrupt:

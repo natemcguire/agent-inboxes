@@ -5,8 +5,9 @@
 **Send a message. Keep its thread. Resume the work.**
 
 The CLI and browser use this JSON API over loopback HTTP. The examples below were
-run against an isolated **2.2.1** service. Responses are real; IDs, timestamps,
-process IDs and remaining lease times will differ on your machine. The
+captured from isolated services: the original walkthrough uses **2.2.1**; the
+observer examples use **2.3.0**. IDs, timestamps, process IDs and remaining lease
+times will differ on your machine. The
 [transcript](examples/http-transcript.json) contains the full requests and responses,
 including cases where this guide shows only selected fields.
 
@@ -42,6 +43,10 @@ the supplied address/session. Use a local HTTP client or the bundled same-origin
 browser UI. CORS is allowlisted, so an arbitrary website cannot assume browser
 access. Optional cloud synchronization has a separate
 [protocol](cloud-sync-spec.md).
+
+Version 2.3 also returns `server_time`, `uptime_seconds`, `listen_address`,
+`port` and `client_ip` from `/healthz`. `client_ip` describes the requesting
+connection; the browser labels it **Browser peer IP**.
 
 ### Client conventions
 
@@ -95,6 +100,85 @@ curl -sS "$API/v1/inboxes?project=harbor"
 The `inboxes` array includes each address, project, local part, display name, role,
 registration/activity timestamps and active session count. Omit `project` to list
 all inboxes. The browser displays that directory directly in its sidebar.
+
+## Observe a project or an agent
+
+Click a project name in **View as human** to follow its conversations together.
+These GET routes do not create inboxes, refresh agent activity, acknowledge mail
+or claim tasks. A project contains the union of its member inboxes' threads,
+including conversations with agents in other projects.
+
+```sh
+curl -sS "$API/v1/projects"
+curl -sS "$API/v1/projects/harbor/overview"
+curl -sS "$API/v1/projects/harbor/threads?limit=50"
+curl -sS "$API/v1/projects/harbor/threads/$THREAD_ID"
+curl -sS "$API/v1/projects/harbor/announcements"
+```
+
+The thread list returns `threads`, `total`, `has_more` and `next_cursor`, newest
+activity first. Each summary includes participants, message count, preview and
+`receipt_activity` (the latest recipient read timestamp). Pass `next_cursor` as
+`cursor` until `has_more` is false. Cursors belong to one project and search;
+`limit` accepts 1–200. `q` searches subjects and message bodies across the project.
+Unknown projects and threads outside the project return 404.
+
+The overview includes agent last-seen times, up to five recorded sessions per
+agent, latest messages, task/reservation counts, and the 20 most recently updated
+unfinished tasks with linked threads and handoff details. `tasks_truncated` signals
+additional work. Recorded activity does not establish that an agent is running.
+
+A human thread returns `reading_as: null`; every email has `your_role: "observer"`
+and `read: null`. Individual receipts remain available. Selected fields from the
+[2.3 capture](examples/http-transcript.json):
+
+```json
+{
+  "thread_id": "thr_eb4ef63cffcc4df48c61f35e84c213f2",
+  "project": "harbor",
+  "view": "human",
+  "reading_as": null,
+  "emails": [
+    {
+      "email_id": "eml_be500bde69024ae6881b42aea6d176f4",
+      "sender_session": "checkout-api",
+      "api_peer_ip": null,
+      "api_received_at": null,
+      "your_role": "observer",
+      "read": null,
+      "receipts": [
+        {
+          "address": "claude@harbor",
+          "kind": "to",
+          "read_at": null
+        },
+        {
+          "address": "reviewer@harbor",
+          "kind": "cc",
+          "read_at": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+**View as agent** keeps the inbox's identity, To/CC roles and unread state. Add
+`observe=true` to inspect it without refreshing that agent's activity timestamp:
+
+```sh
+curl -sS "$API/v1/inboxes/claude@harbor/threads?observe=true&unread=true"
+curl -sS "$API/v1/inboxes/claude@harbor/threads/$THREAD_ID?observe=true"
+curl -sS "$API/v1/announcements?inbox=claude@harbor&observe=true"
+```
+
+Both thread views include sender sessions, recipient receipts and local API
+provenance. New HTTP sends/replies record `api_peer_ip` from the socket and
+`api_received_at` in UTC. Forwarding headers and JSON cannot override the peer.
+These fields are local and nullable: the fixture above was seeded directly;
+historical and cloud-synced messages may also have no recorded API connection.
+Replies follow their parents even when sender clocks disagree, with delivery
+order breaking equal timestamp ties.
 
 ## 2. Send once, retry safely
 

@@ -21,7 +21,7 @@ from agent_inbox.models import (
     NotFoundError,
     ValidationError,
 )
-from agent_inbox.service import InboxService
+from agent_inbox.service import InboxService, ProjectObserver
 
 
 # The Nate's Software web suite (served from these origins) makes browser
@@ -195,10 +195,18 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         """Route GET requests."""
         try:
-            self._touch_actor()
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
             query = urllib.parse.parse_qs(parsed.query)
+            observer_parts = [urllib.parse.unquote(p) for p in path.strip('/').split('/')]
+            observer_read = observer_parts[:2] == ['v1', 'projects'] and (
+                len(observer_parts) == 2 or len(observer_parts) >= 4 and
+                observer_parts[3] in ('overview', 'threads', 'announcements'))
+            observe_inbox = query.get('observe', ['false'])[0] == 'true' and (
+                path == '/v1/announcements' or observer_parts[:2] == ['v1', 'inboxes'] and
+                len(observer_parts) in (4, 5) and observer_parts[3] == 'threads')
+            if not observer_read and not observe_inbox:
+                self._touch_actor()
 
             if path == '/v1/leases/lookup':
                 lease = self._get_service().lookup_agent_by_session(
@@ -274,7 +282,7 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                 rows = self._get_service().list_announcements(
                     query.get("inbox", [""])[0],
                     unread=query.get("unread", ["false"])[0] == "true",
-                    limit=self._history_limit(query))
+                    limit=self._history_limit(query), observe=observe_inbox)
                 self._send_json(HTTPStatus.OK, {"announcements": rows})
                 return
 
@@ -294,6 +302,11 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     "pid": os.getpid(),
                     "db": db_status,
                     "version": __version__,
+                    "server_time": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                    "uptime_seconds": round(time.monotonic() - self.server.started_at, 1),
+                    "listen_address": self.server.server_address[0],
+                    "port": self.server.server_address[1],
+                    "client_ip": self.client_address[0],
                 })
                 return
 
@@ -311,6 +324,29 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
 
             # Path matching for /v1/inboxes/{address}/threads...
             parts = [urllib.parse.unquote(p) for p in path.strip("/").split("/")]
+            if parts[:2] == ['v1', 'projects']:
+                observer = ProjectObserver(self.server.get_thread_connection())
+                if len(parts) == 2:
+                    self._send_json(HTTPStatus.OK, {'projects': observer.projects()})
+                    return
+                if len(parts) >= 4 and parts[3] in ('overview', 'threads', 'announcements'):
+                    project = parts[2]
+                    if len(parts) == 4 and parts[3] == 'overview':
+                        result = observer.overview(project)
+                    elif len(parts) == 4 and parts[3] == 'threads':
+                        try:
+                            limit = int(query.get('limit', ['50'])[0])
+                        except ValueError:
+                            raise ValidationError('invalid_limit', 'limit must be an integer')
+                        result = observer.threads(project, limit, query.get('cursor', [''])[0], query.get('q', [''])[0])
+                    elif len(parts) == 5 and parts[3] == 'threads':
+                        result = observer.thread(project, parts[4])
+                    elif len(parts) == 4 and parts[3] == 'announcements':
+                        result = {'announcements': observer.announcements(project, self._history_limit(query))}
+                    else:
+                        raise NotFoundError('not_found', 'Unknown project view')
+                    self._send_json(HTTPStatus.OK, result)
+                    return
             if len(parts) >= 3 and parts[0] == "v1" and parts[1] == "inboxes":
                 address = parts[2]
                 
@@ -345,7 +381,8 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                 # /v1/inboxes/{address}/threads
                 if len(parts) == 4 and parts[3] == "threads":
                     service = self._get_service()
-                    self._touch_session(service, address)
+                    if not observe_inbox:
+                        self._touch_session(service, address)
                     unread_val = query.get("unread", ["false"])[0].lower()
                     unread_only = unread_val in ("true", "1", "yes")
                     limit_str = query.get("limit", ["50"])[0]
@@ -353,7 +390,7 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                         limit = int(limit_str)
                     except ValueError:
                         limit = 50
-                    threads = service.list_threads(address, unread_only=unread_only, limit=limit)
+                    threads = service.list_threads(address, unread_only=unread_only, limit=limit, observe=observe_inbox)
                     self._send_json(HTTPStatus.OK, {"threads": threads})
                     return
 
@@ -361,8 +398,9 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                 if len(parts) == 5 and parts[3] == "threads":
                     thread_id = parts[4]
                     service = self._get_service()
-                    self._touch_session(service, address)
-                    thread_data = service.get_thread(address, thread_id)
+                    if not observe_inbox:
+                        self._touch_session(service, address)
+                    thread_data = service.get_thread(address, thread_id, observe=observe_inbox)
                     self._send_json(HTTPStatus.OK, thread_data)
                     return
 
@@ -554,6 +592,7 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     sender_session=sender_session,
                     create_missing=body.get('create_missing', False),
                     require_sender=True,
+                    api_peer_ip=self.client_address[0],
                 )
                 from agent_inbox.cloudsync import enabled
                 res["delivery_status"] = "queued locally" if enabled() else "local only"
@@ -584,6 +623,7 @@ class InboxRequestHandler(BaseHTTPRequestHandler):
                     cc_addrs=cc_addrs,
                     sender_session=sender_session,
                     require_sender=True,
+                    api_peer_ip=self.client_address[0],
                 )
                 from agent_inbox.cloudsync import enabled
                 res["delivery_status"] = "queued locally" if enabled() else "local only"
@@ -691,6 +731,7 @@ class AgentInboxServer(ThreadingHTTPServer):
         # AttributeError here used to mask the real "Address already in use".
         self._cloud_worker = None
         self._cloud_check_at = 0.0
+        self.started_at = time.monotonic()
         super().__init__(server_address, InboxRequestHandler)
         self.db_conn = db_conn
         self.verbose = verbose

@@ -1,6 +1,8 @@
 """Core domain and transactional database operations for Agent Inboxes."""
 
 import datetime
+import base64
+import json
 import re
 import sqlite3
 import unicodedata
@@ -184,11 +186,14 @@ class InboxService(AgentLeases, ProjectMail, InboxMaintenance):
             self.conn.execute("ROLLBACK")
             raise
 
-    def list_announcements(self, viewer, unread=False, limit=200):
+    def list_announcements(self, viewer, unread=False, limit=200, observe=False):
         viewer = normalize_address(viewer)
         project = parse_address(viewer)[1]
-        self.ensure_inbox(viewer)
+        if not observe:
+            self.ensure_inbox(viewer)
         inbox_id = self._get_inbox_id(viewer)
+        if inbox_id is None:
+            raise NotFoundError('inbox_not_found', 'Inbox not found')
         rows = self.conn.execute("""SELECT a.rowid AS sequence,a.id,a.project,a.sender,a.subject,a.body_markdown,a.created_at,r.read_at
             FROM announcements a LEFT JOIN announcement_receipts r
             ON r.announcement_id=a.id AND r.inbox_id=?
@@ -413,6 +418,7 @@ class InboxService(AgentLeases, ProjectMail, InboxMaintenance):
         sender_session: Optional[str] = None,
         create_missing: bool = False,
         require_sender: bool = False,
+        api_peer_ip: Optional[str] = None,
     ) -> dict:
         """
         Start a thread and send its first email atomically.
@@ -521,10 +527,10 @@ class InboxService(AgentLeases, ProjectMail, InboxMaintenance):
             # Insert email
             self.conn.execute(
                 """
-                INSERT INTO emails (id, thread_id, from_inbox_id, subject, body_markdown, reply_to_email_id, client_token, sent_at, sender_session)
-                VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                INSERT INTO emails (id, thread_id, from_inbox_id, subject, body_markdown, reply_to_email_id, client_token, sent_at, sender_session, api_peer_ip, api_received_at)
+                VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
                 """,
-                (email_id, thread_id, from_inbox_id, subject.strip(), body_markdown, client_token, sent_at, sender_session),
+                (email_id, thread_id, from_inbox_id, subject.strip(), body_markdown, client_token, sent_at, sender_session, api_peer_ip, sent_at if api_peer_ip else None),
             )
 
             self.store_broadcasts(email_id, to_projects, cc_projects, sent_at)
@@ -574,6 +580,7 @@ class InboxService(AgentLeases, ProjectMail, InboxMaintenance):
         sender_session: Optional[str] = None,
         create_missing: bool = False,
         require_sender: bool = False,
+        api_peer_ip: Optional[str] = None,
     ) -> dict:
         """
         Reply to an existing email in a thread.
@@ -768,10 +775,10 @@ class InboxService(AgentLeases, ProjectMail, InboxMaintenance):
             # Insert email
             self.conn.execute(
                 """
-                INSERT INTO emails (id, thread_id, from_inbox_id, subject, body_markdown, reply_to_email_id, client_token, sent_at, sender_session)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO emails (id, thread_id, from_inbox_id, subject, body_markdown, reply_to_email_id, client_token, sent_at, sender_session, api_peer_ip, api_received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (email_id, thread_id, from_inbox_id, subject, body_markdown, reply_to_email_id, client_token, sent_at, sender_session),
+                (email_id, thread_id, from_inbox_id, subject, body_markdown, reply_to_email_id, client_token, sent_at, sender_session, api_peer_ip, sent_at if api_peer_ip else None),
             )
 
             self.store_broadcasts(email_id, to_projects, cc_projects, sent_at)
@@ -823,11 +830,14 @@ class InboxService(AgentLeases, ProjectMail, InboxMaintenance):
             self.conn.execute("ROLLBACK")
             raise
 
-    def list_threads(self, address: str, unread_only: bool = False, limit: int = 50) -> List[dict]:
+    def list_threads(self, address: str, unread_only: bool = False, limit: int = 50, observe: bool = False) -> List[dict]:
         """List newest-active threads visible to an inbox."""
         norm_addr = normalize_address(address)
-        self.ensure_inbox(norm_addr)
+        if not observe:
+            self.ensure_inbox(norm_addr)
         inbox_id = self._get_inbox_id(norm_addr)
+        if inbox_id is None:
+            raise NotFoundError('inbox_not_found', 'Inbox not found')
 
         limit = max(1, min(limit, 200))
 
@@ -906,14 +916,17 @@ class InboxService(AgentLeases, ProjectMail, InboxMaintenance):
 
         return results
 
-    def get_thread(self, address: str, thread_id: str) -> dict:
+    def get_thread(self, address: str, thread_id: str, observe: bool = False) -> dict:
         """
         Return the complete thread without changing read state.
         Read state is calculated relative to the requesting inbox.
         """
         norm_addr = normalize_address(address)
-        self.ensure_inbox(norm_addr)
+        if not observe:
+            self.ensure_inbox(norm_addr)
         inbox_id = self._get_inbox_id(norm_addr)
+        if inbox_id is None:
+            raise NotFoundError('inbox_not_found', 'Inbox not found')
 
         thread_row = self.conn.execute(
             "SELECT id, subject FROM threads WHERE id = ?",
@@ -928,22 +941,45 @@ class InboxService(AgentLeases, ProjectMail, InboxMaintenance):
         if not self._is_thread_member(thread_id, inbox_id):
             raise NotFoundError("thread_not_found", f"Thread '{thread_id}' not found")
 
+        return {
+            "thread_id": thread_id,
+            "subject": thread_row["subject"],
+            "reading_as": norm_addr,
+            "emails": self.thread_emails(thread_id, inbox_id),
+        }
+
+    def thread_emails(self, thread_id: str, inbox_id: Optional[int] = None) -> List[dict]:
+        """Serialize a previously scope-checked thread; None is a human observer."""
         email_rows = self.conn.execute(
             """
             SELECT e.id, e.from_inbox_id, e.subject, e.body_markdown, e.reply_to_email_id, e.sent_at,
-                   e.sender_session,
+                   e.sender_session, e.api_peer_ip, e.api_received_at, e.delivery_id,
                    i.local_part AS from_local_part, p.slug AS from_project_slug
             FROM emails e
             JOIN inboxes i ON e.from_inbox_id = i.id
             JOIN projects p ON i.project_id = p.id
             WHERE e.thread_id = ?
-            ORDER BY e.sent_at ASC, e.id ASC
+            ORDER BY e.sent_at ASC, e.delivery_id ASC, e.id ASC
             """,
             (thread_id,),
         ).fetchall()
 
+        # Preserve reply ancestry even when sender clocks disagree. Delivery IDs
+        # also make equal-millisecond timestamps stable rather than UUID-ordered.
+        by_id = {row['id']: row for row in email_rows}
+        ordered, emitted = [], set()
+        for row in email_rows:
+            chain, pending = [], set()
+            while row is not None and row['id'] not in emitted and row['id'] not in pending:
+                chain.append(row)
+                pending.add(row['id'])
+                row = by_id.get(row['reply_to_email_id'])
+            for parent in reversed(chain):
+                ordered.append(parent)
+                emitted.add(parent['id'])
+
         email_dicts = []
-        for e in email_rows:
+        for e in ordered:
             email_id = e["id"]
 
             # Recipients
@@ -989,18 +1025,18 @@ class InboxService(AgentLeases, ProjectMail, InboxMaintenance):
                 "sent_at": e["sent_at"],
                 "reply_to_email_id": e["reply_to_email_id"],
                 "references": references,
-                "read": is_read,
+                "read": is_read if inbox_id is not None else None,
                 "sender_session": e["sender_session"],
+                "api_peer_ip": e["api_peer_ip"],
+                "api_received_at": e["api_received_at"],
+                "receipts": [{"address": f"{r['local_part']}@{r['slug']}",
+                              "kind": r["kind"], "read_at": r["read_at"]} for r in rec_rows],
                 "your_role": (rec_entry["kind"] if rec_entry is not None else
+                              "observer" if inbox_id is None else
                               "sender" if e["from_inbox_id"] == inbox_id else "participant"),
             })
 
-        return {
-            "thread_id": thread_id,
-            "subject": thread_row["subject"],
-            "reading_as": norm_addr,
-            "emails": email_dicts,
-        }
+        return email_dicts
 
     def watch_state(self, address: str, after: int = 0) -> dict:
         """One non-blocking check of the long-poll watch condition.
@@ -1600,3 +1636,130 @@ class InboxService(AgentLeases, ProjectMail, InboxMaintenance):
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
+
+
+class ProjectObserver:
+    """Human-facing, SELECT-only views on this user's local project data.
+
+    No synthetic inbox, session heartbeat, receipt or task claim is created by
+    observing. A project sees exactly the union of its member inboxes' threads.
+    """
+
+    THREAD_SCOPE = """EXISTS (
+        SELECT 1 FROM thread_inboxes ti JOIN inboxes i ON i.id=ti.inbox_id
+        WHERE ti.thread_id=t.id AND i.project_id=?)"""
+
+    def __init__(self, conn):
+        self.conn = conn
+        self.service = InboxService(conn)
+
+    def project(self, slug):
+        row = self.conn.execute('SELECT id,slug,created_at FROM projects WHERE slug=?',
+                                (normalize_slug(slug),)).fetchone()
+        if row is None:
+            raise NotFoundError('project_not_found', 'Project not found')
+        return dict(row)
+
+    def projects(self):
+        return [dict(row) for row in self.conn.execute('''
+            SELECT p.slug,
+              (SELECT COUNT(*) FROM inboxes i WHERE i.project_id=p.id) AS inbox_count,
+              (SELECT COUNT(DISTINCT ti.thread_id) FROM thread_inboxes ti
+               JOIN inboxes i ON i.id=ti.inbox_id WHERE i.project_id=p.id) AS thread_count
+            FROM projects p ORDER BY p.slug''')]
+
+    def threads(self, slug, limit=50, cursor='', query=''):
+        project = self.project(slug)
+        if not 1 <= limit <= 200:
+            raise ValidationError('invalid_limit', 'limit must be between 1 and 200')
+        query = query.strip()[:500]
+        condition = self.THREAD_SCOPE
+        params = [project['id']]
+        if query:
+            pattern = '%' + query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
+            condition += " AND (t.subject LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM emails e WHERE e.thread_id=t.id AND e.body_markdown LIKE ? ESCAPE '\\'))"
+            params += [pattern, pattern]
+        total = self.conn.execute('SELECT COUNT(*) FROM threads t WHERE ' + condition, params).fetchone()[0]
+        if cursor:
+            try:
+                if len(cursor) > 4096:
+                    raise ValueError()
+                scope, search, activity, thread_id = json.loads(base64.urlsafe_b64decode(cursor).decode())
+                if scope != project['slug'] or search != query or type(activity) is not int or not 0 <= activity < 2**63 or not isinstance(thread_id, str):
+                    raise ValueError()
+            except (ValueError, TypeError, UnicodeError):
+                raise ValidationError('invalid_cursor', 'Cursor does not belong to this project/search')
+            condition += ' AND (t.activity_id < ? OR (t.activity_id = ? AND t.id < ?))'
+            params += [activity, activity, thread_id]
+        rows = self.conn.execute('SELECT t.* FROM threads t WHERE ' + condition +
+            ' ORDER BY t.activity_id DESC,t.id DESC LIMIT ?', params + [limit + 1]).fetchall()
+        result = []
+        for row in rows[:limit]:
+            item = dict(row)
+            item['thread_id'] = item.pop('id')
+            item.pop('home_project_id', None)
+            item['participants'] = [r[0] for r in self.conn.execute('''
+                SELECT i.local_part||'@'||p.slug FROM thread_inboxes ti
+                JOIN inboxes i ON i.id=ti.inbox_id JOIN projects p ON p.id=i.project_id
+                WHERE ti.thread_id=? ORDER BY p.slug,i.local_part''', (item['thread_id'],))]
+            item['message_count'] = self.conn.execute('SELECT COUNT(*) FROM emails WHERE thread_id=?', (item['thread_id'],)).fetchone()[0]
+            item['receipt_activity'] = self.conn.execute('''SELECT MAX(r.read_at) FROM email_recipients r
+                JOIN emails e ON e.id=r.email_id WHERE e.thread_id=?''', (item['thread_id'],)).fetchone()[0]
+            latest = self.conn.execute('''SELECT substr(e.body_markdown,1,220) AS preview,
+                i.local_part||'@'||p.slug AS last_sender FROM emails e
+                JOIN inboxes i ON i.id=e.from_inbox_id JOIN projects p ON p.id=i.project_id
+                WHERE e.thread_id=? ORDER BY e.delivery_id DESC,e.id DESC LIMIT 1''', (item['thread_id'],)).fetchone()
+            item.update(dict(latest) if latest else {})
+            result.append(item)
+        has_more = len(rows) > limit
+        next_cursor = None
+        if has_more:
+            last = rows[limit - 1]
+            next_cursor = base64.urlsafe_b64encode(json.dumps([project['slug'], query, last['activity_id'], last['id']]).encode()).decode()
+        return {'project': project['slug'], 'view': 'human', 'threads': result,
+                'has_more': has_more, 'next_cursor': next_cursor, 'total': total}
+
+    def thread(self, slug, thread_id):
+        project = self.project(slug)
+        row = self.conn.execute('SELECT t.* FROM threads t WHERE t.id=? AND ' + self.THREAD_SCOPE,
+                                (thread_id, project['id'])).fetchone()
+        if row is None:
+            raise NotFoundError('thread_not_found', 'Thread not found in this project')
+        return {'thread_id': row['id'], 'subject': row['subject'], 'project': project['slug'],
+                'created_at': row['created_at'], 'last_email_at': row['last_email_at'],
+                'activity_id': row['activity_id'], 'view': 'human', 'reading_as': None,
+                'emails': self.service.thread_emails(thread_id)}
+
+    def overview(self, slug):
+        project = self.project(slug)
+        agents = self.service.list_inboxes(project['slug'])
+        now = utc_now_iso()
+        for agent in agents:
+            inbox_id = self.service._get_inbox_id(agent['address'])
+            agent['sessions'] = [dict(r) for r in self.conn.execute('''SELECT session_id,last_seen_at,pid
+                FROM sessions WHERE inbox_id=? ORDER BY last_seen_at DESC,session_id LIMIT 5''', (inbox_id,))]
+            latest = self.conn.execute('''SELECT subject,thread_id,sent_at FROM emails WHERE from_inbox_id=?
+                ORDER BY delivery_id DESC,id DESC LIMIT 1''', (inbox_id,)).fetchone()
+            agent['latest_message'] = dict(latest) if latest else None
+            agent['task_count'] = self.conn.execute("SELECT COUNT(*) FROM ae_tasks WHERE project=? AND state!='completed' AND COALESCE(owner,target)=?",
+                                                   (project['slug'], agent['address'])).fetchone()[0]
+            agent['reservation_count'] = self.conn.execute('''SELECT COUNT(*) FROM reservations
+                WHERE project_id=? AND holder_inbox_id=? AND released_at IS NULL AND expires_at>?''', (project['id'], inbox_id, now)).fetchone()[0]
+        task_count = self.conn.execute("SELECT COUNT(*) FROM ae_tasks WHERE project=? AND state!='completed'", (project['slug'],)).fetchone()[0]
+        tasks = [dict(r) for r in self.conn.execute('''SELECT id,title,state,owner,target,session,note,thread_id,updated_at
+            FROM ae_tasks WHERE project=? AND state!='completed' ORDER BY updated_at DESC,id DESC LIMIT 20''', (project['slug'],))]
+        for task in tasks:
+            handoff = self.conn.execute('SELECT next_action,workspace,ref,acceptance,evidence FROM ae_handoffs WHERE task_id=? ORDER BY version DESC LIMIT 1', (task['id'],)).fetchone()
+            task['handoff'] = dict(handoff) if handoff else None
+        stats = self.conn.execute('''SELECT COUNT(*) AS thread_count,MAX(t.last_email_at) AS last_email_at,
+            COALESCE(SUM((SELECT COUNT(*) FROM emails e WHERE e.thread_id=t.id)),0) AS message_count
+            FROM threads t WHERE ''' + self.THREAD_SCOPE, (project['id'],)).fetchone()
+        return {'project': project['slug'], 'view': 'human', 'observed_at': now,
+                'agents': agents, 'tasks': tasks, 'task_count': task_count, 'tasks_truncated': task_count > len(tasks),
+                'reservation_count': sum(a['reservation_count'] for a in agents), **dict(stats)}
+
+    def announcements(self, slug, limit=200):
+        project = self.project(slug)
+        return [dict(r) for r in self.conn.execute('''SELECT id,project,sender,subject,body_markdown,created_at
+            FROM announcements WHERE project=? OR project IS NULL ORDER BY created_at DESC,id DESC LIMIT ?''',
+            (project['slug'], max(1, min(limit, 200))))]

@@ -44,10 +44,11 @@ agent-inbox ae task complete TASK_ID --version 2 --result 'Checks passed; see re
 ### AE tasks, a kanban board, and Jira
 
 **AE is the coordination layer inside Agent Inboxes.** The browser at
-`http://127.0.0.1:8791/` currently provides Messages, Announcements and
-Reservations. AE tasks are available through the CLI and HTTP API. A separate
-kanban board built for agents is a different application; this release does
-not include a kanban task view or automatic Jira/board synchronization.
+`http://127.0.0.1:8791/` provides Messages, Announcements and Reservations,
+with unfinished AE tasks and linked conversations in the human project view.
+Claim, hand off and complete tasks through the CLI or HTTP API. A full kanban
+board belongs in a companion application; there is no automatic Jira/board
+synchronization.
 
 An external tracker can remain the source of truth for the task, PRD, epic,
 priority and acceptance criteria. AE can coordinate the agent session doing
@@ -91,8 +92,32 @@ decisions and unread state hard to follow. The durable continuity is the task
 ID and thread ID; a short-lived session name should not be the only way to find
 the work. Subscribing follows a topic; accepting a task records responsibility.
 
-Project-wide delivery is available as `*@project` below. The current UI groups
-threads by inbox; a unified project-feed view is a future UI improvement.
+Project-wide delivery is available as `*@project` below. Click the project name
+in the sidebar to see its conversations together, with each topic shown once.
+
+### View as human / View as agent
+
+**View as human** opens the project: agent activity, unfinished work, conversations,
+announcements and reservations. Expand a thread to follow its replies, collapse
+older messages, or copy its link to resume later. Project search includes message
+bodies across the full history; **Load more conversations** retrieves older topics.
+Live updates preserve expanded messages and details.
+
+**View as agent** opens an individual inbox with its unread state and To/CC roles.
+The toggle keeps the project and selected conversation when that inbox belongs to
+the thread. Click any inbox directly to inspect a different agent's perspective.
+Observing either view leaves agent activity timestamps and mail receipts alone;
+**Mark read**, **Acknowledge**, compose and reply are explicit agent-view actions.
+
+Message details show routing, sender session, recipient receipts, exact timestamps,
+reply ancestry and time between messages. New local HTTP sends also record the API
+peer IP and receipt time. The peer is the connection address seen by the service,
+usually loopback; historical and cloud-synced messages may have no recorded peer.
+The sidebar's service details show the listening address, browser connection and
+uptime. Last-seen times and recorded sessions describe past activity, not proof
+that an agent is still running.
+
+[Observer API and data contracts](http-api.md#observe-a-project-or-an-agent).
 
 ### Stable identity and reliable delivery
 

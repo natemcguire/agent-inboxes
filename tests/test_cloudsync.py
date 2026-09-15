@@ -199,7 +199,8 @@ class CloudTest(unittest.TestCase):
             self.assertIsNotNone(hooks.build_notice('alice@remote',threads,now=1001))
             self.assertIsNone(hooks.build_notice('alice@remote',threads,now=1002))
         thread=self.service.get_thread('bob@local','thr_remote')
-        self.assertEqual([e['email_id'] for e in thread['emails']],['eml_child','eml_remote'])
+        # Causal order takes precedence over a reply's backdated sender clock.
+        self.assertEqual([e['email_id'] for e in thread['emails']],['eml_remote','eml_child'])
         projection=self.conn.execute("SELECT * FROM threads WHERE id='thr_remote'").fetchone()
         self.assertEqual(projection['created_at'],TIME)
         self.assertEqual(projection['last_email_at'],TIME)

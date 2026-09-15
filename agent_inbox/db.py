@@ -284,6 +284,11 @@ def init_db(conn: sqlite3.Connection) -> None:
     if "sender_session" not in email_columns:
         conn.execute("ALTER TABLE emails ADD COLUMN sender_session TEXT")
 
+    # Local HTTP provenance. Historical/cloud mail has no invented peer address.
+    for name in ("api_peer_ip", "api_received_at"):
+        if name not in email_columns:
+            conn.execute(f"ALTER TABLE emails ADD COLUMN {name} TEXT")
+
     # v1.4: optional cloud sync marker. Existing mail starts unsynced.
     if "cloud_synced_at" not in email_columns:
         conn.execute("ALTER TABLE emails ADD COLUMN cloud_synced_at TEXT")
