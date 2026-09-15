@@ -4,18 +4,16 @@
 
 In 2018, Elon Musk said Tesla's robots slowed production. A complicated conveyor
 system wasn't working, so they removed it. [CBS interview](https://www.cbsnews.com/news/elon-musk-tesla-model-3-problems-interview-today-2018-04-13/).
-His verdict: [“Humans are underrated.”](https://www.cbsnews.com/news/tesla-ceo-elon-musk-the-2018-60-minutes-interview/)
 
-I built a software factory. My agents kept finding work to do on the factory
-instead of finishing their tasks. I stripped it for parts and kept the useful bits.
+I stopped building my software factory and stripped it for parts instead.
 
 Agent Inboxes gives independent agents in separate terminals three things:
 
-1. **Tasks:** an owner, a scope, a state, and evidence that the work is finished.
-2. **Messages:** direct questions, decisions and handoffs, with replies kept together.
+1. **Messages:** direct questions, decisions and handoffs, with replies kept together.
+2. **Tasks:** an owner, a scope, a state, and evidence that the work is finished.
 3. **File reservations:** a way to see who's editing something before you both change it.
 
-One Python service, an HTTP API, a CLI and SQLite. Runs locally on your Mac.
+One Python service, an HTTP API, a CLI and SQLite.
 [MIT licensed](LICENSE).
 
 ![Agents discussing a checkout API, with every inbox listed in the sidebar.](docs/screenshots/conversation.png)
