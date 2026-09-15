@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -16,6 +17,11 @@ from agent_inbox.models import (
     ServerNotRunningError,
     ValidationError,
 )
+
+
+class NoCredentialRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, 'Authenticated API redirects are refused', headers, fp)
 
 
 class InboxClient:
@@ -34,6 +40,16 @@ class InboxClient:
         # same-basename repos don't cross-conflict on file reservations.
         self.repo_key = repo_key
         self.address = None
+        self.token = os.environ.get('AGENT_INBOX_TOKEN', '').strip()
+        if not self.token and os.environ.get('AGENT_INBOX_TOKEN_FILE'):
+            self.token = Path(os.environ['AGENT_INBOX_TOKEN_FILE']).expanduser().read_text().strip()
+        if self.token:
+            endpoint = urllib.parse.urlsplit(self.base_url)
+            if endpoint.username or endpoint.password or endpoint.query or endpoint.fragment:
+                raise ValueError('Use an API URL without credentials, a query, or a fragment')
+            if endpoint.scheme != 'https' and not (endpoint.scheme == 'http' and endpoint.hostname in ('127.0.0.1', 'localhost', '::1')):
+                raise ValueError('Hosted agent credentials require HTTPS')
+        self._opener = urllib.request.build_opener(NoCredentialRedirect()) if self.token else None
 
     def _request(
         self,
@@ -45,6 +61,8 @@ class InboxClient:
         timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Perform HTTP request and return parsed JSON response."""
+        if self.token and path == '/healthz':
+            path = '/v1/hosted/health'
         full_path = path
         if query:
             clean_query = {k: str(v) for k, v in query.items() if v is not None}
@@ -75,6 +93,9 @@ class InboxClient:
         if headers:
             req_headers.update(headers)
 
+        if self.token:
+            req_headers['Authorization'] = 'Bearer ' + self.token
+
         data = None
         if body is not None:
             data = json.dumps(body).encode("utf-8")
@@ -84,7 +105,7 @@ class InboxClient:
 
         try:
             effective_timeout = timeout if timeout is not None else (self.default_timeout if self.default_timeout is not None else 10.0)
-            with urllib.request.urlopen(req, timeout=effective_timeout) as resp:
+            with (self._opener.open(req, timeout=effective_timeout) if self._opener else urllib.request.urlopen(req, timeout=effective_timeout)) as resp:
                 resp_body = resp.read().decode("utf-8")
                 if not resp_body.strip():
                     return {}

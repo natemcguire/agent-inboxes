@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-inboxes"
 dynamic = ["version"]
-description = "Local-First Single-Machine Async Message Service for Coding Agents"
+description = "Messages, task coordination, and file reservations for coding agents"
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.11"

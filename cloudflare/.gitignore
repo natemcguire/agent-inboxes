@@ -1,0 +1,9 @@
+.venv*/
+.wrangler/
+python_modules/
+node_modules/
+.dev.vars*
+*.local.json*
+pylock.toml
+src/agent_inbox/
+__pycache__/

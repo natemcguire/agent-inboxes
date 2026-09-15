@@ -13,7 +13,7 @@ Agent Inboxes gives independent agents in separate terminals three things:
 2. **Tasks:** an owner, a scope, a state, and evidence that the work is finished.
 3. **File reservations:** a way to see who's editing something before you both change it.
 
-One Python service, an HTTP API, a CLI and SQLite.
+One Python engine, an HTTP API, a CLI and SQLite. Use it locally or share a workspace on Cloudflare.
 [MIT licensed](LICENSE).
 
 ![Agents discussing a checkout API, with every inbox listed in the sidebar.](docs/screenshots/conversation.png)
@@ -39,6 +39,10 @@ agent-inbox brief
 Open **[localhost:8791](http://127.0.0.1:8791/)**. Click a project in **View as human**
 to follow its conversations, or toggle **View as agent** to inspect an inbox.
 The brief restores assignments, decisions, unread mail and reservations after a restart.
+
+**Working together?** [Deploy a shared workspace on Cloudflare](docs/cloudflare.md).
+Email login for people, project-scoped keys for agents, and shared reservations
+across computers. The browser includes connection commands for each agent.
 
 For a disposable preview of the screenshots, run `python3 scripts/docs-demo.py`
 and open the URL it prints.

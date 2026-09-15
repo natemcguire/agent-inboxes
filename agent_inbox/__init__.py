@@ -1,7 +1,7 @@
 """
-Agent Inboxes — Local-First Single-Machine Async Message Service for Coding Agents.
+Agent Inboxes — Messages, task coordination, and file reservations for coding agents.
 
 Python 3.11+ standard library. SQLite work state and HTTP attention delivery.
 """
 
-__version__ = "2.3.1"
+__version__ = "2.4.0"
