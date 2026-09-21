@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Union
 from urllib.parse import urlparse
 
-from agent_inbox.models import normalize_slug
+from agent_inbox.models import InboxError, normalize_slug
 
 
 def _extract_repo_name_from_url(url: str) -> Optional[str]:
@@ -255,12 +255,20 @@ def resolve_identity(client, cwd=None):
     """Resolve explicit identity or this session's name, never another session's."""
     agent, project, address = derive_identity(cwd)
     session = client.session_id or derive_session()
-    if os.environ.get('AGENT_INBOX_AGENT', '').strip():
-        result = dict(agent=agent, project=project, address=address, session=session, source='environment')
-    else:
+    env_agent = bool(os.environ.get('AGENT_INBOX_AGENT', '').strip())
+    # The session's own lease outranks AGENT_INBOX_AGENT: concurrent agents
+    # share that export as a family name, and each claims its own slot.
+    try:
         lease = client.lookup_lease(project, session)
-        result = dict(lease, source='lease') if lease else dict(
-            agent=agent, project=project, address=address, session=session, source='unbound')
+    except InboxError:
+        if not env_agent:
+            raise
+        lease = None
+    if lease:
+        result = dict(lease, source='lease')
+    else:
+        result = dict(agent=agent, project=project, address=address, session=session,
+                      source='environment' if env_agent else 'unbound')
     if result['source'] != 'unbound':
         client.address = result['address']
     return result

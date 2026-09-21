@@ -12,7 +12,9 @@ from agent_inbox.identity import (
     derive_agent,
     derive_identity,
     derive_session,
+    resolve_identity,
 )
+from agent_inbox.models import ServerNotRunningError
 
 
 class TestIdentity(unittest.TestCase):
@@ -63,6 +65,35 @@ class TestIdentity(unittest.TestCase):
             first = derive_session()
             self.assertRegex(first, r"^s-[0-9a-f]{8}$")
             self.assertEqual(first, derive_session())
+
+    def test_session_lease_wins_over_agent_env_var(self):
+        # Concurrent agents share an exported AGENT_INBOX_AGENT; each session's
+        # claimed lease must win or they silently overwrite each other's identity.
+        lease = {"agent": "claude-2", "project": "proj", "address": "claude-2@proj", "session": "s-abc"}
+        client = mock.Mock(session_id="s-abc", lookup_lease=mock.Mock(return_value=lease))
+        with tempfile.TemporaryDirectory() as directory, isolated_inbox(directory), \
+                mock.patch.dict(os.environ, {"AGENT_INBOX_AGENT": "claude", "AGENT_INBOX_PROJECT": "proj"}):
+            result = resolve_identity(client)
+        self.assertEqual(result["source"], "lease")
+        self.assertEqual(result["address"], "claude-2@proj")
+        self.assertEqual(client.address, "claude-2@proj")
+
+    def test_agent_env_var_applies_when_session_has_no_lease(self):
+        client = mock.Mock(session_id="s-abc", lookup_lease=mock.Mock(return_value=None))
+        with tempfile.TemporaryDirectory() as directory, isolated_inbox(directory), \
+                mock.patch.dict(os.environ, {"AGENT_INBOX_AGENT": "worker", "AGENT_INBOX_PROJECT": "proj"}):
+            result = resolve_identity(client)
+        self.assertEqual(result["source"], "environment")
+        self.assertEqual(result["address"], "worker@proj")
+
+    def test_agent_env_var_still_resolves_when_service_is_down(self):
+        client = mock.Mock(session_id="s-abc",
+                           lookup_lease=mock.Mock(side_effect=ServerNotRunningError()))
+        with tempfile.TemporaryDirectory() as directory, isolated_inbox(directory), \
+                mock.patch.dict(os.environ, {"AGENT_INBOX_AGENT": "worker", "AGENT_INBOX_PROJECT": "proj"}):
+            result = resolve_identity(client)
+        self.assertEqual(result["source"], "environment")
+        self.assertEqual(result["address"], "worker@proj")
 
     def test_derive_identity_from_environment(self):
         with tempfile.TemporaryDirectory() as directory, isolated_inbox(directory):
