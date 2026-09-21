@@ -45,6 +45,10 @@ def derive_project(cwd: Optional[Union[str, Path]] = None) -> str:
     from agent_inbox.db import get_connection
     from agent_inbox.project_registry import lookup_project
     env_project = os.environ.get('AGENT_INBOX_PROJECT', '').strip()
+    # Hosted credentials have their own explicit project scope. Never remap
+    # the separate local cloud-mail relay registry while using that scope.
+    if env_project and (os.environ.get('AGENT_INBOX_TOKEN') or os.environ.get('AGENT_INBOX_TOKEN_FILE')):
+        return normalize_slug(env_project)
     working_dir = Path(cwd).expanduser().resolve() if cwd else Path.cwd().resolve()
     raw_repo = str(working_dir)
     remote = ''

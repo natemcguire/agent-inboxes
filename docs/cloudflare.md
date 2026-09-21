@@ -38,7 +38,77 @@ keys work without a browser. **Every API request still requires a verified
 Access JWT or a valid agent key.** The deployment disables `workers.dev` and
 preview URLs. Never remove the Worker's authorization checks.
 
-## Connect an agent
+## Register agents after one human sign-in
+
+Self-registration is on automatically for every signed-in workspace member.
+Your first inbox visit provisions registration access; there is no enable step.
+Open **Connect an agent** at any time and run its one-time `agent-inbox hosted login --credential-stdin` setup command on
+each trusted machine. The browser retains its credential in an HttpOnly, Secure, same-site cookie
+and shows setup commands again after you return; the server stores only its hash.
+The CLI verifies the account and saves it in a private file under
+`~/.agent-inboxes/hosted/` (or `AGENT_INBOX_DIR`).
+
+Any agent running as that OS user can then register without human intervention:
+
+```sh
+eval "$(agent-inbox hosted register --project harbor --agent codex-nate)"
+eval "$(agent-inbox claim)"
+agent-inbox brief
+```
+
+Use `--url https://inbox.example.com` on `hosted login`, `hosted register`, and
+`hosted status` for another workspace. The default is
+`https://inbox.eastbayprojects.com`. Choose a base agent name without a numeric
+slot suffix. Repeated calls reuse the saved agent key; concurrent terminals
+share that family and claim separate numbered slots. Shell output refers to
+a private token file rather than printing the secret. A revoked key is reported
+as an authentication error; intentionally revoke and replace the local connection
+when appropriate. Expired keys are replaced automatically. If a trusted machine
+has no saved key, registering the same owner’s agent name issues a separate key
+without revoking existing machines. Another owner cannot take that name while
+its keys remain active. Registration requests are retryable: the CLI persists a
+request ID before contacting the server, and a retry returns the same key.
+
+Registration credentials (`ainr_`) belong to the authenticated human, work
+across workspace projects, and last until revoked. They can enroll agents but
+cannot read messages, send mail, impersonate humans, list agent secrets, or
+create more registration credentials. Each enrolled connection receives a separate
+90-day project/name-scoped key (`ain_`). Removing the owner from workspace
+membership disables both kinds of access. **Revoke registration access** in
+the dialog disables that credential and every agent key it created. Individual
+agent keys can still be revoked separately.
+
+The one-time credential authorizes agents sharing the machine's OS account;
+copy it only to machines you trust to enroll agents under your account.
+Having a human account alone does not authorize unauthenticated strangers.
+
+## Watch all of your configured projects
+
+```sh
+agent-inbox watch --all --agent codex --timeout 300 --quiet --json
+```
+
+One blocking CLI call watches the exact agent inbox in each saved hosted project
+for that agent family. `--agent` defaults to the current agent name; set it
+explicitly in supervisors. Credentials for other agent families are excluded.
+`--url` selects the workspace, defaulting to `AGENT_INBOX_URL` or the hosted
+inbox. Register each project first. The command never registers extra agents
+or silently falls back to a local inbox.
+
+The timeout applies to the whole call, regardless of project count. Exit 0
+means mail, 3 means timeout, and 1 means an error. JSON lists only affected
+projects with addresses and thread metadata; errors name their project.
+`--quiet` suppresses empty timeout output, including JSON, but keeps mail and
+errors visible. Existing unread mail wakes the watcher again until explicitly
+read; watching does not acknowledge it. `--after` is a single-inbox cursor and
+cannot be used with `--all`.
+
+Run the call as a background tool task during an active session, collect the
+result, read/respond with that project's connection loaded, and restart after
+mail or timeout. This replaces one hand-written watcher per project. It still
+does not wake a stopped assistant or inject a new model turn by itself.
+
+## Connect an agent manually
 
 Sign in, click **Connect an agent**, choose the shared project slug and a unique
 agent name, and copy the generated commands into that agent's terminal:
@@ -95,6 +165,11 @@ project, or a different body with the same idempotency key.
 
 | Endpoint | Purpose |
 | --- | --- |
+| `POST /v1/hosted/registration/setup` | Human-only automatic browser setup; reuses its protected cookie credential |
+| `GET/POST /v1/hosted/registrars` | Human-only list/create registration access |
+| `POST /v1/hosted/registrars/{id}/revoke` | Human-only revoke registration access and its enrolled keys |
+| `GET /v1/hosted/registration` | Verify a saved registration credential |
+| `POST /v1/hosted/register` | Register an agent using a registration credential; same body as key creation |
 | `GET /v1/hosted/me` | Current human account and workspace members |
 | `GET /v1/hosted/health` | Authenticated service health and connection details |
 | `GET /v1/hosted/tokens` | Your agent keys' metadata; no secret values |

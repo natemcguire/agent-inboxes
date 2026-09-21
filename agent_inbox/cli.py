@@ -649,6 +649,25 @@ def cmd_watch(args: argparse.Namespace, client: InboxClient) -> int:
     Exit 0 = mail arrived, exit 3 = timeout, exit 1 = error.
     """
     try:
+        if args.all_projects:
+            from agent_inbox.client import configured_hosted_watches, watch_many, HOSTED_DEFAULT_URL
+            targets = configured_hosted_watches(args.url or os.environ.get('AGENT_INBOX_URL') or HOSTED_DEFAULT_URL,
+                args.agent or derive_agent(), derive_session())
+            result = watch_many(targets, float(args.timeout))
+            if args.json and (not args.quiet or result['changed'] or result['errors']):
+                print(json.dumps(result, indent=2))
+            elif not args.json:
+                for project in result['projects']:
+                    latest = project.get('latest') or {}
+                    print(f"New mail for {project['address']}: {project.get('unread_count', 0)} unread")
+                    if latest:
+                        print(f"Latest: {latest.get('subject')} — from {latest.get('from')} "
+                              f"(thread {latest.get('thread_id')}, {latest.get('sent_at')})")
+                for error in result['errors']:
+                    _print_error(f"{error['address']}: {error['message']}")
+                if not result['changed'] and not result['errors'] and not args.quiet:
+                    print(f"No new mail across {result['watched']} projects within {args.timeout:g}s.")
+            return 1 if result['errors'] else (0 if result['changed'] else 3)
         address = args.for_addr
         if not address:
             _, _, address = _resolved_identity(client)
@@ -678,9 +697,9 @@ def cmd_watch(args: argparse.Namespace, client: InboxClient) -> int:
                 print(f"Run: agent-inbox list --unread")
             return 0
 
-        if args.json:
+        if args.json and not args.quiet:
             print(json.dumps(res or {"changed": False}, indent=2))
-        else:
+        elif not args.quiet:
             print(f"No new mail for {address} within {int(overall)}s.")
         return 3
     except InboxError as e:
@@ -883,6 +902,9 @@ def build_parser() -> argparse.ArgumentParser:
     from agent_inbox.ae_cli import add_parser as add_ae_parser
     add_ae_parser(subparsers)
 
+    from agent_inbox.client import add_hosted_parser
+    add_hosted_parser(subparsers)
+
     p_cloud = subparsers.add_parser("cloud", help="Configure optional cloud mail sync")
     cloud_commands = p_cloud.add_subparsers(dest="cloud_action", required=True)
     p_login = cloud_commands.add_parser("login", help="Verify and save a cloud session token")
@@ -1014,7 +1036,12 @@ def build_parser() -> argparse.ArgumentParser:
     # watch
     p_watch = subparsers.add_parser("watch", help="Block until new unread mail arrives (within-turn long-poll)")
     p_watch.add_argument("--timeout", type=float, default=300.0, help="Overall seconds to wait before exiting 3 (default: 300)")
-    p_watch.add_argument("--for", dest="for_addr", help="Inbox address to watch (defaults to derived identity)")
+    watch_scope = p_watch.add_mutually_exclusive_group()
+    watch_scope.add_argument('--all', dest='all_projects', action='store_true', help='Watch this agent across all saved hosted projects with one global timeout')
+    p_watch.add_argument('--agent', help='With --all, exact agent name to watch in each project (defaults to current agent)')
+    p_watch.add_argument('--url', help='With --all, hosted workspace URL (defaults to AGENT_INBOX_URL or the hosted inbox)')
+    p_watch.add_argument('--quiet', action='store_true', help='Suppress timeout output; mail and errors still appear')
+    watch_scope.add_argument("--for", dest="for_addr", help="Inbox address to watch (defaults to derived identity)")
     p_watch.add_argument("--after", type=int, default=None, help="Only wake for mail newer than this cursor (from a previous watch response)")
     p_watch.add_argument("--json", action="store_true", help="Output JSON")
 
@@ -1077,6 +1104,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.command:
         parser.print_help(sys.stderr)
         return 1
+
+    if args.command == 'watch':
+        if args.all_projects and args.after is not None:
+            parser.error('--after is per inbox and cannot be combined with --all')
+        if not args.all_projects and (args.agent or args.url):
+            parser.error('--agent and --url require --all')
+        if args.all_projects:
+            return cmd_watch(args, None)
+
+    if args.command == "hosted":
+        from agent_inbox.client import run_hosted
+        return run_hosted(args)
 
     if args.command == "hook-check":
         return 0  # Legacy hook commands do no I/O or context injection.

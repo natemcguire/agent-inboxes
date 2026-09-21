@@ -12,6 +12,7 @@ import signal
 import socket
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -125,6 +126,95 @@ def run(runtime):
     assert status==303 and headers['Location']=='/'
     print('PASS signed logins, forged/expired JWTs, CSRF, and automatic welcome retirement',flush=True)
 
+    assert r.expect(200,'GET','/v1/hosted/me',human=nate)['self_registration'] is True
+    status, automatic, setup_headers = r.call('POST','/v1/hosted/registration/setup',{},human=nate)
+    assert status==201
+    cookie_header=next(v for k,v in setup_headers.items() if k.lower()=='set-cookie')
+    assert all(flag in cookie_header for flag in ('HttpOnly','Secure','SameSite=Strict'))
+    cookie=cookie_header.split(';')[0]
+    again=r.expect(200,'POST','/v1/hosted/registration/setup',{},human=nate,headers={'Cookie':cookie})
+    assert again==automatic
+    separate=r.expect(201,'POST','/v1/hosted/registration/setup',{},human=josh,headers={'Cookie':cookie})
+    assert separate['owner']==josh and separate['token']!=automatic['token']
+    r.expect(401,'POST','/v1/hosted/registration/setup',{})
+    r.expect(403,'POST','/v1/hosted/registration/setup',{},human=nate,headers={'Origin':'https://evil.example'})
+    print('PASS automatic registration on sign-in, HttpOnly credential persistence, owner isolation and CSRF protection',flush=True)
+
+    # One human login authorizes unattended enrollment across projects.
+    registrar = r.expect(201,'POST','/v1/hosted/registrars',{'label':'Trusted machine'},human=nate)
+    rh = {'Authorization':'Bearer '+registrar['token']}
+    r.expect(401,'GET','/v1/hosted/registration',headers={'Authorization':'Bearer ainr_forged'})
+    assert r.expect(200,'GET','/v1/hosted/registration',headers=rh)['owner']==nate
+    assert 'token' not in r.expect(200,'GET','/v1/hosted/registrars',human=nate)['registrars'][0]
+    for method,path,body in [('GET','/v1/projects',None),('GET','/v1/hosted/tokens',None),('POST','/v1/hosted/registrars',{})]:
+        r.expect(403,method,path,body,headers=rh)
+    r.expect(403,'POST','/v1/hosted/register',{'project':'auto','family':'nate'},headers=rh)
+    r.expect(403,'POST','/v1/hosted/register',{'project':'auto','family':'new'},agent=a)
+    r.expect(403,'POST','/v1/hosted/registrars/'+registrar['id']+'/revoke',{},human=josh)
+    auto = r.expect(201,'POST','/v1/hosted/register',{'project':'auto','family':'robot','owner':josh},headers=rh)
+    assert auto['owner']==nate
+    retried_body={'project':'auto','family':'robot','registration_id':uuid.uuid4().hex}
+    extra=r.expect(201,'POST','/v1/hosted/register',retried_body,headers=rh)
+    assert extra==r.expect(201,'POST','/v1/hosted/register',retried_body,headers=rh)
+    assert extra['token']!=auto['token']
+    r.expect(409,'POST','/v1/hosted/register',{**retried_body,'label':'changed'},headers=rh)
+    other_owner={'Authorization':'Bearer '+separate['token']}
+    r.expect(400,'POST','/v1/hosted/register',{'project':'auto','family':'robot'},headers=other_owner)
+    r.expect(200,'POST','/v1/hosted/tokens/'+extra['id']+'/revoke',{},human=nate)
+    r.expect(403,'POST','/v1/hosted/register',retried_body,headers=rh)
+    r.expect(200,'GET','/v1/hosted/health',agent=auto)
+
+    r.expect(200,'POST','/v1/leases/claim',{'project':'auto','family':'robot'},agent=auto)
+    r.expect(403,'GET','/v1/projects/private/threads',agent=auto)
+    # Exercise the actual CLI, private files, repeated registration and two
+    # simultaneous terminals without inheriting the developer's hosted settings.
+    with tempfile.TemporaryDirectory() as directory:
+        environment={k:v for k,v in os.environ.items() if not k.startswith('AGENT_INBOX_')}
+        environment.update(AGENT_INBOX_DIR=directory, PYTHONPATH=str(ROOT.parent))
+        base=[sys.executable,'-m','agent_inbox.cli','hosted']
+        def cli(arguments, credential=None):
+            result=subprocess.run(base+arguments, input=credential, text=True, capture_output=True, env=environment, cwd=ROOT.parent)
+            assert result.returncode==0, result.stderr
+            assert registrar['token'] not in result.stdout
+            return result.stdout
+        cli(['login','--url',r.url,'--credential-stdin'],registrar['token'])
+        args=['register','--url',r.url,'--project','cli-project','--agent','robot-cli']
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            outputs=list(pool.map(lambda _:cli(args),range(2)))
+        assert outputs[0]==outputs[1] and 'TOKEN_FILE=' in outputs[0]
+        assert 'ain_' not in outputs[0]
+        assert all(path.stat().st_mode & 0o777 == 0o600 for path in Path(directory).rglob('*') if path.is_file())
+        cli(['status','--url',r.url])
+        cli(['register','--url',r.url,'--project','cli-other','--agent','robot-cli'])
+        cli(['register','--url',r.url,'--project','cli-unrelated','--agent','unrelated-agent'])
+        watch=base[:-1]+['watch','--all','--url',r.url,'--agent','robot-cli','--timeout','3','--json']
+        quiet=subprocess.run(watch+['--timeout','0.5','--quiet'],capture_output=True,text=True,env=environment,cwd=ROOT.parent,timeout=5)
+        assert quiet.returncode==3 and quiet.stdout=='', (quiet.returncode,quiet.stdout,quiet.stderr)
+        started=time.monotonic()
+        waiting=subprocess.Popen(watch,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=environment,cwd=ROOT.parent)
+        time.sleep(.4)
+        mail=r.expect(201,'POST','/v1/emails',{'from':'nate@cli-other','to':['robot-cli@cli-other'],'subject':'Multi-project wakeup','body_markdown':'Watch both projects.'},human=nate,key='multi-watch')
+        stdout,stderr=waiting.communicate(timeout=5)
+        result=json.loads(stdout)
+        assert waiting.returncode==0 and time.monotonic()-started<2.8, (stdout,stderr)
+        assert result['watched']==2 and [p['project'] for p in result['projects']]==['cli-other'], result
+        assert result['projects'][0]['latest']['thread_id']==mail['thread_id']
+        saved=[json.loads(p.read_text()) for p in Path(directory).rglob('*.json')]
+        watched_agent=next(d for d in saved if d.get('project')=='cli-other')
+        assert r.expect(200,'GET','/v1/inboxes/robot-cli@cli-other/threads?unread=true',agent=watched_agent)['threads']
+        r.expect(200,'POST','/v1/inboxes/robot-cli@cli-other/threads/'+mail['thread_id']+'/read',{},agent=watched_agent)
+        r.expect(200,'POST','/v1/hosted/tokens/'+watched_agent['id']+'/revoke',{},human=nate)
+        failed=subprocess.run(watch+['--quiet'],capture_output=True,text=True,env=environment,cwd=ROOT.parent,timeout=5)
+        assert failed.returncode==1 and json.loads(failed.stdout)['errors'][0]['project']=='cli-other', (failed.stdout,failed.stderr)
+        print('PASS multi-project CLI watch, global deadline, quiet timeout, identity filtering, unchanged receipts and visible authentication failures',flush=True)
+
+    r.expect(200,'POST','/v1/hosted/registrars/'+registrar['id']+'/revoke',{},human=nate)
+    r.expect(401,'GET','/v1/hosted/registration',headers=rh)
+    r.expect(401,'GET','/v1/projects',agent=auto)
+    persistent_registrar=r.expect(201,'POST','/v1/hosted/registrars',{},human=nate)
+    persistent_headers={'Authorization':'Bearer '+persistent_registrar['token']}
+    print('PASS autonomous enrollment, owner binding, registrar isolation, private CLI credentials, concurrent registration, and cascading revocation',flush=True)
+
     assert [p['slug'] for p in r.expect(200,'GET','/v1/projects',agent=a)['projects']]==['harbor']
     for path in ['/v1/projects/private/threads','/v1/inboxes/claude-josh@harbor/threads']:
         r.expect(403,'GET',path,agent=a)
@@ -218,6 +308,7 @@ def run(runtime):
     r.start()
     r.expect(401,'GET','/v1/projects',agent=a)
     r.expect(401,'GET','/v1/hosted/me',human=nate)
+    r.expect(401,'GET','/v1/hosted/registration',headers=persistent_headers)
     r.expect(200,'GET','/v1/hosted/me',human=josh)
     r.stop()
     inspected=False
@@ -228,6 +319,7 @@ def run(runtime):
             assert db.execute('SELECT complete,body FROM hosted_welcome').fetchone()==(1,None)
             assert db.execute('SELECT count(*) FROM hosted_members').fetchone()[0]==2
             assert all(len(row[0])==64 and not row[0].startswith('ain_') for row in db.execute('SELECT digest FROM hosted_tokens'))
+            assert all(len(row[0])==64 for row in db.execute('SELECT digest FROM hosted_registrars'))
             assert db.execute("SELECT COUNT(*) FROM reservations WHERE path='src/free.py'").fetchone()[0]==0
     assert inspected,'The real Durable Object SQLite database was not found'
     print('PASS restart durability, welcome content deletion, hashed keys, and persisted rollback evidence',flush=True)

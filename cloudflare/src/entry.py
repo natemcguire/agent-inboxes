@@ -23,9 +23,9 @@ SECURITY = {'Cache-Control':'no-store', 'X-Content-Type-Options':'nosniff',
     'Content-Security-Policy':"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"}
 
 
-def response(data, status=200, content_type='application/json; charset=utf-8'):
+def response(data, status=200, content_type='application/json; charset=utf-8', headers=None):
     return Response(json.dumps(data) if isinstance(data, dict) else data,
-        status=status, headers={**SECURITY, 'Content-Type':content_type})
+        status=status, headers={**SECURITY, 'Content-Type':content_type, **(headers or {})})
 
 
 class Abort(Exception):
@@ -92,6 +92,9 @@ class Workspace(DurableObject):
                 status, result = dispatch(db, principal, request.method, request.url, headers, body, self.env, peer)
                 if status >= 400 or db.rolled_back:
                     raise Abort(response(result, status if status >= 400 else 500))
+                if path == '/v1/hosted/registration/setup' and request.method == 'POST':
+                    cookie = '__TOKEN__; Path=/v1/hosted/registration/setup; HttpOnly; Secure; SameSite=Strict; Max-Age=315360000'
+                    return response(result, status, headers={'Set-Cookie': 'ain_registration=' + cookie.replace('__TOKEN__', result['token'])})
                 return response(result, status)
             except InboxError as exc:
                 raise Abort(response(exc.to_dict(), exc.status_code))
@@ -115,7 +118,7 @@ class Default(WorkerEntrypoint):
             return response({'error': {'code':'forbidden','message':'Use this workspace origin'}},403)
         email = await member(request, self.env)
         authorization = request.headers.get('Authorization') or ''
-        if not email and not authorization.startswith('Bearer ain_'):
+        if not email and not authorization.startswith(('Bearer ain_', 'Bearer ainr_')):
             return response({'error': {'code':'unauthorized','message':'Sign in or supply an agent key'}},401)
         # Always replace client-supplied identity/provenance before forwarding.
         forwarded = JSHeaders.new(request.js_object.headers)

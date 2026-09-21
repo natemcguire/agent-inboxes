@@ -1,6 +1,11 @@
 """HTTP client library for Agent Inboxes communicating over loopback."""
 
+import hashlib
 import json
+import shlex
+import sys
+import tempfile
+import time
 import os
 from pathlib import Path
 import urllib.error
@@ -10,8 +15,9 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from agent_inbox import __version__
-from agent_inbox.config import get_server_url
+from agent_inbox.config import get_data_dir, get_server_url
 from agent_inbox.models import (
+    normalize_slug,
     ConflictError,
     InboxError,
     NotFoundError,
@@ -29,7 +35,8 @@ class InboxClient:
     """Client for interacting with local Agent Inboxes service via HTTP."""
 
     def __init__(self, base_url: Optional[str] = None, session_id: Optional[str] = None,
-                 timeout: Optional[float] = None, repo_key: Optional[str] = None):
+                 timeout: Optional[float] = None, repo_key: Optional[str] = None,
+                 token: Optional[str] = None):
         self.base_url = (base_url or get_server_url()).rstrip("/")
         # Default per-request timeout; explicit per-call timeouts still win.
         self.default_timeout = timeout
@@ -41,8 +48,8 @@ class InboxClient:
         # same-basename repos don't cross-conflict on file reservations.
         self.repo_key = repo_key
         self.address = None
-        self.token = os.environ.get('AGENT_INBOX_TOKEN', '').strip()
-        if not self.token and os.environ.get('AGENT_INBOX_TOKEN_FILE'):
+        self.token = token if token is not None else os.environ.get('AGENT_INBOX_TOKEN', '').strip()
+        if token is None and not self.token and os.environ.get('AGENT_INBOX_TOKEN_FILE'):
             self.token = Path(os.environ['AGENT_INBOX_TOKEN_FILE']).expanduser().read_text().strip()
         if self.token:
             endpoint = urllib.parse.urlsplit(self.base_url)
@@ -268,7 +275,7 @@ class InboxClient:
         """Long-poll for new unread mail. Blocks up to ``timeout`` seconds
         (server clamps to 0–300) and returns the watch state either way."""
         encoded_addr = urllib.parse.quote(address, safe="@")
-        query: Dict[str, Any] = {"timeout": int(timeout)}
+        query: Dict[str, Any] = {"timeout": float(timeout)}
         if after is not None:
             query["after"] = int(after)
         return self._request(
@@ -391,3 +398,208 @@ class InboxClient:
         """Mark every email in thread as read for the inbox."""
         encoded_addr = urllib.parse.quote(address, safe="@")
         return self._request("POST", f"/v1/inboxes/{encoded_addr}/threads/{thread_id}/read")
+
+
+# One-time owner setup and unattended hosted agent registration.
+HOSTED_DEFAULT_URL = 'https://inbox.eastbayprojects.com'
+
+
+def hosted_origin(value):
+    url = urllib.parse.urlsplit(value)
+    if (url.username or url.password or url.query or url.fragment or url.path not in ('', '/')
+            or not url.hostname or (url.scheme != 'https' and not
+            (url.scheme == 'http' and url.hostname in ('localhost', '127.0.0.1', '::1')))):
+        raise ValueError('Use a workspace HTTPS origin without a path, credentials, query, or fragment')
+    return value.rstrip('/')
+
+
+def hosted_request(url, token, method, path, body=None):
+    req = urllib.request.Request(hosted_origin(url) + path, method=method,
+        headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json',
+                 'User-Agent': 'agent-inboxes/' + __version__},
+        data=json.dumps(body).encode() if body is not None else None)
+    try:
+        with urllib.request.build_opener(NoCredentialRedirect()).open(req, timeout=20) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        # Never echo credentials, redirect destinations, or server HTML.
+        message = 'Hosted request failed (HTTP %s)' % exc.code
+        try:
+            message += ': ' + json.load(exc)['error']['message']
+        except (ValueError, KeyError, TypeError):
+            pass
+        raise ValueError(message) from None
+
+
+def save_hosted_credentials(path, value):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as file:
+            json.dump(value, file)
+            file.write('\n')
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def add_hosted_parser(subparsers):
+    parser = subparsers.add_parser('hosted', help='One-time owner setup and autonomous agent registration')
+    commands = parser.add_subparsers(dest='hosted_action', required=True)
+    login = commands.add_parser('login', help='Save owner registration access once for agents on this machine')
+    login.add_argument('--url', default=HOSTED_DEFAULT_URL)
+    login.add_argument('--credential-stdin', action='store_true', required=True)
+    register = commands.add_parser('register', help='Register an agent using saved owner access; print shell exports')
+    register.add_argument('--url', default=HOSTED_DEFAULT_URL)
+    register.add_argument('--project', required=True)
+    register.add_argument('--agent', required=True)
+    register.add_argument('--label')
+    status = commands.add_parser('status', help='Check saved owner registration access')
+    status.add_argument('--url', default=HOSTED_DEFAULT_URL)
+
+
+def run_hosted(args):
+    import fcntl
+
+    try:
+        url = hosted_origin(args.url)
+        directory = get_data_dir() / 'hosted' / hashlib.sha256(url.encode()).hexdigest()[:24]
+        config = directory / 'registration.json'
+        if args.hosted_action == 'login':
+            token = sys.stdin.read().strip()
+            if not token.startswith('ainr_') or len(token) > 200:
+                raise ValueError('Expected an owner registration credential (ainr_) from Connect an agent')
+            data = hosted_request(url, token, 'GET', '/v1/hosted/registration')
+            save_hosted_credentials(config, {'url': url, 'token': token, **data})
+            print('Registration access saved for %s at %s. Agents can now run hosted register.' % (data['owner'], url))
+            return 0
+        if not config.exists():
+            raise ValueError('One-time setup required: sign in to %s, open Connect an agent, and run its setup command.' % url)
+        owner = json.loads(config.read_text())
+        if args.hosted_action == 'status':
+            data = hosted_request(url, owner['token'], 'GET', '/v1/hosted/registration')
+            print(json.dumps(data, indent=2))
+            return 0
+        project, family = normalize_slug(args.project), normalize_slug(args.agent)
+        cache = directory / (hashlib.sha256((project + '/' + family).encode()).hexdigest() + '.json')
+        # Serialize agents registering the same family across concurrent terminals.
+        fd = os.open(directory / 'register.lock', os.O_CREAT | os.O_RDWR, 0o600)
+        with os.fdopen(fd, 'w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            data = json.loads(cache.read_text()) if cache.exists() else None
+            if data and data.get('owner') != owner.get('owner'):
+                data = None
+            if data and data['expires_at'] > time.time():
+                hosted_request(url, data['token'], 'GET', '/v1/hosted/health')
+            else:
+                pending = cache.with_suffix('.pending')
+                if pending.exists():
+                    enrollment = json.loads(pending.read_text())
+                else:
+                    enrollment = {'registration_id': uuid.uuid4().hex}
+                    save_hosted_credentials(pending, enrollment)
+                data = hosted_request(url, owner['token'], 'POST', '/v1/hosted/register',
+                    {'project': project, 'family': family, 'label': args.label or family, **enrollment})
+                save_hosted_credentials(cache, data)
+                pending.unlink(missing_ok=True)
+            token_file = cache.with_suffix('.token')
+            fd, name = tempfile.mkstemp(dir=directory)
+            try:
+                with os.fdopen(fd, 'w') as file:
+                    file.write(data['token'] + '\n')
+                os.replace(name, token_file)
+            finally:
+                if os.path.exists(name):
+                    os.unlink(name)
+        print('unset AGENT_INBOX_TOKEN')
+        for key, value in {'URL': url, 'TOKEN_FILE': str(token_file), 'PROJECT': project, 'AGENT': family}.items():
+            print('export AGENT_INBOX_%s=%s' % (key, shlex.quote(value)))
+        return 0
+    except (ValueError, OSError, KeyError) as exc:
+        print('Error: %s' % exc, file=sys.stderr)
+        return 1
+
+
+def configured_hosted_watches(url, agent, session):
+    """Load only this agent's saved project keys, without mutating process env."""
+    import re
+    url = hosted_origin(url)
+    agent = normalize_slug(agent)
+    family = re.sub(r'-[0-9]+$', '', agent)
+    directory = get_data_dir() / 'hosted' / hashlib.sha256(url.encode()).hexdigest()[:24]
+    targets = []
+    for path in sorted(directory.glob('*.json')):
+        if path.name == 'registration.json':
+            continue
+        data = json.loads(path.read_text())
+        if data.get('family') != family:
+            continue
+        project = data.get('project')
+        if not project or project != normalize_slug(project) or not data.get('token', '').startswith('ain_'):
+            raise ValueError('Invalid saved hosted registration: ' + path.name)
+        if data.get('expires_at', 0) <= time.time():
+            raise ValueError('Saved key expired for %s@%s; run hosted register for that project first' % (family, project))
+        client = InboxClient(url, session_id=session, token=data['token'])
+        client.address = agent + '@' + project
+        targets.append({'client': client, 'address': client.address, 'project': project})
+    if not targets:
+        raise ValueError('No saved hosted projects for %s at %s. Run hosted register for each project first.' % (agent, url))
+    if len(targets) > 100:
+        raise ValueError('At most 100 configured projects can be watched at once')
+    return targets
+
+
+def watch_many(targets, timeout):
+    """One bounded long-poll per inbox; first mail/error ends the global wait.
+
+    Daemon workers let a one-shot CLI exit immediately without waiting for
+    unrelated HTTP long-polls. No background process or persisted cursor is
+    created. Unread mail remains unread until explicitly read by the caller.
+    """
+    import math
+    import queue
+    import threading
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError('Watch timeout must be a positive finite number')
+    deadline = time.monotonic() + timeout
+    results = queue.Queue()
+    stop = threading.Event()
+
+    def poll(target):
+        metadata = {k: target[k] for k in ('project', 'address')}
+        try:
+            while not stop.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                result = target['client'].watch(target['address'], timeout=min(60.0, remaining))
+                if result.get('changed'):
+                    results.put(('mail', {**metadata, **result}))
+                    return
+        except Exception as exc:
+            # Include the project in failures; never mistake an inaccessible
+            # inbox for an empty inbox or expose a credential in the error.
+            message = exc.message if isinstance(exc, InboxError) else str(exc)
+            results.put(('error', {**metadata, 'message': message}))
+
+    for target in targets:
+        threading.Thread(target=poll, args=(target,), daemon=True, name='inbox-watch-' + target['project']).start()
+    mail, errors = [], []
+    try:
+        try:
+            kind, result = results.get(timeout=max(0, deadline - time.monotonic()))
+            (mail if kind == 'mail' else errors).append(result)
+        except queue.Empty:
+            pass
+        # Include any other projects whose responses have already arrived.
+        while True:
+            try:
+                kind, result = results.get_nowait()
+                (mail if kind == 'mail' else errors).append(result)
+            except queue.Empty:
+                break
+    finally:
+        stop.set()
+    return {'changed': bool(mail), 'projects': sorted(mail, key=lambda x: x['project']),
+            'errors': sorted(errors, key=lambda x: x['project']), 'watched': len(targets)}

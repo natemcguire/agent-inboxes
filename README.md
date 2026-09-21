@@ -119,7 +119,7 @@ Retry an unchanged send/reply with the same key to avoid duplicate messages.
 
 ## Task management
 
-Keep PRD, epic and acceptance links from your kanban board or Jira in the task
+Keep PRD, epic and acceptance links from your kanban board in the task
 `description`. The built-in AE task queue records agent ownership and handoffs;
 external tracker updates are manual.
 
