@@ -95,3 +95,33 @@ Public exceptions are authentication pages, bundled static distribution files,
 and minimal operational health/configuration flags with no keys, account IDs or
 customer data. They do not authorize product use. Fresh passkey enrollment and
 new third-party invitations were not performed on production during validation.
+
+## Final protected release and historical URLs
+
+The Suite guarded release completed from `600ce2eb` at
+`https://052a4386.nates-software.pages.dev`, including 103 tests, production
+build, migration checks, private admission checks, native CLI distribution
+checks and live payment/drain configuration verification. The operational
+configuration exception is exact GET/HEAD only; application APIs stay private.
+
+Retired 494 superseded Pages deployment artifacts without deleting D1 data,
+R2 files or Git history. A complete HTTP audit found 492 returning 404, one
+already protected preview returning 401, and one provider-retained hostname
+still serving old code despite successful deletion. That exact hostname,
+`f831fff3.nates-software.pages.dev`, now has an account Bulk Redirect (308) to
+the canonical protected site, preserving path/query. Following its old API URL
+returns 401. No Cloudflare Access app was introduced.
+
+Redirect list: `1170b7eec46d443490db31b3a1b74c42`.
+Redirect rule: `8b9da72e5e8e4ab0b52c53be8ec93308` in ruleset
+`eb7294dccbce4180accc3c1449deafa5`. It matches only the retired exact hostname.
+Current and future deployment hosts are unaffected. The provider's matching
+known issue is https://github.com/cloudflare/developer-platform/issues/67.
+Private retirement inventory/evidence lives under
+`~/.local/state/nates-sso-migration/`; private pre-migration Inbox Access and
+hub database backups also reside in this repository's ignored
+`.agent-inboxes/migration-backups/2026-09-27/` directory.
+
+Auth, View and Share workers.dev and version-preview URLs are explicitly
+turned off. Inbox and Tasks already disable these URLs. Future releases must
+retain the SSO gate; never restore an old pre-tenancy deployment to production.
