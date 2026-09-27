@@ -74,8 +74,8 @@ async def route(request, env):
     path = url.path
     origin = f'{url.scheme}://{url.netloc}'
     if path == '/auth/signed-out' and request.method == 'GET':
-        return Response('<!doctype html><meta charset="utf-8"><title>Signed out · Agent Inbox</title><p>You are signed out of Agent Inbox.</p><a href="/auth/login">Sign in with Nate’s SSO</a>',
-            headers={**HEADERS, 'Content-Type':'text/html; charset=utf-8'})
+        return Response('', status=302, headers={**HEADERS, 'Location':
+            getattr(env, 'SSO_ORIGIN', 'https://auth.nates-software.com').rstrip('/') + '/signed-out'})
     if path == '/auth/login' and request.method == 'GET':
         state = secrets.token_urlsafe(32)
         location = getattr(env, 'SSO_ORIGIN', 'https://auth.nates-software.com').rstrip('/') + '/authorize?' + urlencode({
@@ -107,6 +107,12 @@ async def route(request, env):
         except Exception:
             return Response('{"error":"Sign-in failed or access denied"}', status=401, headers=HEADERS)
     if path == '/auth/logout' and request.method == 'POST':
+        token = cookie(request, COOKIE)
+        if token:
+            result = await hub(env, '/session/logout', {'token': token, 'audience': audience(env)})
+            if not result or result.get('ok') is not True:
+                return Response('{"error":{"message":"Could not sign out of all products. Please try again."}}',
+                    status=503, headers={**HEADERS, 'Content-Type':'application/json'})
         return Response('{"ok":true}', headers={**HEADERS, 'Content-Type':'application/json',
             'Set-Cookie': f'{COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0'})
     return None

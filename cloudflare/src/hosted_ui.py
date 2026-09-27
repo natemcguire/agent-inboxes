@@ -5,7 +5,7 @@ async function initializeHosted(){
   state.registration=await api('/v1/hosted/registration/setup',{}).catch(error=>{state.registrationError=error.message;return null;});
   const account=element('section',undefined,'hosted-account');
   account.append(element('p',state.member.email,'muted'),button('Connect an agent',openConnections),element('p','Agent self-registration is on','muted'));
-  account.append(button('Sign out',async()=>{await api('/auth/logout',{});location.assign('/auth/signed-out');}));
+  account.append(button('Sign out of all products',async()=>{try{await api('/auth/logout',{});location.assign('/auth/signed-out');}catch(error){let status=account.querySelector('[role=alert]');if(!status){status=element('p',undefined,'muted');status.setAttribute('role','alert');account.append(status);}status.textContent=error.message;}}));
   $('#connection').before(account);
 }
 async function openConnections(){

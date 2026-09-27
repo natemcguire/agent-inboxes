@@ -334,6 +334,22 @@ def run(runtime):
     r.expect(401,'GET','/v1/projects',agent=b)
     print('PASS long polling while another client writes, AE cursor contract, immediate key revocation',flush=True)
 
+    # Browser sign-out must reach the hub, invalidate the prior token, and leave
+    # durable agent credentials usable. A hub rejection must not claim success.
+    logout_token = r.identity.token(nate, jti='logout-contract')
+    logout_headers = {'Cookie':'__Host-ain_session='+logout_token}
+    r.expect(200,'GET','/v1/hosted/me',headers=logout_headers)
+    code,body,headers = r.call('POST','/auth/logout',{},headers=logout_headers)
+    assert code == 200 and body['ok'] is True
+    assert 'Max-Age=0' in headers.get('Set-Cookie', headers.get('set-cookie',''))
+    r.expect(401,'GET','/v1/hosted/me',headers=logout_headers)
+    r.expect(200,'GET','/v1/projects',agent=a)
+    r.expect(503,'POST','/auth/logout',{},headers={'Cookie':'__Host-ain_session=invalid'})
+    r.expect(403,'POST','/auth/logout',{},headers={**logout_headers,'Origin':'https://evil.example'})
+    code,_,headers=r.call('GET','/auth/signed-out')
+    assert code == 302 and headers.get('Location',headers.get('location')) == r.hub_url+'/signed-out'
+    print('PASS global browser logout, agent credential independence, and logout failure handling',flush=True)
+
     r.stop();r.start()
     persisted=r.expect(200,'GET',f"/v1/projects/harbor/threads/{first['thread_id']}",human=nate)
     assert len(persisted['emails'])==3
