@@ -59,6 +59,10 @@
     {
       "pattern": "inbox.eastbayprojects.com",
       "custom_domain": true
+    },
+    {
+      "pattern": "inbox.nates-software.com/*",
+      "zone_name": "nates-software.com"
     }
   ]
 }
