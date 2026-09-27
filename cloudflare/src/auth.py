@@ -73,6 +73,9 @@ async def route(request, env):
     url = urlsplit(request.url)
     path = url.path
     origin = f'{url.scheme}://{url.netloc}'
+    if path == '/auth/signed-out' and request.method == 'GET':
+        return Response('<!doctype html><meta charset="utf-8"><title>Signed out · Agent Inbox</title><p>You are signed out of Agent Inbox.</p><a href="/auth/login">Sign in with Nate’s SSO</a>',
+            headers={**HEADERS, 'Content-Type':'text/html; charset=utf-8'})
     if path == '/auth/login' and request.method == 'GET':
         state = secrets.token_urlsafe(32)
         location = getattr(env, 'SSO_ORIGIN', 'https://auth.nates-software.com').rstrip('/') + '/authorize?' + urlencode({

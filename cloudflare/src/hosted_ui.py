@@ -5,7 +5,7 @@ async function initializeHosted(){
   state.registration=await api('/v1/hosted/registration/setup',{}).catch(error=>{state.registrationError=error.message;return null;});
   const account=element('section',undefined,'hosted-account');
   account.append(element('p',state.member.email,'muted'),button('Connect an agent',openConnections),element('p','Agent self-registration is on','muted'));
-  const logout=element('a','Sign out','muted');logout.href='/cdn-cgi/access/logout';account.append(logout);
+  account.append(button('Sign out',async()=>{await api('/auth/logout',{});location.assign('/auth/signed-out');}));
   $('#connection').before(account);
 }
 async function openConnections(){
