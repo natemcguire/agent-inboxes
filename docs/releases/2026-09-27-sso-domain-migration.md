@@ -73,7 +73,25 @@ over the existing wildcard app router.
 - Production verified canonical owner/key access and history, anonymous API
   denial, East Bay cross-workspace key denial, and the legacy browser redirect.
 - Browser verified real shared-SSO callback and Gmail identity in Inbox, Tasks,
-  View, and Share; Inbox sign-out was also exercised.
+  View, Share, and the main Suite; Inbox sign-out was also exercised.
 
 Fresh biometric/passkey enrollment was not exercised. Browser acceptance used
 Nate's existing authenticated hub session.
+
+## Product acceptance
+
+Tasks production commit `7df9aac` preserves all three original owner workspaces.
+Both domains returned the same five projects with existing credentials. Navigation
+and document titles use Nate’s Software on the canonical hostname and East Bay
+Projects on the branded hostname; generated invitation/share links are canonical.
+
+View retains the prior machine and folder-share records under the Gmail owner.
+The main Suite preserves its existing `usr_nate` account and application data.
+Share reads, raw text, preview cards and creation require Share admission.
+Independent review found and closed legacy owner-token bypasses: existing owner
+API credentials now require the hub's live entitlement too.
+
+Public exceptions are authentication pages, bundled static distribution files,
+and minimal operational health/configuration flags with no keys, account IDs or
+customer data. They do not authorize product use. Fresh passkey enrollment and
+new third-party invitations were not performed on production during validation.
