@@ -125,3 +125,7 @@ hub database backups also reside in this repository's ignored
 Auth, View and Share workers.dev and version-preview URLs are explicitly
 turned off. Inbox and Tasks already disable these URLs. Future releases must
 retain the SSO gate; never restore an old pre-tenancy deployment to production.
+
+After the final guarded promotion, the two safe intermediate Pages deployments
+were also retired. Total retirement: 496 superseded artifacts. The Pages project
+now lists only production `052a4386-eecb-4fa0-af75-f45d55cb1f45`.
