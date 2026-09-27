@@ -91,7 +91,7 @@ Share reads, raw text, preview cards and creation require Share admission.
 Independent review found and closed legacy owner-token bypasses: existing owner
 API credentials now require the hub's live entitlement too.
 
-Public exceptions are authentication pages, bundled static distribution files,
+Public exceptions are the data-free guest desktop, authentication pages, bundled static distribution files,
 and minimal operational health/configuration flags with no keys, account IDs or
 customer data. They do not authorize product use. Fresh passkey enrollment and
 new third-party invitations were not performed on production during validation.
@@ -129,3 +129,61 @@ retain the SSO gate; never restore an old pre-tenancy deployment to production.
 After the final guarded promotion, the two safe intermediate Pages deployments
 were also retired. Total retirement: 496 superseded artifacts. The Pages project
 now lists only production `052a4386-eecb-4fa0-af75-f45d55cb1f45`.
+
+
+## Design and global sign-out follow-up
+
+The organization admin now has a searchable member list, explicit active/revoked
+filters, product catalog, and invite/edit drawer. Destructive access changes have
+a confirmation step. Invitation copy explains that saving access does not send
+email. Layouts were exercised at desktop and 390px widths using isolated fixture
+members; production membership still contains only the owner.
+
+The suite root now renders a public desktop with app shortcuts while signed out.
+No personal catalog or account data is fetched for this shell. Protected APIs
+still reject anonymous requests. Share has a redesigned composer, examples,
+attribution guidance, reader actions and clear My text/Saved empty states.
+
+Global logout uses a hub browser-session generation and deletes previous hub
+sessions. Product browser tokens check this generation during live introspection.
+A valid signed expired token may end its old generation but cannot invalidate a
+newer login by replay. Browser logout leaves separately issued agent/service
+credentials intact; those still require live owner membership/product access.
+Each product must successfully call the hub before reporting global logout,
+then clear its local cookie and navigate to the hub’s signed-out page.
+
+- Auth: `3dcd34d`, Worker `1cdd1a92-228a-4836-a9d2-bd209e11ae96`, includes
+  admin design commits `2e4da1d`, `6d84c0f`, `26f0b8c`; migration `0003` applied.
+- Inbox: `a690225`, Worker `c6b3cde6-1766-45dc-942e-ecbaee318401`.
+- Tasks: `9c71701`, Worker `a860371a-fb0c-44fb-9be3-c7a49d24c347`.
+- Suite: `97bd2393`, Pages production `dc254125.nates-software.pages.dev`.
+- Share: `eea91c5`, Worker `639cf831-1f49-477f-aa9b-b5364535ce64`.
+
+Validation: 6 hub security tests, 130 Tasks tests, 104 suite release checks,
+Share TypeScript/build and auth regressions, and the real Inbox Worker/Durable
+Object integration suite passed. Inbox coverage includes global logout,
+unchanged agent credentials, rejected cross-origin sign-out and retryable hub
+failure. Global machine documentation now describes these semantics.
+
+
+View follow-up: commit `be42774`, Worker
+`0608e01a-de22-45c2-9d59-a8be73cad045`. The white wide-screen dashboard separates
+Shared by me, Shared with me, and Computers. Received folders require an explicit
+matching email grant and exclude owned/revoked folders. Existing schema, IDs,
+URLs, files, and grants are preserved. TypeScript and 12 View tests passed.
+
+Live browser verification saw the redesigned admin with only the Gmail owner,
+and the Inbox owner session with the new global sign-out control. Clicking
+Inbox’s sign-out successfully redirected to the hub signed-out URL. A subsequent
+read-only production D1 check confirmed owner browser generation `2` and zero
+remaining hub sessions. This invalidates the previous generation’s product tokens
+and prevents silent reauthentication through an old hub session. The hosted agent
+credential remained usable for coordination afterward.
+
+Chrome began returning `ERR_BLOCKED_BY_CLIENT` on product navigation, including
+the hub’s signed-out page. This prevented final visual verification of the
+post-logout pages in that browser. It is distinct from an application authorization
+response; no access policies were weakened to work around it. Tasks had passed
+fresh canonical Chrome SSO checks earlier in this follow-up, with original five
+projects visible. The user’s original denial was not reproduced as an application
+error.
