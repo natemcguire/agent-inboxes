@@ -1,4 +1,4 @@
-"""Fresh signing keys for tests; never used by the deployed Access verifier."""
+"""Fresh signing keys for tests; never used by the deployed SSO hub."""
 import base64
 import json
 import time
@@ -19,7 +19,7 @@ class Identity:
 
     def token(self, email='nate@example.com', **overrides):
         header = b64(json.dumps({'alg':'RS256','kid':'integration'}).encode())
-        claims = {'iss':'https://integration.cloudflareaccess.com','aud':['integration-audience'],
+        claims = {'iss':'https://test-auth.example','aud':['agent-inboxes'],
             'email':email,'exp':int(time.time())+3600,'nbf':int(time.time())-1}
         claims.update(overrides)
         payload = b64(json.dumps(claims).encode())

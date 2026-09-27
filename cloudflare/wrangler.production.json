@@ -1,0 +1,64 @@
+{
+  "name": "agent-inboxes",
+  "main": "src/entry.py",
+  "compatibility_date": "2026-09-15",
+  "compatibility_flags": [
+    "python_workers"
+  ],
+  "workers_dev": false,
+  "preview_urls": false,
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "WORKSPACES",
+        "class_name": "Workspace"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "Workspace"
+      ]
+    }
+  ],
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "WORKSPACE": "eastbayprojects",
+    "WORKSPACE_NAME": "Nate\u2019s Software",
+    "MEMBERS": "nate.mcguire@gmail.com",
+    "SSO_ORIGIN": "https://auth.nates-software.com",
+    "SSO_APP_ID": "agent-inboxes",
+    "SSO_TENANT_ID": "nates-software",
+    "OWNER_EMAIL": "nate.mcguire@gmail.com",
+    "LEGACY_OWNER_EMAIL": "nate@eastbayprojects.com",
+    "WORKSPACE_HOSTS": "{\"inbox.nates-software.com\": \"eastbayprojects\", \"inbox.eastbayprojects.com\": \"eastbayprojects\", \"inboxes.eastbayprojects.com\": \"eastbayprojects-branded\"}"
+  },
+  "build": {
+    "command": "python3 build.py"
+  },
+  "services": [
+    {
+      "binding": "AUTH_HUB",
+      "service": "auth"
+    }
+  ],
+  "account_id": "4219a576830c72b0e6e4ca358e61473a",
+  "routes": [
+    {
+      "pattern": "inbox.nates-software.com",
+      "custom_domain": true
+    },
+    {
+      "pattern": "inboxes.eastbayprojects.com",
+      "custom_domain": true
+    },
+    {
+      "pattern": "inbox.eastbayprojects.com",
+      "custom_domain": true
+    }
+  ]
+}

@@ -29,11 +29,18 @@
   "vars": {
     "WORKSPACE": "team",
     "WORKSPACE_NAME": "Your workspace",
-    "ACCESS_DOMAIN": "your-team.cloudflareaccess.com",
-    "ACCESS_AUD": "",
-    "MEMBERS": ""
+    "MEMBERS": "nate.mcguire@gmail.com",
+    "SSO_ORIGIN": "https://auth.nates-software.com",
+    "SSO_APP_ID": "agent-inboxes",
+    "SSO_TENANT_ID": "nates-software"
   },
   "build": {
     "command": "python3 build.py"
-  }
+  },
+  "services": [
+    {
+      "binding": "AUTH_HUB",
+      "service": "auth"
+    }
+  ]
 }

@@ -40,9 +40,17 @@ class Runtime:
         self.url = f'http://127.0.0.1:{self.port}'
         config = json.loads((ROOT/'wrangler.jsonc').read_text())
         config.pop('routes',None)
-        variables = dict(config['vars'], ACCESS_DOMAIN='integration.cloudflareaccess.com', ACCESS_AUD='integration-audience', MEMBERS='nate@example.com,josh@example.com', ACCESS_JWKS=json.dumps(self.identity.jwks), WORKSPACE='integration-'+uuid.uuid4().hex)
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1',0))
+            self.hub_port = sock.getsockname()[1]
+        self.hub_url = f'http://127.0.0.1:{self.hub_port}'
+        self.hub_name = 'auth-test-' + uuid.uuid4().hex[:8]
+        self.hub_config = ROOT/('wrangler.'+self.hub_name+'.local.json')
+        self.hub_config.write_text(json.dumps({'name':self.hub_name,'main':'tests/auth_hub.js','compatibility_date':'2026-09-15','vars':{'JWKS':json.dumps(self.identity.jwks)}}))
+        self.hub_process = None
+        variables = dict(config['vars'], SSO_ORIGIN=self.hub_url, MEMBERS='nate@example.com,josh@example.com', WORKSPACE='integration-'+uuid.uuid4().hex)
         self.environment='integration-'+uuid.uuid4().hex[:8]
-        config['env'] = {self.environment: {'vars': variables, 'durable_objects': config['durable_objects']}}
+        config['env'] = {self.environment: {'vars': variables, 'durable_objects': config['durable_objects'], 'services':[{'binding':'AUTH_HUB','service':self.hub_name}]}}
         self.config = ROOT/('wrangler.'+self.environment+'.local.json')
         self.config.write_text(json.dumps(config))
         # An environment-specific empty dotenv prevents the developer's .dev.vars
@@ -55,6 +63,15 @@ class Runtime:
         self.opener = urllib.request.build_opener(NoRedirect())
 
     def start(self):
+        if not self.hub_process:
+            self.hub_process = subprocess.Popen(['npx','wrangler','dev','--config',str(self.hub_config),'--port',str(self.hub_port)],cwd=ROOT,stdout=self.log,stderr=subprocess.STDOUT,start_new_session=True)
+            deadline = time.monotonic()+30
+            while time.monotonic() < deadline:
+                try:
+                    urllib.request.urlopen(self.hub_url, timeout=1).close()
+                    break
+                except OSError:
+                    time.sleep(.2)
         self.process = subprocess.Popen(['npm','run','dev','--','--config',str(self.config),'--env',self.environment,'--port',str(self.port),'--persist-to',str(self.directory/'state')],cwd=ROOT,stdout=self.log,stderr=subprocess.STDOUT,start_new_session=True)
         deadline = time.monotonic()+45
         while time.monotonic() < deadline:
@@ -79,6 +96,10 @@ class Runtime:
 
     def close(self):
         self.stop()
+        if self.hub_process and self.hub_process.poll() is None:
+            os.killpg(self.hub_process.pid,signal.SIGTERM)
+            self.hub_process.wait(timeout=10)
+        self.hub_config.unlink(missing_ok=True)
         self.config.unlink(missing_ok=True)
         if self.previous is None:self.dotenv.unlink(missing_ok=True)
         else:self.dotenv.write_bytes(self.previous)
@@ -86,10 +107,14 @@ class Runtime:
 
     def call(self, method, path, body=None, human=None, agent=None, session='terminal-1', headers=None, key=None):
         h = {'Content-Type':'application/json'}
-        if human:h['Cf-Access-Jwt-Assertion'] = self.identity.token(human)
+        if human:h['Cookie'] = '__Host-ain_session=' + self.identity.token(human)
         if agent:h.update({'Authorization':'Bearer '+agent['token'],'X-Agent-Session':session,'X-Agent-Address':agent['address']})
         if key:h['Idempotency-Key'] = key
-        if headers:h.update(headers)
+        if headers:
+            prior_cookie = h.get('Cookie')
+            h.update(headers)
+            if prior_cookie and headers.get('Cookie'):
+                h['Cookie'] = prior_cookie + '; ' + headers['Cookie']
         request=urllib.request.Request(self.url+path,method=method,headers=h,data=json.dumps(body).encode() if body is not None else None)
         try:result=self.opener.open(request,timeout=10)
         except urllib.error.HTTPError as exc:result=exc
@@ -109,12 +134,12 @@ def run(runtime):
     r=runtime
     nate,josh='nate@example.com','josh@example.com'
     for identity in [r.identity.token('stranger@example.com'),r.identity.token(nate,exp=0),r.identity.token(nate,aud=['wrong']),r.identity.token(nate,iss='https://evil.example')]:
-        r.expect(401,'GET','/v1/hosted/me',headers={'Cf-Access-Jwt-Assertion':identity})
+        r.expect(401,'GET','/v1/hosted/me',headers={'Cookie':'__Host-ain_session='+identity})
     good = r.identity.token(nate)
     parts=good.split('.');parts[-1]=parts[-1][:-8]+'AAAAAAAA'
-    r.expect(401,'GET','/v1/hosted/me',headers={'Cf-Access-Jwt-Assertion':'.'.join(parts)})
+    r.expect(401,'GET','/v1/hosted/me',headers={'Cookie':'__Host-ain_session='+'.'.join(parts)})
     r.expect(401,'GET','/v1/hosted/me',headers={'X-Hosted-Member':nate,'Authorization':'Bearer ain_forged'})
-    r.expect(200,'GET','/v1/hosted/me',headers={'Cookie':'CF_Authorization='+good})
+    r.expect(200,'GET','/v1/hosted/me',headers={'Cookie':'__Host-ain_session='+good})
     assert 'One place to follow' in r.expect(200,'GET','/welcome',human=nate)
     r.expect(200,'GET','/',human=nate)
     assert 'One place to follow' in r.expect(200,'GET','/welcome',human=nate)
@@ -122,6 +147,19 @@ def run(runtime):
     a = r.expect(201,'POST','/v1/hosted/tokens',{'project':'harbor','family':'codex-nate'},human=nate)
     b = r.expect(201,'POST','/v1/hosted/tokens',{'project':'harbor','family':'claude-josh'},human=josh)
     private = r.expect(201,'POST','/v1/hosted/tokens',{'project':'private','family':'reviewer'},human=josh)
+    # A valid stored agent key does not bypass revocation of its human owner.
+    request = urllib.request.Request(r.hub_url+'/test/revoke', method='POST',
+        headers={'Content-Type':'application/json'}, data=json.dumps({'email':josh}).encode())
+    urllib.request.urlopen(request).close()
+    r.expect(401,'GET','/v1/hosted/me',human=josh)
+    r.expect(401,'GET','/v1/projects',agent=b)
+    request = urllib.request.Request(r.hub_url+'/test/restore', method='POST',
+        headers={'Content-Type':'application/json'}, data=json.dumps({'email':josh}).encode())
+    urllib.request.urlopen(request).close()
+    r.expect(200,'GET','/v1/projects',agent=b)
+    r.expect(401,'GET','/v1/hosted/me',headers={'Cf-Access-Jwt-Assertion':good})
+    r.expect(401,'POST','/auth/session',{'token':good,'state':'forged'})
+    print('PASS live product revocation disables browser and scoped agent access; legacy headers and forged login state rejected',flush=True)
     status,_,headers = r.call('GET','/welcome',human=nate)
     assert status==303 and headers['Location']=='/'
     print('PASS signed logins, forged/expired JWTs, CSRF, and automatic welcome retirement',flush=True)
@@ -302,9 +340,9 @@ def run(runtime):
     r.expect(303,'GET','/welcome',human=josh)
     r.expect(401,'GET','/v1/projects',agent=b)
     r.stop()
-    config=json.loads(r.config.read_text())
-    config['env'][r.environment]['vars']['MEMBERS']=josh
-    r.config.write_text(json.dumps(config))
+    request = urllib.request.Request(r.hub_url+'/test/revoke', method='POST',
+        headers={'Content-Type':'application/json'}, data=json.dumps({'email':nate}).encode())
+    urllib.request.urlopen(request).close()
     r.start()
     r.expect(401,'GET','/v1/projects',agent=a)
     r.expect(401,'GET','/v1/hosted/me',human=nate)

@@ -401,7 +401,7 @@ class InboxClient:
 
 
 # One-time owner setup and unattended hosted agent registration.
-HOSTED_DEFAULT_URL = 'https://inbox.eastbayprojects.com'
+HOSTED_DEFAULT_URL = 'https://inbox.nates-software.com'
 
 
 def hosted_origin(value):

@@ -2,41 +2,53 @@
 
 The same Python inbox engine runs in a Worker. One SQLite Durable Object owns
 all messages, task coordination, and file reservations in a workspace.
-Cloudflare Access handles human email login. Agents use revocable keys scoped
-to one project and one agent name (including its numbered session slots).
+Nate's shared SSO at `auth.nates-software.com` handles human login. Access
+requires active membership in the `nates-software` organization and an explicit
+`agent-inboxes` product grant. The organization owner is
+`nate.mcguire@gmail.com`. Invite and grant users through the auth hub admin page.
+Agents use revocable keys scoped to one project and one agent name; every
+request also checks their owner's current SSO entitlement over the private
+`AUTH_HUB` service binding. Removing a product grant disables browser and agent
+access immediately. Cloudflare Access is no longer used.
 
-## Deploy your own
+## Production domains and data
 
-Install Node, Python 3.13+, and [uv](https://docs.astral.sh/uv/). Authenticate
-Wrangler with your Cloudflare account, then:
+- `inbox.nates-software.com`: canonical Inbox, preserving all existing history.
+- `inboxes.eastbayprojects.com`: separate East Bay workspace on the same Worker.
+- `inbox.eastbayprojects.com`: browser redirect to the canonical Inbox; temporary
+  API compatibility for agents during migration. Do not configure new clients here.
+
+One `agent-inboxes` Worker serves all hosts. The canonical workspace retains
+its historical Durable Object key `eastbayprojects`, which is a storage identity,
+not an authorization domain. East Bay uses `eastbayprojects-branded`; it cannot
+read canonical keys or messages. Both require the owner's SSO organization and
+Inbox product grant. The old Nate email's credential ownership is migrated to
+`nate.mcguire@gmail.com`; other users receive no automatic SSO membership.
+
+## Deploy
 
 ```sh
 cd cloudflare
 npm ci
 uv sync
-cd ..
-
-python3 cloudflare/provision.py \
-  --account YOUR_CLOUDFLARE_ACCOUNT_ID \
-  --domain inbox.example.com \
-  --team your-cloudflare-access-team \
-  --workspace your-team \
-  --name 'Your team' \
-  --members 'you@example.com,teammate@example.com'
-
-cd cloudflare
-npm run deploy -- --config wrangler.production.local.json
+npm run deploy -- --config wrangler.production.json
 ```
 
-The provisioning script uses `CLOUDFLARE_API_TOKEN` (Access configuration
-permissions), or `CLOUDFLARE_EMAIL` with `CLOUDFLARE_API_KEY`. It creates an
-email-code login and an explicit member allowlist. Its generated deployment
-configuration stays out of Git. Your domain must already be on that account.
+Deploy the auth hub and its tenancy migration first. The tracked production
+configuration defines the domain routes and private hub service binding. Commit
+verified source before deploying. Workers.dev and preview URLs stay disabled.
 
-The `/v1` Access application delegates authentication to the Worker so agent
-keys work without a browser. **Every API request still requires a verified
-Access JWT or a valid agent key.** The deployment disables `workers.dev` and
-preview URLs. Never remove the Worker's authorization checks.
+For a new workspace, register its product/callback origin in the hub, then:
+
+```sh
+python3 cloudflare/provision.py \
+  --account YOUR_CLOUDFLARE_ACCOUNT_ID \
+  --domain inbox.example.com --workspace your-team --name 'Your team' \
+  --tenant nates-software --app agent-inboxes --owner you@example.com
+```
+
+The generated local configuration contains no login allowlist or bypass policy.
+The hub is the authority for membership and product grants.
 
 ## Register agents after one human sign-in
 
@@ -58,7 +70,7 @@ agent-inbox brief
 
 Use `--url https://inbox.example.com` on `hosted login`, `hosted register`, and
 `hosted status` for another workspace. The default is
-`https://inbox.eastbayprojects.com`. Choose a base agent name without a numeric
+`https://inbox.nates-software.com`. Choose a base agent name without a numeric
 slot suffix. Repeated calls reuse the saved agent key; concurrent terminals
 share that family and claim separate numbered slots. Shell output refers to
 a private token file rather than printing the secret. A revoked key is reported
@@ -73,8 +85,7 @@ Registration credentials (`ainr_`) belong to the authenticated human, work
 across workspace projects, and last until revoked. They can enroll agents but
 cannot read messages, send mail, impersonate humans, list agent secrets, or
 create more registration credentials. Each enrolled connection receives a separate
-90-day project/name-scoped key (`ain_`). Removing the owner from workspace
-membership disables both kinds of access. **Revoke registration access** in
+90-day project/name-scoped key (`ain_`). Removing the owner from SSO membership or their Inbox product grant disables both kinds of access. **Revoke registration access** in
 the dialog disables that credential and every agent key it created. Individual
 agent keys can still be revoked separately.
 

@@ -13,7 +13,7 @@ from agent_inbox.ae import initialize as initialize_ae
 from agent_inbox.models import InboxError
 from agent_inbox.ui import ASSETS
 from api import SCHEMA, authenticate, dispatch
-from auth import member
+from auth import member, owner_allowed, route as auth_route
 from storage import Database
 import onboarding
 import hosted_ui
@@ -33,6 +33,16 @@ class Abort(Exception):
         self.result = result
 
 
+class WorkspaceEnvironment:
+    """Request metadata without changing Worker bindings or durable storage IDs."""
+    def __init__(self, env, workspace):
+        self.env = env
+        self.WORKSPACE = workspace
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
+
+
 class Workspace(DurableObject):
     def __init__(self, ctx, env):
         super().__init__(ctx, env)
@@ -41,11 +51,20 @@ class Workspace(DurableObject):
             init_db(db)
             initialize_ae(db)
             db.executescript(SCHEMA)
+            # Preserve the existing workspace and keys while assigning Nate's
+            # legacy credentials to his canonical SSO account. No other owner
+            # is migrated or granted membership.
+            legacy = getattr(self.env, 'LEGACY_OWNER_EMAIL', '')
+            owner = getattr(self.env, 'OWNER_EMAIL', '')
+            if legacy and owner:
+                for table in ('hosted_tokens', 'hosted_registrars'):
+                    db.execute(f'UPDATE {table} SET owner=? WHERE owner=?', (owner, legacy))
             onboarding.initialize(db, self.env)
         self.ctx.storage.transactionSync(initialize)
 
     async def fetch(self, request):
         path = urlsplit(request.url).path
+        workspace_env = WorkspaceEnvironment(self.env, request.headers.get('X-Hosted-Workspace') or self.env.WORKSPACE)
         email = request.headers.get('X-Hosted-Member') or ''
         token = request.headers.get('Authorization') or ''
         token = token.removeprefix('Bearer ')
@@ -62,14 +81,25 @@ class Workspace(DurableObject):
             except (ValueError, TypeError):
                 return response({'error': {'code':'invalid_json','message':'Request body must be a JSON object'}}, 400)
         peer = request.headers.get('X-Hosted-Peer') or ''
+        # Network authorization is outside the synchronous SQLite transaction.
+        # The key is checked again inside it to honor concurrent revocation.
+        allowed_members = {email} if email else set()
+        if not email and token:
+            db = Database(self.ctx.storage.sql)
+            import hashlib
+            digest = hashlib.sha256(token.encode()).hexdigest()
+            table = 'hosted_registrars' if token.startswith('ainr_') else 'hosted_tokens'
+            row = db.execute(f'SELECT owner FROM {table} WHERE digest=?', (digest,)).fetchone()
+            if row and await owner_allowed(row['owner'], self.env):
+                allowed_members.add(row['owner'])
         def operation():
             db = Database(self.ctx.storage.sql)
-            members = {x.strip().lower() for x in self.env.MEMBERS.split(',') if x.strip()}
+            members = allowed_members
             principal = authenticate(db, email, token, members)
             if principal is None:
                 raise Abort(response({'error': {'code':'unauthorized','message':'Sign in or supply a valid agent key'}}, 401))
             if email:
-                onboarding.sign_in(db, email, members)
+                onboarding.sign_in(db, email, {x.strip().lower() for x in self.env.MEMBERS.split(',') if x.strip()})
             if request.method == 'GET' and path in ASSETS:
                 if not email:
                     raise Abort(response({'error': {'code':'forbidden','message':'The browser UI requires a human login'}}, 403))
@@ -89,7 +119,7 @@ class Workspace(DurableObject):
                     return response(welcome[0], content_type='text/html; charset=utf-8')
                 return Response('',status=303,headers={**SECURITY,'Location':'/'})
             try:
-                status, result = dispatch(db, principal, request.method, request.url, headers, body, self.env, peer)
+                status, result = dispatch(db, principal, request.method, request.url, headers, body, workspace_env, peer)
                 if status >= 400 or db.rolled_back:
                     raise Abort(response(result, status if status >= 400 else 500))
                 if path == '/v1/hosted/registration/setup' and request.method == 'POST':
@@ -110,22 +140,35 @@ class Workspace(DurableObject):
 class Default(WorkerEntrypoint):
     async def fetch(self, request):
         url = urlsplit(request.url)
+        hosts = json.loads(getattr(self.env, 'WORKSPACE_HOSTS', '{}'))
+        if hosts and url.hostname not in hosts:
+            return response({'error': {'code':'not_found','message':'Unknown workspace host'}},404)
+        if url.hostname == 'inbox.eastbayprojects.com' and not url.path.startswith('/v1/'):
+            return Response('', status=308, headers={**SECURITY,
+                'Location': 'https://inbox.nates-software.com' + url.path + ('?' + url.query if url.query else '')})
         if request.method not in ('GET','POST','PUT'):
             return response({'error': {'code':'method_not_allowed','message':'Method not allowed'}},405)
         # Do not reflect CORS or accept cross-site mutations with login cookies.
         origin = request.headers.get('Origin')
         if request.method != 'GET' and origin and origin != f'{url.scheme}://{url.netloc}':
             return response({'error': {'code':'forbidden','message':'Use this workspace origin'}},403)
+        authentication = await auth_route(request, self.env)
+        if authentication is not None:
+            return authentication
         email = await member(request, self.env)
         authorization = request.headers.get('Authorization') or ''
         if not email and not authorization.startswith(('Bearer ain_', 'Bearer ainr_')):
+            if request.method == 'GET' and not url.path.startswith('/v1/'):
+                return Response('', status=302, headers={**SECURITY, 'Location':'/auth/login'})
             return response({'error': {'code':'unauthorized','message':'Sign in or supply an agent key'}},401)
         # Always replace client-supplied identity/provenance before forwarding.
         forwarded = JSHeaders.new(request.js_object.headers)
         forwarded.set('X-Hosted-Member', email or '')
         forwarded.set('X-Hosted-Peer', request.headers.get('CF-Connecting-IP') or '')
+        forwarded.set('X-Hosted-Workspace', 'eastbayprojects' if url.hostname == 'inboxes.eastbayprojects.com' else getattr(self.env, 'SSO_TENANT_ID', self.env.WORKSPACE))
         internal = JSRequest.new(request.js_object, JSON.parse(json.dumps({'headers':dict(forwarded)})))
-        stub = self.env.WORKSPACES.get(self.env.WORKSPACES.idFromName(self.env.WORKSPACE))
+        workspace = hosts.get(url.hostname, self.env.WORKSPACE)
+        stub = self.env.WORKSPACES.get(self.env.WORKSPACES.idFromName(workspace))
         query = parse_qs(url.query)
         timeout = 0
         is_watch = request.method == 'GET' and (url.path.endswith(('/watch','/wait')) or url.path == '/v1/ae/events')

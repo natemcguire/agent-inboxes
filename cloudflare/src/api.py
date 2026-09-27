@@ -114,7 +114,7 @@ def management(db, principal, method, path, body, env, peer, browser_token=None,
     if path == '/v1/hosted/registration/setup' and method == 'POST':
         # Human sign-in automatically provisions registration access. Keep only
         # a digest in storage; an HttpOnly browser cookie retains the secret.
-        members = {x.strip().lower() for x in env.MEMBERS.split(',') if x.strip()}
+        members = {principal['email']}
         saved = authenticate(db, None, browser_token, members)
         if saved and saved['kind'] == 'registrar' and saved['owner'] == principal['email']:
             return 200, {k: saved[k] for k in ('id', 'owner', 'label', 'created_at', 'revoked_at')} | {'token': browser_token}
@@ -144,7 +144,7 @@ def management(db, principal, method, path, body, env, peer, browser_token=None,
 
     if path == '/v1/hosted/me' and method == 'GET':
         return 200, {'email': principal['email'], 'workspace': env.WORKSPACE,
-            'self_registration': True, 'members': [x.strip() for x in env.MEMBERS.split(',')], 'human_agent': principal['email'].split('@')[0]}
+            'self_registration': True, 'members': [principal['email']], 'human_agent': principal['email'].split('@')[0]}
     if path == '/v1/hosted/tokens' and method == 'GET':
         rows = db.execute('SELECT * FROM hosted_tokens WHERE owner=? ORDER BY created_at DESC', (principal['email'],))
         return 200, {'tokens': [token_metadata(row) for row in rows]}
