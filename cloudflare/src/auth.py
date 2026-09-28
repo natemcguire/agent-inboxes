@@ -84,7 +84,7 @@ async def route(request, env):
             'Set-Cookie': f'{STATE_COOKIE}={state}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600'})
     if path == '/auth/callback' and request.method == 'GET':
         return Response(CALLBACK, headers={**HEADERS, 'Content-Type':'text/html; charset=utf-8',
-            'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'sha256-2s757Rb89AEJZRrJbbilIMmiruRcsEmoXq1IXkNHnjs='; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"})
+            'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'sha256-2s757Rb89AEJZRrJbbilIMmiruRcsEmoXq1IXkNHnjs='; connect-src 'self'; base-uri 'none'; frame-ancestors https://nates-software.com https://nates-software.pages.dev"})
     if path == '/auth/callback.js' and request.method == 'GET':
         return Response(CALLBACK_JS, headers={**HEADERS, 'Content-Type':'text/javascript; charset=utf-8'})
     if path == '/auth/session' and request.method == 'POST':

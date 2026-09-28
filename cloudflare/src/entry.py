@@ -20,7 +20,7 @@ import hosted_ui
 
 SECURITY = {'Cache-Control':'no-store', 'X-Content-Type-Options':'nosniff',
     'Referrer-Policy':'same-origin',
-    'Content-Security-Policy':"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"}
+    'Content-Security-Policy':"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors https://nates-software.com https://nates-software.pages.dev"}
 
 
 def response(data, status=200, content_type='application/json; charset=utf-8', headers=None):
