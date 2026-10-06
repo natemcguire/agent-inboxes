@@ -1,192 +1,65 @@
 # Agent Inboxes
 
-## Stop building software factories. Give your agents an inbox.
+Email, tasks and file reservations for coding agents running in separate terminals.
 
-In 2018, Elon Musk said Tesla's robots slowed production. A complicated conveyor
-system wasn't working, so they removed it. [CBS interview](https://www.cbsnews.com/news/elon-musk-tesla-model-3-problems-interview-today-2018-04-13/).
-
-I stopped building my software factory and stripped it for parts instead.
-
-Agent Inboxes gives independent agents in separate terminals three things:
-
-1. **Messages:** direct questions, decisions and handoffs, with replies kept together.
-2. **Tasks:** an owner, a scope, a state, and evidence that the work is finished.
-3. **File reservations:** a way to see who's editing something before you both change it.
-
-One Python engine, an HTTP API, a CLI and SQLite. Use it locally or share a workspace on Cloudflare.
-[MIT licensed](LICENSE).
-
-![Agents discussing a checkout API, with every inbox listed in the sidebar.](docs/screenshots/conversation.png)
+```sh
+agent-inbox send --to claude@harbor --subject "Design: Checkout API" --body "Can a retry create a second order?"
+agent-inbox list --unread
+agent-inbox reserve tests/test_checkout.py --reason "HBR-42: retry behavior"
+```
 
 ## Get started
 
-Python 3.11+. The installer sets up the CLI and a background service.
+Python 3.11+.
 
 ```sh
 git clone https://github.com/natemcguire/agent-inboxes.git
 cd agent-inboxes
-./scripts/install.sh
+./scripts/install.sh        # installs the CLI and a background service on :8791
 ```
 
-In each agent's terminal, from its project:
+Then, in each agent's terminal, from its project:
 
 ```sh
-agent-inbox setup-project
-eval "$(agent-inbox claim)"
-agent-inbox brief
+agent-inbox setup-project   # adds the instruction block to AGENTS.md / CLAUDE.md
+eval "$(agent-inbox claim)" # take a unique name: claude, claude-2, ...
+agent-inbox brief           # assignments, decisions, unread mail, reservations
 ```
 
-Open **[localhost:8791](http://127.0.0.1:8791/)**. Click a project in **View as human**
-to follow its conversations, or toggle **View as agent** to inspect an inbox.
-The brief restores assignments, decisions, unread mail and reservations after a restart.
+Open http://127.0.0.1:8791 to read along as a human. Press ⌘K to search every conversation.
 
-Press **⌘K** (Ctrl+K) to find a conversation: live results, highlighted passages,
-typo recovery, and filters for projects, people, and dates. Open a result at the
-matching message. [Search examples and API](docs/search.md).
+## What it does
 
-**Working together?** [Deploy a shared workspace on Cloudflare](docs/cloudflare.md).
-Email login for people, project-scoped keys for agents, and shared reservations
-across computers. The browser includes connection commands for each agent.
+- **Messages.** Addresses look like `agent@project`. Threads keep replies together, and `*@project` mails every agent in a project.
+- **Tasks.** Each one has an owner, a state, versioned claims and handoffs with evidence (`agent-inbox ae task`).
+- **Reservations.** Advisory leases on file paths or named resources like `release:pages`, so two agents don't edit the same thing.
 
-For a disposable preview of the screenshots, run `python3 scripts/docs-demo.py`
-and open the URL it prints.
+It's one Python engine with SQLite, a CLI and an HTTP API.
+Run it locally, or [deploy a shared workspace on Cloudflare](docs/cloudflare.md) so agents on several machines share mail.
 
-## Messages, replies and project mail
+## Usage
 
-Addresses are `agent@project`. Register the example participants first:
+| | |
+|---|---|
+| `agent-inbox whoami` | your address for this project and session |
+| `agent-inbox send --to A --subject S --body-file -` | start a thread (body from stdin) |
+| `agent-inbox reply <email-id> --body-file -` | reply in a thread (reply-all by default) |
+| `agent-inbox read <thread-id>` | read a thread and mark it read |
+| `agent-inbox watch --timeout 60` | block until new mail arrives |
+| `agent-inbox reserve <paths> \| --resource R` | take a lease (all or nothing; `--wait` to queue) |
+| `agent-inbox renew --all` / `release --all` | extend or drop your leases |
+| `agent-inbox ae task ...` | create, claim, complete and hand off tasks |
+| `agent-inbox skill` | install the Claude Code `/inbox` skill |
 
-```sh
-API=http://127.0.0.1:8791
-for agent in codex claude reviewer; do
-  curl -sS -X PUT "$API/v1/inboxes/$agent@harbor" \
-    -H 'Content-Type: application/json' -d '{}'
-done
-```
+HTTP is the same model: `POST /v1/emails`, `POST /v1/emails/{id}/reply`,
+`POST /v1/ae/command`, `POST /v1/projects/{project}/reservations`.
+Send an `Idempotency-Key` (or `request_id`) so retries never duplicate.
 
-**Send a message:** `POST /v1/emails`
+## More
 
-```sh
-curl -sS "$API/v1/emails" \
-  -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: readme-message-001' \
-  -d '{
-    "from": "codex@harbor",
-    "to": ["claude@harbor"],
-    "cc": ["reviewer@harbor"],
-    "subject": "Design: Checkout API",
-    "body_markdown": "Can a retried request create a second order?"
-  }'
-```
+- [HTTP API with examples and errors](docs/http-api.md)
+- [Agent handbook](docs/guide.md)
+- [Search](docs/search.md)
+- `python3 scripts/docs-demo.py` starts a throwaway demo with sample conversations
 
-**201 Created** returns this shape. Use your returned IDs in subsequent requests.
-
-```json
-{
-  "email_id": "eml_c50203fffb834887a9176e1c75bce49a",
-  "thread_id": "thr_bc73f89c7ec7454a82903bb703817c60",
-  "sent_at": "2026-09-15T14:40:59.255Z",
-  "delivery_status": "local only"
-}
-```
-
-**Reply:** `POST /v1/emails/{email_id}/reply`, with a new `Idempotency-Key`:
-
-```json
-{
-  "from": "claude@harbor",
-  "body_markdown": "The retry case passes. One order, one receipt."
-}
-```
-
-The reply keeps `thread_id`, adds `reply_to_email_id` and `references`, and defaults
-to reply-all. Read it at `GET /v1/inboxes/claude@harbor/threads/{thread_id}`.
-Mark it read explicitly with `POST` to the same path plus `/read`.
-
-**Email a project:** use the send endpoint with a project address in `to`:
-
-```json
-{
-  "from": "codex@harbor",
-  "to": ["*@harbor"],
-  "subject": "Release: Checkout preview",
-  "body_markdown": "The preview is ready. Reply here with release blockers."
-}
-```
-
-`*@harbor` expands to registered agents in that project, excluding the sender.
-Put action owners in To and observers in CC. Keep one topic per thread.
-Retry an unchanged send/reply with the same key to avoid duplicate messages.
-
-## Task management
-
-Keep PRD, epic and acceptance links from your kanban board in the task
-`description`. The built-in AE task queue records agent ownership and handoffs;
-external tracker updates are manual.
-
-**Create:** `POST /v1/ae/command`
-
-```json
-{
-  "actor": "codex@harbor",
-  "session": "checkout-api",
-  "request_id": "readme-task-001",
-  "operation": "task.create",
-  "payload": {
-    "title": "Verify checkout retries",
-    "description": "Task: HBR-42; Epic: HBR-7; PRD: https://example.com/checkout; acceptance: one order after a retry.",
-    "target": "claude@harbor",
-    "paths": ["tests/test_checkout.py"]
-  }
-}
-```
-
-**200 OK** returns a task with `id`, `state: "queued"`, `owner: null` and `version: 1`.
-Add `thread_id` to the payload to link its discussion. Claude accepts it through
-the same endpoint:
-
-```json
-{
-  "actor": "claude@harbor",
-  "session": "checkout-tests",
-  "request_id": "readme-task-002",
-  "operation": "task.claim",
-  "payload": {"id": "TASK_ID", "version": 1}
-}
-```
-
-The task becomes `active`, owned by that actor/session, at version 2. Further
-changes use the current version; stale versions return **409**. Use `task.complete`
-with `{id, version, result}` or `task.handoff` with the next action and evidence.
-Retry identical commands with their original `request_id`.
-
-## File reservations
-
-**Acquire:** `POST /v1/projects/harbor/reservations`, with an `Idempotency-Key`:
-
-```json
-{
-  "holder": "claude@harbor",
-  "session": "checkout-tests",
-  "paths": ["tests/test_checkout.py"],
-  "reason": "HBR-42: verify retry behavior",
-  "ttl_seconds": 900
-}
-```
-
-**201 Created** returns `reservations` containing `path`, `kind`, `holder`, `session`,
-`reason`, `active`, `ttl_seconds`, `created_at`, `expires_at` and `expires_in_seconds`.
-A conflict returns **409** with `conflicts`; none of the requested paths are acquired.
-
-**Renew / release:** `POST` to the same path plus `/renew` or `/release`:
-
-```json
-{"holder":"claude@harbor","session":"checkout-tests","all":true}
-```
-
-The owning session must match. Responses list `renewed` or `released` paths and
-`missed` paths. These are advisory leases on one machine. Claiming a task does not
-reserve its files. Named resources use `resources: ["release:preview"]` on acquisition.
-
----
-
-[Full API examples and errors](docs/http-api.md) · [Agent handbook](docs/guide.md) · [Tests](docs/guide.md#testing-and-verification) · [MIT License](LICENSE)
+[MIT licensed](LICENSE).
