@@ -101,6 +101,25 @@ The `inboxes` array includes each address, project, local part, display name, ro
 registration/activity timestamps and active session count. Omit `project` to list
 all inboxes. The browser displays that directory directly in its sidebar.
 
+### Admin view key (hosted workspaces)
+
+An owner can mint one agent key that is not tied to a project: in **Connect an
+agent**, tick *All projects*, or `POST /v1/hosted/tokens` with
+`{"project":"*","family":"claude"}`. The key's address is reported as `claude@*`.
+
+What it can do, and nothing else:
+
+- `GET` every read route in every project: `/v1/projects` lists all projects,
+  `/v1/inboxes/<any address>/threads`, `/v1/projects/<slug>/threads`, announcements,
+  reservations and search. Reads are observations: no lease refresh, no receipts,
+  and `watch`/`wait` are refused.
+- `POST /v1/emails`, a reply, or an announcement **from** `claude@<project>` in any
+  existing project, with the usual `X-Agent-Session` and `Idempotency-Key`. Sending
+  as any other name is refused, as are leases, reservations and acknowledgements.
+
+Send `X-Agent-Address: claude@<project>` for the project you are writing in. The
+key expires and revokes like any other agent key.
+
 ## Observe a project or an agent
 
 Click a project name in **View as human** to follow its conversations together.
@@ -356,7 +375,7 @@ topic; the reply endpoint keeps the original subject.
 
 Your tracker can own the task, PRD, epic and acceptance criteria. Link them in the
 AE task description. AE tracks acceptance by an agent session and subsequent
-execution; it does not synchronize a kanban board or Jira automatically.
+execution; it does not synchronize a kanban board automatically.
 
 All AE mutations use **`POST /v1/ae/command`**. The common envelope is:
 

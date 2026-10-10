@@ -178,6 +178,25 @@ def run(runtime):
     r.expect(403,'POST','/v1/hosted/registration/setup',{},human=nate,headers={'Origin':'https://evil.example'})
     print('PASS automatic registration on sign-in, HttpOnly credential persistence, owner isolation and CSRF protection',flush=True)
 
+    # An owner-issued admin view key reads every inbox and sends as itself in any project.
+    admin = r.expect(201,'POST','/v1/hosted/tokens',{'project':'*','family':'claude','label':'Admin view'},human=nate)
+    assert admin['address']=='claude@*' and admin['project']=='*'
+    admin_agent = {**admin,'address':'claude@harbor'}
+    everything = r.expect(200,'GET','/v1/projects',agent=admin_agent)['projects']
+    assert {p['slug'] for p in everything} >= {'harbor','private'}
+    assert r.expect(200,'GET','/v1/inboxes/codex-nate%40harbor/threads',agent=admin_agent)['threads'] is not None
+    assert r.expect(200,'GET','/v1/inboxes/reviewer%40private/threads',agent=admin_agent)['threads'] is not None
+    assert r.expect(200,'GET','/v1/projects/private/threads',agent=admin_agent)['threads'] is not None
+    assert len(r.expect(200,'GET','/v1/inboxes',agent=admin_agent)['inboxes']) >= 4
+    note = r.expect(201,'POST','/v1/emails',{'from':'claude@harbor','to':['codex-nate@harbor'],'subject':'Design: admin hello','body_markdown':'From the admin view key.'},agent=admin_agent,key='admin-hello-1')
+    assert note['thread_id']
+    r.expect(403,'POST','/v1/emails',{'from':'codex-nate@harbor','to':['claude@harbor'],'subject':'forged','body_markdown':'no'},agent=admin_agent,key='admin-forge-1')
+    r.expect(403,'POST','/v1/emails',{'from':'claude@nowhere','to':['codex-nate@nowhere'],'subject':'lost','body_markdown':'no'},agent=admin_agent,key='admin-lost-1')
+    r.expect(403,'POST','/v1/projects/harbor/reservations',{'holder':'claude@harbor','paths':['x']},agent=admin_agent,key='admin-res-1')
+    r.expect(403,'GET','/v1/inboxes/codex-nate%40harbor/watch',agent=admin_agent)
+    r.expect(403,'POST','/v1/leases/claim',{'family':'claude','project':'harbor'},agent=admin_agent)
+    print('PASS admin view key: every project and inbox readable, sends only as itself, no leases, reservations or watches',flush=True)
+
     # One human login authorizes unattended enrollment across projects.
     registrar = r.expect(201,'POST','/v1/hosted/registrars',{'label':'Trusted machine'},human=nate)
     rh = {'Authorization':'Bearer '+registrar['token']}

@@ -47,11 +47,23 @@ def deny(message='This credential does not allow that operation'):
     raise Forbidden('forbidden', message)
 
 
+ALL_PROJECTS = '*'
+
+
+def all_projects_key(principal):
+    """An owner-issued admin view key: reads every inbox in the workspace and sends
+    as its own name in any project. It never acts for another agent."""
+    return principal.get('kind') == 'agent' and principal.get('project') == ALL_PROJECTS
+
+
 def family_address(address, principal):
     address = normalize_address(address)
     local, project = address.split('@')
     family = principal['family']
-    return project == principal['project'] and (local == family or re.fullmatch(re.escape(family) + r'-[2-9]\d*', local) is not None or re.fullmatch(re.escape(family) + r'-1\d+', local) is not None)
+    same_family = local == family or re.fullmatch(re.escape(family) + r'-[2-9]\d*', local) is not None or re.fullmatch(re.escape(family) + r'-1\d+', local) is not None
+    if all_projects_key(principal):
+        return same_family
+    return project == principal['project'] and same_family
 
 
 def authenticate(db, email, token, members):
@@ -149,7 +161,9 @@ def management(db, principal, method, path, body, env, peer, browser_token=None,
         rows = db.execute('SELECT * FROM hosted_tokens WHERE owner=? ORDER BY created_at DESC', (principal['email'],))
         return 200, {'tokens': [token_metadata(row) for row in rows]}
     if path == '/v1/hosted/tokens' and method == 'POST':
-        project, family = normalize_slug(body.get('project', '')), normalize_slug(body.get('family', ''))
+        every_project = body.get('all_projects') is True or body.get('project') == ALL_PROJECTS
+        project = ALL_PROJECTS if every_project else normalize_slug(body.get('project', ''))
+        family = normalize_slug(body.get('family', ''))
         if not project or not family or len(project) > 64 or len(family) > 48:
             raise ValidationError('invalid_scope', 'A project and agent name are required')
         if re.search(r'-\d+$', family):
@@ -173,10 +187,11 @@ def management(db, principal, method, path, body, env, peer, browser_token=None,
             owner=principal['email'], project=project, family=family, label=label.strip(),
             created_at=utc_now_iso(), expires_at=time.time()+days*86400, revoked_at=None)
         db.execute('INSERT INTO hosted_tokens VALUES (?,?,?,?,?,?,?,?,NULL)', tuple(row[k] for k in ('id','digest','owner','project','family','label','created_at','expires_at')))
-        service = InboxService(db)
-        service.ensure_inbox(f'{family}@{project}', role='agent')
-        for name in human_names:
-            service.ensure_inbox(f'{name}@{project}', display_name=name.title() + ' (human)', role='agent')
+        if not every_project:
+            service = InboxService(db)
+            service.ensure_inbox(f'{family}@{project}', role='agent')
+            for name in human_names:
+                service.ensure_inbox(f'{name}@{project}', display_name=name.title() + ' (human)', role='agent')
         return 201, {**token_metadata(row), 'token': token, 'address': f'{family}@{project}'}
     match = re.fullmatch(r'/v1/hosted/tokens/(key_[a-f0-9]{32})/revoke', path)
     if match and method == 'POST':
@@ -219,6 +234,35 @@ def authorize(db, principal, method, path, headers, body):
             headers['x-agent-session'] = 'human-' + hashlib.sha256(principal['email'].encode()).hexdigest()[:16]
         else:
             deny('Human views cannot change agent receipts, tasks, or reservations')
+    elif all_projects_key(principal):
+        family = principal['family']
+        if method == 'GET':
+            # Pure observation across the workspace: no lease refresh, no receipts.
+            headers.pop('x-agent-address', None)
+            headers.pop('x-agent-session', None)
+            allowed = parts[:2] in (['v1','projects'], ['v1','inboxes'], ['v1','announcements'], ['v1','reservations'], ['v1','search'])
+            if not allowed or 'wait' in parts or 'watch' in parts:
+                deny('Admin view keys only read and send')
+            query['observe'] = ['true']
+        elif method == 'POST' and (url.path in ('/v1/emails','/v1/announcements') or re.fullmatch(r'/v1/emails/[^/]+/reply', url.path)):
+            sender = normalize_address(body.get('from'))
+            if not family_address(sender, principal):
+                deny(f'Send as {family}@<project>')
+            project = sender.split('@')[1]
+            if not db.execute('SELECT 1 FROM projects WHERE slug=?', (project,)).fetchone():
+                deny('Choose an existing project')
+            if headers.get('x-agent-address') and not family_address(headers['x-agent-address'], principal):
+                deny('Agent header does not match this key')
+            InboxService(db).ensure_inbox(sender, role='agent')
+            if not headers.get('x-agent-session'):
+                raise ValidationError('missing_session', 'X-Agent-Session is required')
+            raw_session = headers.get('x-agent-session')
+            scoped_session = 's-' + hashlib.sha256((principal['id'] + '/' + raw_session).encode()).hexdigest()[:40]
+            headers['x-agent-session'] = scoped_session
+            if 'session' in body:
+                body['session'] = scoped_session
+        else:
+            deny('Admin view keys only read and send')
     else:
         project = principal['project']
         for field in actor_fields:
@@ -278,7 +322,7 @@ def authorize(db, principal, method, path, headers, body):
                 if not isinstance(address, str) or address.lower().split('@')[-1] != project:
                     deny('Recipients must belong to the same project')
     if len(parts) >= 3 and parts[1] == 'emails':
-        project = (body.get('from') or '').split('@')[-1] if is_human else principal['project']
+        project = (body.get('from') or '').split('@')[-1] if (is_human or all_projects_key(principal)) else principal['project']
         email = db.execute('SELECT e.thread_id,p.slug FROM emails e JOIN threads t ON t.id=e.thread_id JOIN projects p ON p.id=t.home_project_id WHERE e.id=?', (parts[2],)).fetchone()
         if not email or email['slug'] != project:
             deny('Message is outside this project')
@@ -321,7 +365,7 @@ def dispatch(db, principal, method, path, headers, body, env, peer):
         if parsed.path == '/v1/ae/command':
             body['request_id'] = scoped_key
     status, result = Handler(db, method, path, headers, body, peer).run()
-    if parsed.path == '/v1/projects' and principal['kind'] == 'agent' and status == 200:
+    if parsed.path == '/v1/projects' and principal['kind'] == 'agent' and status == 200 and not all_projects_key(principal):
         result['projects'] = [p for p in result['projects'] if p['slug'] == principal['project']]
     if key and method != 'GET' and status < 400:
         db.execute('INSERT INTO hosted_requests VALUES (?,?,?,?,?)', (principal['id'],key,fingerprint,status,json.dumps(result)))
