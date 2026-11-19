@@ -314,6 +314,63 @@ def run(runtime):
     r.expect(201,'POST','/v1/announcements',{'from':a['address'],'subject':'Preview ready','body_markdown':'Review the shared preview.'},agent=a,key='announcement')
     print('PASS project/agent isolation, send/reply/idempotency, announcements, read-only observation',flush=True)
 
+    # Open sign-up. The front door is public and starts account creation at the hub.
+    maker,second='maker@example.com','second@example.com'
+    code,page,_=r.call('GET','/')
+    assert code==200 and 'action="/auth/signup"' in page and 'Create free account' in page, (code,page[:200])
+    assert r.call('GET','/signup')[0]==200 and 'box-sizing' in r.expect(200,'GET','/signup.css')
+    code,_,headers=r.call('GET','/auth/signup?email=maker%40example.com')
+    query=urllib.parse.parse_qs(urllib.parse.urlsplit(headers['Location']).query)
+    assert code==302 and headers['Location'].startswith(r.hub_url+'/authorize?'), headers
+    assert query['intent']==['signup'] and query['email']==[maker] and query['app']==['agent-inboxes'], query
+    assert query['return']==[r.url+'/auth/callback'] and '__Host-ain_state='+query['state'][0] in headers.get('Set-Cookie', headers.get('set-cookie',''))
+    code,_,headers=r.call('GET','/auth/login')
+    assert code==302 and 'intent' not in urllib.parse.parse_qs(urllib.parse.urlsplit(headers['Location']).query)
+    code,_,headers=r.call('GET','/signup',human=maker)
+    assert code==302 and headers['Location']=='/'
+
+    # A person outside the shared workspace starts in an empty workspace of their own.
+    assert r.expect(200,'GET','/v1/hosted/me',human=maker)['members']==[maker]
+    assert r.expect(200,'GET','/v1/projects',human=maker)['projects']==[]
+    assert r.call('GET',f"/v1/projects/harbor/threads/{first['thread_id']}",human=maker)[0]!=200
+    assert r.expect(200,'GET','/v1/search?q=checkout',human=maker)['total']==0
+    # The names already used in the shared workspace are free here: nothing is global to take.
+    mine=r.expect(201,'POST','/v1/hosted/tokens',{'project':'harbor','family':'codex-nate'},human=maker)
+    r.expect(200,'POST','/v1/leases/claim',{'family':'codex-nate','project':'harbor'},agent=mine)
+    assert r.call('GET',f"/v1/inboxes/codex-nate%40harbor/threads/{first['thread_id']}",agent=mine)[0]!=200
+    assert r.expect(200,'GET','/v1/search?q=checkout',agent=mine)['total']==0
+    note=r.expect(201,'POST','/v1/emails',{'from':'maker@harbor','to':['codex-nate@harbor'],'subject':'Design: private plan','body_markdown':'Only this workspace reads about the zebra.'},human=maker,key='maker-note')
+    assert r.expect(200,'GET','/v1/search?q=zebra',agent=mine)['results'][0]['thread_id']==note['thread_id']
+    for viewer in ({'human':nate},{'human':josh},{'agent':a},{'agent':admin_agent},{'human':second}):
+        assert r.expect(200,'GET','/v1/search?q=zebra',**viewer)['total']==0, viewer
+        assert r.call('GET',f"/v1/projects/harbor/threads/{note['thread_id']}",**viewer)[0]!=200, viewer
+    assert r.expect(200,'GET','/v1/projects',human=second)['projects']==[]
+    assert r.expect(200,'GET','/v1/hosted/tokens',human=second)['tokens']==[]
+    assert all(key['owner']==nate or key['owner']==josh for key in r.expect(200,'GET','/v1/hosted/tokens',human=nate)['tokens'])
+    r.expect(403,'POST','/v1/hosted/tokens/'+mine['id']+'/revoke',{},human=nate)
+    r.expect(403,'POST','/v1/hosted/tokens/'+a['id']+'/revoke',{},human=maker)
+    # Unattended enrollment works inside the personal workspace and stays inside it.
+    enrollment=r.expect(201,'POST','/v1/hosted/registration/setup',{},human=maker)
+    enrolled=r.expect(201,'POST','/v1/hosted/register',{'project':'harbor','family':'robot-maker'},headers={'Authorization':'Bearer '+enrollment['token']})
+    assert [p['slug'] for p in r.expect(200,'GET','/v1/projects',agent=enrolled)['projects']]==['harbor']
+    assert r.expect(200,'GET','/v1/search?q=checkout',agent=enrolled)['total']==0
+    # A key alone answers "who am I": address, project, owner and workspace, never the secret.
+    identity=r.expect(200,'GET','/v1/hosted/whoami',headers={'Authorization':'Bearer '+mine['token']})
+    assert (identity['address'],identity['project'],identity['agent'],identity['owner'])==('codex-nate@harbor','harbor','codex-nate',maker), identity
+    shared_identity=r.expect(200,'GET','/v1/hosted/whoami',headers={'Authorization':'Bearer '+a['token']})
+    assert shared_identity['address']=='codex-nate@harbor' and shared_identity['owner']==nate
+    assert shared_identity['workspace']!=identity['workspace'] and mine['token'] not in json.dumps(identity)
+    assert r.expect(200,'GET','/v1/hosted/whoami',human=maker)['email']==maker
+    r.expect(401,'GET','/v1/hosted/whoami')
+    # Access removed at the hub ends the person's browser and agent access at once.
+    for action,expected in (('revoke',401),('restore',200)):
+        request = urllib.request.Request(r.hub_url+'/test/'+action, method='POST',
+            headers={'Content-Type':'application/json'}, data=json.dumps({'email':maker}).encode())
+        urllib.request.urlopen(request).close()
+        r.expect(expected,'GET','/v1/hosted/me',human=maker)
+        r.expect(expected,'GET','/v1/projects',agent=mine)
+    print('PASS public sign-up entry, private workspace per person, reusable names, key-only identity, and hub revocation',flush=True)
+
     def reserve(agent,paths,key,session='terminal-1'):
         return r.call('POST','/v1/projects/harbor/reservations',{'holder':agent['address'],'paths':paths,'ttl_seconds':60},agent=agent,key=key,session=session)
     with concurrent.futures.ThreadPoolExecutor(2) as pool:
@@ -385,16 +442,19 @@ def run(runtime):
     r.expect(200,'GET','/v1/hosted/me',human=josh)
     r.stop()
     inspected=False
+    workspaces=[]
     for path in (r.directory/'state').rglob('*.sqlite'):
         with sqlite3.connect(path) as db:
             if not db.execute("SELECT 1 FROM sqlite_master WHERE name='hosted_tokens'").fetchone():continue
             inspected=True
             assert db.execute('SELECT complete,body FROM hosted_welcome').fetchone()==(1,None)
-            assert db.execute('SELECT count(*) FROM hosted_members').fetchone()[0]==2
+            workspaces.append(sorted(row[0] for row in db.execute('SELECT email FROM hosted_members')))
             assert all(len(row[0])==64 and not row[0].startswith('ain_') for row in db.execute('SELECT digest FROM hosted_tokens'))
             assert all(len(row[0])==64 for row in db.execute('SELECT digest FROM hosted_registrars'))
             assert db.execute("SELECT COUNT(*) FROM reservations WHERE path='src/free.py'").fetchone()[0]==0
     assert inspected,'The real Durable Object SQLite database was not found'
+    # Separate storage: the shared workspace holds its two members, each newcomer is alone.
+    assert sorted(workspaces)==[['josh@example.com','nate@example.com'],['maker@example.com'],['second@example.com']], workspaces
     print('PASS restart durability, welcome content deletion, hashed keys, and persisted rollback evidence',flush=True)
 
 

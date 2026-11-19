@@ -96,6 +96,18 @@ def management(db, principal, method, path, body, env, peer, browser_token=None,
         return 200, {'status': 'ok', 'db': 'ok', 'service': 'agent-inboxes', 'version': __version__,
             'hosting': 'Cloudflare', 'workspace': env.WORKSPACE, 'server_time': utc_now_iso(),
             'client_ip': peer, 'ae_transport': {'kind': 'http', 'connected': True, 'broker_required': False}}
+    if path == '/v1/hosted/whoami' and method == 'GET':
+        # The credential is the identity. An agent that has lost track of its name,
+        # project or workspace asks with nothing but its key.
+        if principal['kind'] == 'agent':
+            return 200, {'kind': 'agent', 'address': principal['family'] + '@' + principal['project'],
+                'agent': principal['family'], 'project': principal['project'], 'owner': principal['owner'],
+                'label': principal['label'], 'expires_at': principal['expires_at'],
+                'workspace': env.WORKSPACE, 'directory': '/v1/inboxes'}
+        if principal['kind'] == 'registrar':
+            return 200, {'kind': 'registrar', 'owner': principal['owner'], 'workspace': env.WORKSPACE}
+        return 200, {'kind': 'human', 'email': principal['email'], 'name': principal['email'].split('@')[0],
+            'workspace': env.WORKSPACE}
     if principal['kind'] == 'registrar':
         if path == '/v1/hosted/registration' and method == 'GET':
             return 200, {'owner': principal['owner'], 'workspace': env.WORKSPACE, 'id': principal['id']}
@@ -104,7 +116,7 @@ def management(db, principal, method, path, body, env, peer, browser_token=None,
             if not isinstance(request_id, str) or not re.fullmatch(r'[a-f0-9]{32}', request_id):
                 raise ValidationError('invalid_registration_id', 'registration_id must be 32 lowercase hexadecimal characters')
             fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
-            token = 'ain_' + hmac.new(principal['credential'].encode(),
+            token = 'ain_' + getattr(env, 'TOKEN_PREFIX', '') + hmac.new(principal['credential'].encode(),
                 ('agent-registration-v1/' + request_id).encode(), hashlib.sha256).hexdigest()
             previous = db.execute('SELECT * FROM hosted_enrollments WHERE registrar_id=? AND request_id=?', (principal['id'], request_id)).fetchone()
             if previous:
@@ -141,7 +153,7 @@ def management(db, principal, method, path, body, env, peer, browser_token=None,
             raise ValidationError('invalid_label', 'Use a name under 100 characters')
         if db.execute('SELECT COUNT(*) FROM hosted_registrars WHERE owner=? AND revoked_at IS NULL', (principal['email'],)).fetchone()[0] >= 20:
             deny('Revoke unused registration access first')
-        token = 'ainr_' + secrets.token_urlsafe(32)
+        token = 'ainr_' + getattr(env, 'TOKEN_PREFIX', '') + secrets.token_urlsafe(32)
         row = dict(id='reg_' + uuid.uuid4().hex, owner=principal['email'], label=label.strip(), created_at=utc_now_iso(), revoked_at=None)
         db.execute('INSERT INTO hosted_registrars VALUES (?,?,?,?,?,NULL)',
             (row['id'], hashlib.sha256(token.encode()).hexdigest(), row['owner'], row['label'], row['created_at']))
@@ -182,7 +194,7 @@ def management(db, principal, method, path, body, env, peer, browser_token=None,
         label = body.get('label', family)
         if not isinstance(label, str) or not label.strip() or len(label) > 100:
             raise ValidationError('invalid_label', 'Use a name under 100 characters')
-        token = issued_token or 'ain_' + secrets.token_urlsafe(32)
+        token = issued_token or 'ain_' + getattr(env, 'TOKEN_PREFIX', '') + secrets.token_urlsafe(32)
         row = dict(id='key_' + uuid.uuid4().hex, digest=hashlib.sha256(token.encode()).hexdigest(),
             owner=principal['email'], project=project, family=family, label=label.strip(),
             created_at=utc_now_iso(), expires_at=time.time()+days*86400, revoked_at=None)

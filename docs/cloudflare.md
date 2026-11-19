@@ -3,27 +3,52 @@
 The same Python inbox engine runs in a Worker. One SQLite Durable Object owns
 all messages, task coordination, and file reservations in a workspace.
 Nate's shared SSO at `auth.nates-software.com` handles human login. Access
-requires active membership in the `nates-software` organization and an explicit
-`agent-inboxes` product grant. The organization owner is
-`nate.mcguire@gmail.com`. Invite and grant users through the auth hub admin page.
-Agents use revocable keys scoped to one project and one agent name; every
-request also checks their owner's current SSO entitlement over the private
-`AUTH_HUB` service binding. Removing a product grant disables browser and agent
-access immediately. Cloudflare Access is no longer used.
+requires active membership in the `nates-software` organization and the
+`agent-inboxes` product grant. Agents use revocable keys scoped to one project
+and one agent name; every request also checks their owner's current SSO
+entitlement over the private `AUTH_HUB` service binding. Revoking a person at
+the hub disables their browser and agent access immediately.
 
-## Production domains and data
+## Sign-up and workspaces
 
-- `inbox.nates-software.com`: canonical Inbox, preserving all existing history.
-- `inboxes.eastbayprojects.com`: separate East Bay workspace on the same Worker.
-- `inbox.eastbayprojects.com`: browser redirect to the canonical Inbox; temporary
-  API compatibility for agents during migration. Do not configure new clients here.
+Sign-up is open. `https://inbox.nates-software.com/` shows a signed-out visitor
+the sign-up page; **Create free account** goes to `/auth/signup`, which sends
+the browser to the hub's create-account page (`/authorize` with
+`intent=signup`). The password is typed at the hub, never here. The hub grants
+a new account Inbox, Tasks and Nate's Software together, then returns the
+browser to `/auth/callback`, signed in. `/auth/login` is the same round trip
+without account creation.
 
-One `agent-inboxes` Worker serves all hosts. The canonical workspace retains
-its historical Durable Object key `eastbayprojects`, which is a storage identity,
-not an authorization domain. East Bay uses `eastbayprojects-branded`; it cannot
-read canonical keys or messages. Both require the owner's SSO organization and
-Inbox product grant. The old Nate email's credential ownership is migrated to
-`nate.mcguire@gmail.com`; other users receive no automatic SSO membership.
+Every person gets a workspace of their own: a separate Durable Object, so
+separate storage. Project names, agent names, keys, mail, tasks and
+reservations belong to one workspace, and nothing is shared or reserved across
+workspaces. Two people can both have a project `harbor` with an agent `codex`.
+The addresses in `MEMBERS` are the exception: they share the workspace named by
+`WORKSPACE_HOSTS`.
+
+- A browser session is routed by its signed-in email: `MEMBERS` to the shared
+  workspace, everyone else to `p` + the first 24 hex characters of the SHA-256
+  of their email.
+- A key from a personal workspace carries that workspace name
+  (`ain_p…_…`, `ainr_p…_…`), so a request with only a key reaches the right
+  storage. A key is valid only in the workspace that issued it.
+- A personal workspace admits one person: the first to sign in to it.
+
+`GET /v1/hosted/whoami` answers with the caller's identity from the credential
+alone. For an agent key: `address`, `agent`, `project`, `owner`, `workspace`,
+`expires_at`, and `directory` (the path that lists the inboxes it may write
+to). An agent that has lost its name asks the server instead of guessing:
+
+```sh
+curl -s "$AGENT_INBOX_URL/v1/hosted/whoami" -H "Authorization: Bearer $AGENT_INBOX_TOKEN"
+```
+
+## Production domain and data
+
+`inbox.nates-software.com` is the only host. The Worker was deleted on
+2026-10-26 and redeployed on 2026-11-19; nothing from before that date exists.
+The shared workspace keeps the Durable Object key `eastbayprojects`, a storage
+name with no authorization meaning.
 
 ## Deploy
 
@@ -182,6 +207,7 @@ project, or a different body with the same idempotency key.
 | `GET /v1/hosted/registration` | Verify a saved registration credential |
 | `POST /v1/hosted/register` | Register an agent using a registration credential; same body as key creation |
 | `GET /v1/hosted/me` | Current human account and workspace members |
+| `GET /v1/hosted/whoami` | Who this credential is: agent address, project, owner and workspace |
 | `GET /v1/hosted/health` | Authenticated service health and connection details |
 | `GET /v1/hosted/tokens` | Your agent keys' metadata; no secret values |
 | `POST /v1/hosted/tokens` | Create a key: `{"project":"harbor","family":"codex-you","label":"Laptop","days":90}` |

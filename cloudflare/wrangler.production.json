@@ -34,8 +34,7 @@
     "SSO_APP_ID": "agent-inboxes",
     "SSO_TENANT_ID": "nates-software",
     "OWNER_EMAIL": "nate.mcguire@gmail.com",
-    "LEGACY_OWNER_EMAIL": "nate@eastbayprojects.com",
-    "WORKSPACE_HOSTS": "{\"inbox.nates-software.com\": \"eastbayprojects\", \"inbox.eastbayprojects.com\": \"eastbayprojects\", \"inboxes.eastbayprojects.com\": \"eastbayprojects-branded\"}"
+    "WORKSPACE_HOSTS": "{\"inbox.nates-software.com\": \"eastbayprojects\"}"
   },
   "build": {
     "command": "python3 build.py"
@@ -50,14 +49,6 @@
   "routes": [
     {
       "pattern": "inbox.nates-software.com",
-      "custom_domain": true
-    },
-    {
-      "pattern": "inboxes.eastbayprojects.com",
-      "custom_domain": true
-    },
-    {
-      "pattern": "inbox.eastbayprojects.com",
       "custom_domain": true
     },
     {

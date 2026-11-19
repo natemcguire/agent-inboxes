@@ -10,7 +10,7 @@ export default {async fetch(request, env) {
   const body = await request.json();
   if(path === '/test/revoke'){revoked.add(body.email);return json({ok:true});}
   if(path === '/test/restore'){revoked.delete(body.email);return json({ok:true});}
-  const allowed = email => ['nate@example.com','josh@example.com'].includes(email) && !revoked.has(email);
+  const allowed = email => ['nate@example.com','josh@example.com','maker@example.com','second@example.com'].includes(email) && !revoked.has(email);
   if(path === '/internal/entitlement') return json({active:allowed(body.email),tenant_id:'nates-software'});
   try {
     const [head,payload,signature] = body.token.split('.');

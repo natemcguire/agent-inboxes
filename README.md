@@ -8,7 +8,15 @@ agent-inbox list --unread
 agent-inbox reserve tests/test_checkout.py --reason "HBR-42: retry behavior"
 ```
 
-## Get started
+## Hosted, free
+
+Create an account at **[inbox.nates-software.com](https://inbox.nates-software.com)**: email and a password, no invite.
+You get a private workspace for yourself and your agents, so agents on different machines share one inbox and you read along in the browser.
+After signing in, **Connect an agent** shows the two commands to run on each machine.
+
+The same account opens [Tasks](https://tasks.nates-software.com) ([source](https://github.com/natemcguire/tasktrack)), a task tracker built for people working with agents.
+
+## Run it yourself
 
 Python 3.11+.
 
@@ -35,7 +43,7 @@ Open http://127.0.0.1:8791 to read along as a human. Press ⌘K to search every 
 - **Reservations.** Advisory leases on file paths or named resources like `release:pages`, so two agents don't edit the same thing.
 
 It's one Python engine with SQLite, a CLI and an HTTP API.
-Run it locally, or [deploy a shared workspace on Cloudflare](docs/cloudflare.md) so agents on several machines share mail.
+Run it locally, use the hosted service above, or [deploy your own on Cloudflare](docs/cloudflare.md).
 
 ## Usage
 

@@ -1,7 +1,9 @@
 """Authenticated Cloudflare entrypoint; each workspace owns one SQLite object."""
 import asyncio
+import hashlib
 import json
 import math
+import re
 import time
 from urllib.parse import parse_qs, urlsplit
 
@@ -13,7 +15,7 @@ from agent_inbox.ae import initialize as initialize_ae
 from agent_inbox.models import InboxError
 from agent_inbox.ui import ASSETS
 from api import SCHEMA, authenticate, dispatch
-from auth import member, owner_allowed, route as auth_route
+from auth import member, owner_allowed, route as auth_route, signup_page, signup_css
 from storage import Database
 import onboarding
 import hosted_ui
@@ -26,6 +28,15 @@ SECURITY = {'Cache-Control':'no-store', 'X-Content-Type-Options':'nosniff',
 def response(data, status=200, content_type='application/json; charset=utf-8', headers=None):
     return Response(json.dumps(data) if isinstance(data, dict) else data,
         status=status, headers={**SECURITY, 'Content-Type':content_type, **(headers or {})})
+
+
+# Everyone outside the configured MEMBERS gets a workspace of their own, named by a
+# digest of their email. Its keys carry that name so a bare key finds its workspace.
+PERSONAL_KEY = re.compile(r'Bearer ainr?_(p[0-9a-f]{24})_')
+
+
+def personal_workspace(email):
+    return 'p' + hashlib.sha256(email.encode()).hexdigest()[:24]
 
 
 class Abort(Exception):
@@ -65,6 +76,8 @@ class Workspace(DurableObject):
     async def fetch(self, request):
         path = urlsplit(request.url).path
         workspace_env = WorkspaceEnvironment(self.env, request.headers.get('X-Hosted-Workspace') or self.env.WORKSPACE)
+        personal = request.headers.get('X-Hosted-Personal') or ''
+        workspace_env.TOKEN_PREFIX = personal + '_' if personal else ''
         email = request.headers.get('X-Hosted-Member') or ''
         token = request.headers.get('Authorization') or ''
         token = token.removeprefix('Bearer ')
@@ -86,7 +99,6 @@ class Workspace(DurableObject):
         allowed_members = {email} if email else set()
         if not email and token:
             db = Database(self.ctx.storage.sql)
-            import hashlib
             digest = hashlib.sha256(token.encode()).hexdigest()
             table = 'hosted_registrars' if token.startswith('ainr_') else 'hosted_tokens'
             row = db.execute(f'SELECT owner FROM {table} WHERE digest=?', (digest,)).fetchone()
@@ -98,8 +110,17 @@ class Workspace(DurableObject):
             principal = authenticate(db, email, token, members)
             if principal is None:
                 raise Abort(response({'error': {'code':'unauthorized','message':'Sign in or supply a valid agent key'}}, 401))
+            configured = {x.strip().lower() for x in self.env.MEMBERS.split(',') if x.strip()}
+            if personal:
+                # One person per personal workspace: whoever signed in to it first.
+                owner = principal.get('email') or principal.get('owner')
+                first = db.execute('SELECT email FROM hosted_members LIMIT 1').fetchone()
+                if first and first['email'] != owner:
+                    raise Abort(response({'error': {'code':'forbidden','message':'This workspace belongs to another account'}}, 403))
+                workspace_env.MEMBERS = owner
+                configured = {owner}
             if email:
-                onboarding.sign_in(db, email, {x.strip().lower() for x in self.env.MEMBERS.split(',') if x.strip()})
+                onboarding.sign_in(db, email, configured)
             if request.method == 'GET' and path in ASSETS:
                 if not email:
                     raise Abort(response({'error': {'code':'forbidden','message':'The browser UI requires a human login'}}, 403))
@@ -155,19 +176,32 @@ class Default(WorkerEntrypoint):
         authentication = await auth_route(request, self.env)
         if authentication is not None:
             return authentication
+        if request.method == 'GET' and url.path == '/signup.css':
+            return signup_css()
         email = await member(request, self.env)
         authorization = request.headers.get('Authorization') or ''
         if not email and not authorization.startswith(('Bearer ain_', 'Bearer ainr_')):
+            if request.method == 'GET' and url.path in ('/', '/signup'):
+                return signup_page(self.env)
             if request.method == 'GET' and not url.path.startswith('/v1/'):
                 return Response('', status=302, headers={**SECURITY, 'Location':'/auth/login'})
             return response({'error': {'code':'unauthorized','message':'Sign in or supply an agent key'}},401)
+        if email and request.method == 'GET' and url.path == '/signup':
+            return Response('', status=302, headers={**SECURITY, 'Location':'/'})
+        shared_members = {x.strip().lower() for x in self.env.MEMBERS.split(',') if x.strip()}
+        if email:
+            personal = '' if email in shared_members else personal_workspace(email)
+        else:
+            key = PERSONAL_KEY.match(authorization)
+            personal = key[1] if key else ''
         # Always replace client-supplied identity/provenance before forwarding.
         forwarded = JSHeaders.new(request.js_object.headers)
         forwarded.set('X-Hosted-Member', email or '')
         forwarded.set('X-Hosted-Peer', request.headers.get('CF-Connecting-IP') or '')
-        forwarded.set('X-Hosted-Workspace', 'eastbayprojects' if url.hostname == 'inboxes.eastbayprojects.com' else getattr(self.env, 'SSO_TENANT_ID', self.env.WORKSPACE))
+        forwarded.set('X-Hosted-Personal', personal)
+        forwarded.set('X-Hosted-Workspace', personal or ('eastbayprojects' if url.hostname == 'inboxes.eastbayprojects.com' else getattr(self.env, 'SSO_TENANT_ID', self.env.WORKSPACE)))
         internal = JSRequest.new(request.js_object, JSON.parse(json.dumps({'headers':dict(forwarded)})))
-        workspace = hosts.get(url.hostname, self.env.WORKSPACE)
+        workspace = personal or hosts.get(url.hostname, self.env.WORKSPACE)
         stub = self.env.WORKSPACES.get(self.env.WORKSPACES.idFromName(workspace))
         query = parse_qs(url.query)
         timeout = 0
