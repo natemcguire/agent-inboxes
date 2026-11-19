@@ -64,6 +64,21 @@ def _read_body(body_arg: Optional[str], body_file_arg: Optional[str]) -> str:
 def cmd_whoami(args: argparse.Namespace, client: InboxClient) -> int:
     """Show resolution source; register only a bound or explicitly named inbox."""
     try:
+        # A hosted key knows who it is: ask the server before trusting this shell.
+        card = None
+        if client.token:
+            try:
+                card = client._request('GET', '/v1/hosted/whoami')
+            except InboxError as exc:
+                if exc.code not in ('not_found', 'http_error'):
+                    raise
+            guessed = derive_project()
+            if card and card.get('kind') == 'agent' and card['project'] not in ('*', guessed):
+                _print_error(f"This key belongs to {card['address']}, but this folder and shell point at project "
+                             f"{guessed}. They are different agents, and nothing was read or sent. Run agent-inbox "
+                             f"from the {card['project']} repository, or connect this one with: agent-inbox hosted register",
+                             'identity_conflict')
+                return 2
         identity = resolve_identity(client)
         address = identity['address']
         res = dict(identity)
@@ -71,10 +86,14 @@ def cmd_whoami(args: argparse.Namespace, client: InboxClient) -> int:
             res.update(client.put_inbox(address))
         else:
             print('No name is bound to this session. Run eval "$(agent-inbox claim)" before acting.', file=sys.stderr)
+        if card:
+            res['hosted'] = card
         if args.json:
             print(json.dumps(res, indent=2))
         else:
             print(address)
+            if card:
+                _print_identity_card(card, address)
             session_id = res.get("session_id") or client.session_id
             if session_id:
                 print(f"session: {session_id}")
@@ -92,6 +111,40 @@ def cmd_whoami(args: argparse.Namespace, client: InboxClient) -> int:
     except Exception as e:
         _print_error(str(e))
         return 1
+
+
+def _family(address: str) -> str:
+    """The name without its project or numbered slot: claude-2@boats and claude@home are both claude."""
+    import re
+    return re.sub(r'-\d+$', '', address.split('@')[0])
+
+
+def _print_identity_card(card: dict, address: str) -> None:
+    """Who this agent is, who else is in its project, and the house rules."""
+    print(f"You are {address}: project {card.get('project')}, key held for {card.get('owner')}.")
+    if card.get('address') and address.split('@')[-1] != card['address'].split('@')[-1]:
+        print(f"WARNING: this key belongs to {card['address']}, not {address}. Run from that project's repository.")
+    entries = card.get('directory') or []
+    if entries:
+        print("In this project:")
+        for entry in entries:
+            notes = []
+            if entry.get('you'):
+                notes.append('you' if entry['address'] == address else 'your key, another session')
+            if entry.get('kind') == 'human':
+                notes.append('human')
+            if entry.get('description'):
+                notes.append(entry['description'])
+            sessions = entry.get('active_sessions') or 0
+            notes.append(f"{sessions} active" if sessions else f"last seen {entry.get('last_seen_at') or 'never'}")
+            print(f"  {entry['address']} ({'; '.join(notes)})")
+    twins = card.get('same_name_elsewhere') or []
+    if twins:
+        print("Same name in other projects, different agents, not you: " + ", ".join(twins))
+    if card.get('rules'):
+        print("House rules:")
+        for rule in card['rules']:
+            print(f"  - {rule}")
 
 
 def cmd_skill(args: argparse.Namespace) -> int:
@@ -356,7 +409,8 @@ def cmd_read(args: argparse.Namespace, client: InboxClient) -> int:
         if args.json:
             print(json.dumps(thread_data, indent=2))
         else:
-            print(f"Reading as: {thread_data.get('reading_as', inbox)} (To = action owner; CC = observer)")
+            reading_as = thread_data.get('reading_as', inbox)
+            print(f"Reading as: {reading_as} (To = action owner; CC = observer)")
             print(f"Thread: {thread_data['thread_id']} — {thread_data['subject']}\n" + "=" * 60)
             for eml in thread_data.get("emails", []):
                 to_str = ", ".join(eml["to"])
@@ -364,6 +418,11 @@ def cmd_read(args: argparse.Namespace, client: InboxClient) -> int:
                 read_status = "" if eml["read"] else " [UNREAD]"
                 sess = eml.get("sender_session")
                 from_str = f"{eml['from']} (session {sess})" if sess else eml["from"]
+                # The same first name is not the same agent: say which it is.
+                if eml['from'] == reading_as:
+                    from_str += " [you]"
+                elif _family(eml['from']) == _family(reading_as):
+                    from_str += " [not you: a different agent with the same name]"
                 print(f"Email ID: {eml['email_id']}{read_status}")
                 print(f"From:     {from_str}")
                 print(f"To:       {to_str}{cc_str}")
@@ -1116,6 +1175,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "hosted":
         from agent_inbox.client import run_hosted
         return run_hosted(args)
+
+    # A connected repository supplies the identity; a conflicting shell stops here.
+    try:
+        from agent_inbox.client import apply_hosted_binding
+        apply_hosted_binding()
+    except ValueError as exc:
+        _print_error(str(exc), 'identity_conflict')
+        return 2
 
     if args.command == "hook-check":
         return 0  # Legacy hook commands do no I/O or context injection.

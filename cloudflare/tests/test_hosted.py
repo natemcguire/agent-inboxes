@@ -362,6 +362,36 @@ def run(runtime):
     assert shared_identity['workspace']!=identity['workspace'] and mine['token'] not in json.dumps(identity)
     assert r.expect(200,'GET','/v1/hosted/whoami',human=maker)['email']==maker
     r.expect(401,'GET','/v1/hosted/whoami')
+    # The same answer is a directory: everyone in the project, what each is for, and which entry is the caller.
+    people={entry['address']:entry for entry in identity['directory']}
+    assert set(people)=={'codex-nate@harbor','robot-maker@harbor','maker@harbor'}, people
+    assert people['codex-nate@harbor']['you'] is True and people['robot-maker@harbor']['you'] is False
+    assert people['maker@harbor']['kind']=='human' and people['robot-maker@harbor']['owner']==maker
+    labelled=r.expect(201,'POST','/v1/hosted/tokens',{'project':'garden','family':'codex-nate','label':'Greenhouse Mac · Codex'},human=maker)
+    r.expect(200,'POST','/v1/leases/claim',{'family':'codex-nate','project':'garden'},agent=labelled)
+    other=r.expect(200,'GET','/v1/hosted/whoami',headers={'Authorization':'Bearer '+labelled['token']})
+    assert next(e for e in other['directory'] if e['you'])['description']=='Greenhouse Mac · Codex'
+    assert all(entry['project']=='garden' for entry in other['directory'])
+    # Two agents with one name in one account are told about each other, and cannot write to each other.
+    again=r.expect(200,'GET','/v1/hosted/whoami',headers={'Authorization':'Bearer '+mine['token']})
+    assert again['same_name_elsewhere']==['codex-nate@garden'] and other['same_name_elsewhere']==['codex-nate@harbor']
+    assert shared_identity['same_name_elsewhere']==[] and len(again['rules'])>=4 and any('different agent' in rule for rule in again['rules'])
+    crossing={'from':'codex-nate@harbor','to':['codex-nate@garden'],'subject':'Design: wrong project','body_markdown':'This must not arrive.'}
+    r.expect(403,'POST','/v1/emails',crossing,agent=mine,key='crossing')
+    assert r.expect(200,'GET','/v1/inboxes/codex-nate%40garden/threads',agent=labelled)['threads']==[]
+    # An agent stuck acknowledging is stopped; reading, retries and other agents carry on.
+    chatty=r.expect(201,'POST','/v1/hosted/tokens',{'project':'harbor','family':'chatty'},human=maker)
+    r.expect(200,'POST','/v1/leases/claim',{'family':'chatty','project':'harbor'},agent=chatty)
+    ack={'from':'chatty@harbor','to':['codex-nate@harbor'],'subject':'Design: acknowledgement','body_markdown':'Got it, thanks.'}
+    sent=[r.call('POST','/v1/emails',{**ack,'subject':f'Design: acknowledgement {n}'},agent=chatty,key=f'ack-{n}')[0] for n in range(31)]
+    assert sent==[201]*30+[429], sent
+    refused=r.expect(429,'POST','/v1/emails',{**ack,'subject':'Design: one more'},agent=chatty,key='ack-more')
+    assert refused['error']['code']=='slow_down' and 'human' in refused['error']['message']
+    r.expect(201,'POST','/v1/emails',{**ack,'subject':'Design: acknowledgement 0'},agent=chatty,key='ack-0')
+    assert r.expect(200,'GET','/v1/inboxes/chatty%40harbor/threads',agent=chatty)['threads'] is not None
+    r.expect(201,'POST','/v1/emails',{'from':'codex-nate@harbor','to':['chatty@harbor'],'subject':'Design: please stop','body_markdown':'Summarize for the human instead.'},agent=mine,key='please-stop')
+    r.expect(201,'POST','/v1/emails',{'from':'maker@harbor','to':['chatty@harbor'],'subject':'Design: from a person','body_markdown':'People are not limited.'},human=maker,key='person-1')
+    print('PASS directory with self-identification, same-name agents told apart and walled off, and the send limit',flush=True)
     # Access removed at the hub ends the person's browser and agent access at once.
     for action,expected in (('revoke',401),('restore',200)):
         request = urllib.request.Request(r.hub_url+'/test/'+action, method='POST',

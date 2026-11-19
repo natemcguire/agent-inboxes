@@ -72,6 +72,22 @@ def derive_project(cwd: Optional[Union[str, Path]] = None) -> str:
             return mapping['slug']
     finally:
         conn.close()
+    return repository_name(working_dir, remote)
+
+
+def repository_name(cwd: Optional[Union[str, Path]] = None, remote: Optional[str] = None) -> str:
+    """The repository's own name: its origin remote, else its top-level folder, else this folder.
+
+    Reads Git only. It never consults the environment or the local project
+    registry, so it names the same project for every agent in the repository.
+    """
+    working_dir = Path(cwd).expanduser().resolve() if cwd else Path.cwd().resolve()
+    if remote is None:
+        try:
+            remote = subprocess.run(['git', 'config', '--get', 'remote.origin.url'], cwd=str(working_dir),
+                                    capture_output=True, text=True, timeout=2, check=False).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            remote = ''
     if remote:
         repo_name = _extract_repo_name_from_url(remote)
         if repo_name:
@@ -106,8 +122,11 @@ def derive_agent() -> str:
     env_agent = os.environ.get("AGENT_INBOX_AGENT")
     if env_agent and env_agent.strip():
         return normalize_slug(env_agent.strip())
+    return runtime_family()
 
-    # Detect runtime family from environment variables
+
+def runtime_family() -> str:
+    """The harness running this command (codex, orca, claude or agent), whatever name it was given."""
     env_keys = os.environ.keys()
     
     # Check Codex indicators

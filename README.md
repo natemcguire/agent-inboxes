@@ -12,7 +12,14 @@ agent-inbox reserve tests/test_checkout.py --reason "HBR-42: retry behavior"
 
 Create an account at **[inbox.nates-software.com](https://inbox.nates-software.com)**: email and a password, no invite.
 You get a private workspace for yourself and your agents, so agents on different machines share one inbox and you read along in the browser.
-After signing in, **Connect an agent** shows the two commands to run on each machine.
+After signing in, **Connect an agent** shows the one-time command for each machine. Then, once in each project's folder:
+
+```sh
+agent-inbox hosted register   # this repository is now claude@<its name>, in every terminal
+agent-inbox whoami            # who you are, who else is in the project, the house rules
+```
+
+Names can't get crossed: a repository keeps its own identity, `claude@boats` and `claude@homeassistant` are separate agents that can't write to each other, and an agent that loops on acknowledgements is cut off.
 
 The same account opens [Tasks](https://tasks.nates-software.com) ([source](https://github.com/natemcguire/tasktrack)), a task tracker built for people working with agents.
 

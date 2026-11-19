@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS hosted_requests (
  principal TEXT NOT NULL, key TEXT NOT NULL, fingerprint TEXT NOT NULL,
  status INTEGER NOT NULL, response TEXT NOT NULL, PRIMARY KEY(principal,key)
 );
+CREATE TABLE IF NOT EXISTS hosted_sends (principal TEXT NOT NULL, at REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS hosted_sends_recent ON hosted_sends(principal, at);
 '''
 
 
@@ -85,6 +87,39 @@ def authenticate(db, email, token, members):
     return None
 
 
+# Sent to every agent with its identity, so the same rules reach every runtime.
+HOUSE_RULES = (
+    'An agent with your name in another project is a different agent, not you. Mail does not cross projects.',
+    'Write only when someone must act or decide, or is waiting on you. No acknowledgements, thanks or progress chatter.',
+    'One topic per thread. Reply in the thread instead of starting another on the same topic.',
+    'Address the one agent who must act. Use *@project only for news every agent in the project needs.',
+    'If a thread has gone two rounds with nothing new, stop replying and tell your human.',
+    'Never answer your own message or an automated notice.',
+)
+# One agent key may send this many messages in a rolling window. A real burst of
+# work fits; two agents acknowledging each other forever do not.
+SEND_LIMIT, SEND_WINDOW = 30, 600
+
+
+def directory(db, project, humans, principal):
+    """Everyone the caller can write to: address, what it is for, who owns it, when it was last here."""
+    keys = {}
+    for row in db.execute('SELECT project,family,label,owner FROM hosted_tokens WHERE revoked_at IS NULL AND expires_at>?', (time.time(),)):
+        keys[(row['project'], row['family'])] = row
+    entries = []
+    for inbox in InboxService(db).list_inboxes(project):
+        local = inbox['local_part']
+        # Numbered slots (claude-2) are extra sessions of the family that holds the key.
+        key = keys.get((inbox['project'], local)) or keys.get((inbox['project'], re.sub(r'-[1-9]\d*$', '', local)))
+        human = local in humans
+        entries.append({'address': inbox['address'], 'project': inbox['project'],
+            'kind': 'human' if human else inbox['role'],
+            'description': None if human or not key else key['label'], 'owner': key['owner'] if key and not human else None,
+            'last_seen_at': inbox['last_seen_at'], 'active_sessions': inbox['active_sessions'],
+            'you': bool(principal) and family_address(inbox['address'], principal)})
+    return entries
+
+
 def token_metadata(row):
     return {k: row[k] for k in ('id','owner','project','family','label','created_at','expires_at','revoked_at')}
 
@@ -98,16 +133,24 @@ def management(db, principal, method, path, body, env, peer, browser_token=None,
             'client_ip': peer, 'ae_transport': {'kind': 'http', 'connected': True, 'broker_required': False}}
     if path == '/v1/hosted/whoami' and method == 'GET':
         # The credential is the identity. An agent that has lost track of its name,
-        # project or workspace asks with nothing but its key.
-        if principal['kind'] == 'agent':
-            return 200, {'kind': 'agent', 'address': principal['family'] + '@' + principal['project'],
-                'agent': principal['family'], 'project': principal['project'], 'owner': principal['owner'],
-                'label': principal['label'], 'expires_at': principal['expires_at'],
-                'workspace': env.WORKSPACE, 'directory': '/v1/inboxes'}
+        # project or workspace asks with nothing but its key, and gets back who it
+        # is, who else is here, and how to behave.
         if principal['kind'] == 'registrar':
             return 200, {'kind': 'registrar', 'owner': principal['owner'], 'workspace': env.WORKSPACE}
+        humans = {email.strip().split('@')[0] for email in env.MEMBERS.split(',')}
+        if principal['kind'] == 'agent':
+            everywhere = all_projects_key(principal)
+            twins = [] if everywhere else [principal['family'] + '@' + row['project'] for row in db.execute(
+                "SELECT DISTINCT project FROM hosted_tokens WHERE family=? AND owner=? AND project NOT IN (?,'*') "
+                'AND revoked_at IS NULL AND expires_at>? ORDER BY project',
+                (principal['family'], principal['owner'], principal['project'], time.time()))]
+            return 200, {'kind': 'agent', 'address': principal['family'] + '@' + principal['project'],
+                'agent': principal['family'], 'project': principal['project'], 'owner': principal['owner'],
+                'label': principal['label'], 'expires_at': principal['expires_at'], 'workspace': env.WORKSPACE,
+                'directory': directory(db, None if everywhere else principal['project'], humans, principal),
+                'same_name_elsewhere': twins, 'rules': list(HOUSE_RULES)}
         return 200, {'kind': 'human', 'email': principal['email'], 'name': principal['email'].split('@')[0],
-            'workspace': env.WORKSPACE}
+            'workspace': env.WORKSPACE, 'directory': directory(db, None, humans, None), 'rules': list(HOUSE_RULES)}
     if principal['kind'] == 'registrar':
         if path == '/v1/hosted/registration' and method == 'GET':
             return 200, {'owner': principal['owner'], 'workspace': env.WORKSPACE, 'id': principal['id']}
@@ -376,7 +419,19 @@ def dispatch(db, principal, method, path, headers, body, env, peer):
         headers['idempotency-key'] = scoped_key
         if parsed.path == '/v1/ae/command':
             body['request_id'] = scoped_key
+    # A retried send returned above; only new messages from an agent count here.
+    sending = principal['kind'] == 'agent' and method == 'POST' and (
+        parsed.path in ('/v1/emails', '/v1/announcements') or re.fullmatch(r'/v1/emails/[^/]+/reply', parsed.path))
+    if sending:
+        now = time.time()
+        db.execute('DELETE FROM hosted_sends WHERE at<?', (now - SEND_WINDOW,))
+        if db.execute('SELECT COUNT(*) FROM hosted_sends WHERE principal=?', (principal['id'],)).fetchone()[0] >= SEND_LIMIT:
+            return 429, {'error': {'code': 'slow_down', 'message':
+                f'This agent sent {SEND_LIMIT} messages in {SEND_WINDOW // 60} minutes. Stop sending, '
+                'summarize where things stand for your human, and wait. Reading still works.'}}
     status, result = Handler(db, method, path, headers, body, peer).run()
+    if sending and status < 400:
+        db.execute('INSERT INTO hosted_sends VALUES (?,?)', (principal['id'], time.time()))
     if parsed.path == '/v1/projects' and principal['kind'] == 'agent' and status == 200 and not all_projects_key(principal):
         result['projects'] = [p for p in result['projects'] if p['slug'] == principal['project']]
     if key and method != 'GET' and status < 400:

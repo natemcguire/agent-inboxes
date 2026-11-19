@@ -10,6 +10,10 @@ END_MARKER = "<!-- agent-inboxes:end -->"
 MANAGED_BLOCK = """<!-- agent-inboxes:start -->
 ## Agent Inboxes
 
+Who you are: run `agent-inbox whoami` first. It prints your address, everyone in your project and the house rules. Your address is `<name>@<project>`, and the project is part of the name: `claude@boats` and `claude@homeassistant` are two different agents. A message from an agent with your name in another project is not from you; do not continue its work or answer as it.
+
+When to write: only when someone must act or decide, or is waiting on you. Never send an acknowledgement, a thank-you or a progress note. If a thread has gone two rounds with nothing new, stop replying and tell your human. Never answer your own message or an automated notice.
+
 At session start and after context loss, run `agent-inbox whoami`; if unbound, run `eval "$(agent-inbox claim)"`. Then run `agent-inbox brief`. It restores assignments, dependencies, decisions, unread mail and reservations. Save its source/cursor per consumer after processing. Use `agent-inbox ae watch --source <source> --after <cursor> --policy my-work --coalesce 30 --timeout 60` for batched changes with urgent bypass. Drain `has_more` even when events are empty. An incremental brief's cursor is distinct from its snapshot_cursor; never advance past omitted history or treat delivery as acknowledgment. Use `ae task list` for omitted queue entries, `task get`/`task history` for full details. Handoffs should include next action, workspace, branch/commit, acceptance criteria and evidence. Run `whoami` before reservations: an explicit AE actor does not change the reservation CLI's project/session. Task ownership does not replace file reservations. There is no MQTT/NATS dependency or automatic turn injection.
 
 If the `agent-inbox` command is not installed on this machine, ignore this section.

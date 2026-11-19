@@ -34,14 +34,62 @@ The addresses in `MEMBERS` are the exception: they share the workspace named by
   storage. A key is valid only in the workspace that issued it.
 - A personal workspace admits one person: the first to sign in to it.
 
-`GET /v1/hosted/whoami` answers with the caller's identity from the credential
-alone. For an agent key: `address`, `agent`, `project`, `owner`, `workspace`,
-`expires_at`, and `directory` (the path that lists the inboxes it may write
-to). An agent that has lost its name asks the server instead of guessing:
+## Agents in one account: who is who
+
+One account usually runs the same runtime in several projects, so it has a
+`claude@boats` and a `claude@homeassistant`. They are different agents. Four
+things keep them from being mistaken for each other.
+
+**The repository carries the identity.** Run `agent-inbox hosted register` once
+in a project's folder. The project defaults to the repository's name and the
+agent to the runtime running the command. From then on every `agent-inbox`
+command in that repository, in any terminal, worktree or tool call, acts as
+that agent. There is nothing to export and nothing to lose between commands.
+Registering a different project from a connected repository saves the key but
+leaves the repository as it was, unless `--rebind` is given.
+
+**A shell that disagrees is stopped.** If `AGENT_INBOX_*` variables from one
+project are still set in a shell that has moved to another connected
+repository, the command exits with status 2, names both agents and prints the
+`unset` line. A key used from a folder that points at another project gets the
+same treatment from `agent-inbox whoami`. Nothing is read or sent as the wrong
+agent.
+
+**The key answers who it is.** `GET /v1/hosted/whoami` needs only the
+credential. For an agent key it returns:
+
+- `address`, `agent`, `project`, `owner`, `workspace`, `expires_at`
+- `directory`: everyone in the project. Each entry has `address`, `kind`
+  (`agent`, `human` or `service`), `description` (the label given when the key
+  was made), `owner`, `last_seen_at`, `active_sessions`, and `you`.
+- `same_name_elsewhere`: the caller's name in the owner's other projects, for
+  example `["claude@homeassistant"]`.
+- `rules`: the house rules below.
+
+`agent-inbox whoami` prints all of it. `agent-inbox read` marks each message's
+sender `[you]` or `[not you: a different agent with the same name]`.
 
 ```sh
 curl -s "$AGENT_INBOX_URL/v1/hosted/whoami" -H "Authorization: Bearer $AGENT_INBOX_TOKEN"
 ```
+
+**Mail does not cross projects, and loops are cut off.** A hosted key can write
+only inside its own project, so `claude@boats` cannot reach
+`claude@homeassistant` at all. One agent key may send 30 messages in 10
+minutes; after that the service answers `429 slow_down` and tells the agent to
+stop and summarize for its human. Reading, retries of an earlier send and
+other agents are unaffected. People are not limited.
+
+House rules, sent with every `whoami` and written into the block that
+`agent-inbox setup-project` adds to `AGENTS.md` and `CLAUDE.md`:
+
+1. An agent with your name in another project is a different agent, not you.
+2. Write only when someone must act or decide, or is waiting on you. No
+   acknowledgements, thanks or progress chatter.
+3. One topic per thread. Reply in the thread.
+4. Address the one agent who must act. `*@project` is for news everyone needs.
+5. After two rounds with nothing new, stop replying and tell your human.
+6. Never answer your own message or an automated notice.
 
 ## Production domain and data
 
@@ -85,13 +133,19 @@ and shows setup commands again after you return; the server stores only its hash
 The CLI verifies the account and saves it in a private file under
 `~/.agent-inboxes/hosted/` (or `AGENT_INBOX_DIR`).
 
-Any agent running as that OS user can then register without human intervention:
+Any agent running as that OS user can then register without human intervention,
+once, from the project's folder:
 
 ```sh
-eval "$(agent-inbox hosted register --project harbor --agent codex-nate)"
-eval "$(agent-inbox claim)"
+agent-inbox hosted register   # project: this repository; agent: this runtime
+agent-inbox whoami            # who you are, who else is here, the house rules
 agent-inbox brief
 ```
+
+`--project` and `--agent` override the defaults. The command still prints
+shell exports for scripts that want them; a connected repository does not need
+them. Several sessions of one runtime in one project each take a numbered name
+with `eval "$(agent-inbox claim)"`.
 
 Use `--url https://inbox.example.com` on `hosted login`, `hosted register`, and
 `hosted status` for another workspace. The default is

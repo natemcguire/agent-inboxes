@@ -444,6 +444,56 @@ def save_hosted_credentials(path, value):
             os.unlink(name)
 
 
+def hosted_bindings_path():
+    return get_data_dir() / 'hosted' / 'bindings.json'
+
+
+def load_hosted_bindings():
+    try:
+        data = json.loads(hosted_bindings_path().read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+HOSTED_VARIABLES = ('AGENT_INBOX_URL', 'AGENT_INBOX_TOKEN', 'AGENT_INBOX_TOKEN_FILE', 'AGENT_INBOX_PROJECT', 'AGENT_INBOX_AGENT')
+
+
+def apply_hosted_binding(environment=None):
+    """Act as the agent this repository was connected with.
+
+    Identity belongs to the repository, so it cannot drift with a shell: a
+    command run in the boats repository is the boats agent in every terminal,
+    worktree and tool call. Explicit variables still win when they agree; when
+    they name a different project the command stops instead of acting as the
+    wrong agent. Returns the binding in use, or None.
+    """
+    from agent_inbox.identity import derive_repo_key, runtime_family
+    environment = os.environ if environment is None else environment
+    repository = derive_repo_key()
+    bound = load_hosted_bindings().get(repository or '', {}).get(runtime_family())
+    if not bound:
+        return None
+    chosen = (environment.get('AGENT_INBOX_PROJECT') or '').strip()
+    if environment.get('AGENT_INBOX_TOKEN') or environment.get('AGENT_INBOX_TOKEN_FILE'):
+        if chosen and normalize_slug(chosen) != bound['project']:
+            raise ValueError('This terminal is set up as an agent in project %s, but this repository is connected as %s@%s. '
+                'They are different agents. Run: unset %s' % (normalize_slug(chosen), bound['family'], bound['project'], ' '.join(HOSTED_VARIABLES)))
+        return None
+    if environment.get('AGENT_INBOX_URL'):
+        return None  # An explicit endpoint (a local or test service) is a deliberate choice.
+    directory = get_data_dir() / 'hosted' / hashlib.sha256(bound['url'].encode()).hexdigest()[:24]
+    token_file = directory / (hashlib.sha256((bound['project'] + '/' + bound['family']).encode()).hexdigest() + '.token')
+    if not token_file.exists():
+        return None
+    environment['AGENT_INBOX_URL'] = bound['url']
+    environment['AGENT_INBOX_TOKEN_FILE'] = str(token_file)
+    environment['AGENT_INBOX_PROJECT'] = bound['project']
+    if not (environment.get('AGENT_INBOX_AGENT') or '').strip():
+        environment['AGENT_INBOX_AGENT'] = bound['family']
+    return bound
+
+
 def add_hosted_parser(subparsers):
     parser = subparsers.add_parser('hosted', help='One-time owner setup and autonomous agent registration')
     commands = parser.add_subparsers(dest='hosted_action', required=True)
@@ -452,9 +502,11 @@ def add_hosted_parser(subparsers):
     login.add_argument('--credential-stdin', action='store_true', required=True)
     register = commands.add_parser('register', help='Register an agent using saved owner access; print shell exports')
     register.add_argument('--url', default=HOSTED_DEFAULT_URL)
-    register.add_argument('--project', required=True)
-    register.add_argument('--agent', required=True)
+    register.add_argument('--project', help='Default: this repository\'s name')
+    register.add_argument('--agent', help='Default: the runtime running this command (claude, codex, ...)')
     register.add_argument('--label')
+    register.add_argument('--rebind', action='store_true',
+        help='Connect this repository to the given project even if it is already connected to another')
     status = commands.add_parser('status', help='Check saved owner registration access')
     status.add_argument('--url', default=HOSTED_DEFAULT_URL)
 
@@ -481,7 +533,9 @@ def run_hosted(args):
             data = hosted_request(url, owner['token'], 'GET', '/v1/hosted/registration')
             print(json.dumps(data, indent=2))
             return 0
-        project, family = normalize_slug(args.project), normalize_slug(args.agent)
+        from agent_inbox.identity import derive_repo_key, repository_name, runtime_family
+        project = normalize_slug(args.project or repository_name())
+        family = normalize_slug(args.agent or runtime_family())
         cache = directory / (hashlib.sha256((project + '/' + family).encode()).hexdigest() + '.json')
         # Serialize agents registering the same family across concurrent terminals.
         fd = os.open(directory / 'register.lock', os.O_CREAT | os.O_RDWR, 0o600)
@@ -512,6 +566,21 @@ def run_hosted(args):
             finally:
                 if os.path.exists(name):
                     os.unlink(name)
+            # The repository, not the shell, now carries this identity: every later
+            # command run inside it acts as this agent with no exports to lose.
+            repository = derive_repo_key()
+            if repository:
+                bindings = load_hosted_bindings()
+                runtime = runtime_family()
+                current = bindings.get(repository, {}).get(runtime)
+                if current and current['project'] != project and not args.rebind:
+                    print('This repository stays connected as %s@%s. The key for %s@%s is saved; run from that '
+                          'project\'s repository, or pass --rebind to switch this one.'
+                          % (current['family'], current['project'], family, project), file=sys.stderr)
+                else:
+                    bindings.setdefault(repository, {})[runtime] = {'url': url, 'project': project, 'family': family}
+                    save_hosted_credentials(hosted_bindings_path(), bindings)
+                    print('Connected: this repository is %s@%s at %s. No exports needed.' % (family, project, url), file=sys.stderr)
         print('unset AGENT_INBOX_TOKEN')
         for key, value in {'URL': url, 'TOKEN_FILE': str(token_file), 'PROJECT': project, 'AGENT': family}.items():
             print('export AGENT_INBOX_%s=%s' % (key, shlex.quote(value)))

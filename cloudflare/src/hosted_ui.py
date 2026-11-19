@@ -38,7 +38,7 @@ async function openConnections(){
   }
   const registration=state.registration;
   dialog.querySelector('#copy-registration').disabled=!registration;
-  dialog.querySelector('#registration-command').value=registration?`agent-inbox hosted login --url '${location.origin}' --credential-stdin <<'INBOX_CREDENTIAL'\n${registration.token}\nINBOX_CREDENTIAL\n\n# Each agent can now run, using its project and name:\neval "$(agent-inbox hosted register --url '${location.origin}' --project my-project --agent codex)"\neval "$(agent-inbox claim)"\nagent-inbox brief`:`Setup is temporarily unavailable: ${state.registrationError}. Reopen this dialog to retry.`;
+  dialog.querySelector('#registration-command').value=registration?`agent-inbox hosted login --url '${location.origin}' --credential-stdin <<'INBOX_CREDENTIAL'\n${registration.token}\nINBOX_CREDENTIAL\n\n# Then once in each project's folder. The folder remembers who the agent is:\nagent-inbox hosted register --url '${location.origin}'\nagent-inbox whoami`:`Setup is temporarily unavailable: ${state.registrationError}. Reopen this dialog to retry.`;
   dialog.querySelector('#copy-registration').onclick=async()=>{try{await navigator.clipboard.writeText(dialog.querySelector('#registration-command').value);dialog.querySelector('#copy-registration').textContent='Copied';}catch{dialog.querySelector('#registration-command').select();}};
   form.onsubmit=async event=>{
     event.preventDefault();const submit=form.querySelector('button[type=submit]');submit.disabled=true;dialog.querySelector('#key-error').textContent='';

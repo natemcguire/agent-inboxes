@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -76,3 +77,148 @@ class HostedRegistrationTests(unittest.TestCase):
         with patch.dict(os.environ, {'AGENT_INBOX_PROJECT': 'shared', 'AGENT_INBOX_TOKEN_FILE': '/private/key'}):
             with patch('agent_inbox.db.get_connection', side_effect=AssertionError('Hosted identity must not open the local database')):
                 self.assertEqual(derive_project(), 'shared')
+
+
+class RepositoryIdentityTests(unittest.TestCase):
+    """A repository connected once is that project's agent in every shell; a real HTTP service records who called."""
+
+    def setUp(self):
+        import subprocess
+        seen = self.seen = []
+        keys = self.keys = {}
+
+        class Service(BaseHTTPRequestHandler):
+            def reply(self, status, data):
+                raw = json.dumps(data).encode()
+                self.send_response(status);self.send_header('Content-Type', 'application/json');self.end_headers();self.wfile.write(raw)
+
+            def do_GET(self):
+                bearer = (self.headers.get('Authorization') or '').removeprefix('Bearer ')
+                seen.append((keys.get(bearer, bearer), self.path))
+                if self.path == '/v1/hosted/registration':
+                    return self.reply(200, {'owner': 'owner@example.com', 'workspace': 'w', 'id': 'reg_1'})
+                if self.path == '/v1/hosted/whoami' and bearer in keys:
+                    agent, project = keys[bearer].split('@')
+                    return self.reply(200, {'kind': 'agent', 'address': keys[bearer], 'agent': agent, 'project': project,
+                        'owner': 'owner@example.com', 'directory': [], 'same_name_elsewhere': [], 'rules': []})
+                self.reply(200, {'inboxes': [], 'status': 'ok'})
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                address = body['family'] + '@' + body['project']
+                token = 'ain_key_for_' + address.replace('@', '_at_')
+                keys[token] = address
+                self.reply(201, {'id': 'key_' + address, 'token': token, 'address': address, 'project': body['project'],
+                    'family': body['family'], 'owner': 'owner@example.com', 'expires_at': time.time() + 3600})
+
+            def do_PUT(self):
+                self.rfile.read(int(self.headers.get('Content-Length') or 0))
+                self.reply(200, {})
+
+            def log_message(self, *args): pass
+
+        self.server = ThreadingHTTPServer(('127.0.0.1', 0), Service)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f'http://127.0.0.1:{self.server.server_port}'
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name).resolve()
+        for name in ('boats', 'homeassistant'):
+            (self.root / name).mkdir()
+            subprocess.run(['git', 'init', '-q', str(self.root / name)], check=True)
+        # A Claude session with no inbox variables of its own.
+        self.shell = {'PATH': os.environ['PATH'], 'HOME': str(self.root), 'CLAUDE_CODE_SESSION_ID': 'session-one',
+            'AGENT_INBOX_DIR': str(self.root / 'data'), 'AGENT_INBOX_DB': str(self.root / 'data' / 'inbox.db'),
+            'AGENT_INBOX_CLOUD_CONFIG': str(self.root / 'no-cloud.json')}
+        self.start = Path.cwd()
+        self.run_in('boats', ['hosted', 'login', '--url', self.url, '--credential-stdin'], stdin='ainr_owner_credential')
+
+    def tearDown(self):
+        os.chdir(self.start)
+        self.server.shutdown();self.server.server_close()
+        self.directory.cleanup()
+
+    def run_in(self, repository, arguments, shell=None, stdin=''):
+        """One CLI invocation in a repository, as a fresh process would see it."""
+        os.chdir(self.root / repository)
+        output, error = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, {**self.shell, **(shell or {})}, clear=True), patch('sys.stdin', io.StringIO(stdin)), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+            status = main(arguments)
+        return status, output.getvalue(), error.getvalue()
+
+    def callers(self):
+        """Which agent's key the service saw on inbox requests since the last check."""
+        found = [who for who, path in self.seen if path.startswith('/v1/inboxes')]
+        self.seen.clear()
+        return found
+
+    def connect(self, repository, *extra):
+        status, _, error = self.run_in(repository, ['hosted', 'register', '--url', self.url, *extra])
+        self.assertEqual(status, 0, error)
+        return error
+
+    def test_each_repository_acts_as_its_own_agent_without_exports(self):
+        self.assertIn('claude@boats', self.connect('boats'))
+        self.assertIn('claude@homeassistant', self.connect('homeassistant'))
+        self.seen.clear()
+        for repository in ('boats', 'homeassistant', 'boats'):
+            self.assertEqual(self.run_in(repository, ['inboxes'])[0], 0)
+            self.assertEqual(self.callers(), ['claude@' + repository])
+        status, output, _ = self.run_in('homeassistant', ['whoami'])
+        self.assertEqual(status, 0)
+        self.assertEqual(output.splitlines()[0], 'claude@homeassistant')
+
+    def test_a_worktree_is_the_same_agent_as_its_repository(self):
+        import subprocess
+        self.connect('boats')
+        git = ['git', '-C', str(self.root / 'boats'), '-c', 'user.name=t', '-c', 'user.email=t@example.com']
+        subprocess.run(git + ['commit', '-q', '--allow-empty', '-m', 'start'], check=True)
+        subprocess.run(git + ['worktree', 'add', '-q', str(self.root / 'boats-wt-task49')], check=True, capture_output=True)
+        self.seen.clear()
+        self.assertEqual(self.run_in('boats-wt-task49', ['inboxes'])[0], 0)
+        self.assertEqual(self.callers(), ['claude@boats'])
+
+    def test_exports_from_another_project_stop_the_command(self):
+        self.connect('boats');self.connect('homeassistant')
+        _, exports, _ = self.run_in('boats', ['hosted', 'register', '--url', self.url])
+        leaked = dict(line.removeprefix('export ').split('=', 1) for line in exports.splitlines() if line.startswith('export '))
+        leaked = {name: value.strip("'") for name, value in leaked.items()}
+        self.assertEqual(leaked['AGENT_INBOX_PROJECT'], 'boats')
+        self.seen.clear()
+        # The boats exports are still in a shell that has moved to the homeassistant repository.
+        status, output, error = self.run_in('homeassistant', ['inboxes'], shell=leaked)
+        self.assertEqual(status, 2)
+        self.assertEqual(self.seen, [])
+        self.assertIn('boats', error);self.assertIn('claude@homeassistant', error);self.assertIn('unset AGENT_INBOX_URL', error)
+        # The same exports in the repository they belong to are fine.
+        self.assertEqual(self.run_in('boats', ['inboxes'], shell=leaked)[0], 0)
+        self.assertEqual(self.callers(), ['claude@boats'])
+
+    def test_a_key_used_from_the_wrong_folder_is_explained_not_guessed(self):
+        self.connect('boats')
+        _, exports, _ = self.run_in('boats', ['hosted', 'register', '--url', self.url])
+        token_file = next(line.split('=', 1)[1].strip("'") for line in exports.splitlines() if 'TOKEN_FILE' in line)
+        (self.root / 'elsewhere').mkdir()
+        # Only the key travelled: no project variable, and a folder that is not connected.
+        status, output, error = self.run_in('elsewhere', ['whoami'], shell={'AGENT_INBOX_URL': self.url, 'AGENT_INBOX_TOKEN_FILE': token_file})
+        self.assertEqual(status, 2)
+        self.assertEqual(output, '')
+        self.assertIn('claude@boats', error);self.assertIn('elsewhere', error);self.assertIn('different agents', error)
+
+    def test_registering_another_project_does_not_silently_repoint_a_repository(self):
+        self.connect('boats')
+        note = self.connect('boats', '--project', 'homeassistant')
+        self.assertIn('stays connected as claude@boats', note)
+        self.seen.clear()
+        self.run_in('boats', ['inboxes'])
+        self.assertEqual(self.callers(), ['claude@boats'])
+        self.connect('boats', '--project', 'homeassistant', '--rebind')
+        self.run_in('boats', ['inboxes'])
+        self.assertEqual(self.callers(), ['claude@homeassistant'])
+
+    def test_an_explicit_endpoint_is_left_alone(self):
+        self.connect('boats')
+        self.seen.clear()
+        # A local or test service chosen on purpose is not replaced by the repository's hosted identity.
+        self.run_in('boats', ['inboxes'], shell={'AGENT_INBOX_URL': self.url})
+        self.assertEqual(self.callers(), [''])
