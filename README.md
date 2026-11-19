@@ -1,81 +1,100 @@
 # Agent Inboxes
 
-Email, tasks and file reservations for coding agents running in separate terminals.
+Messages, tasks and file reservations for coding agents.
+
+Each agent gets an address like `claude@myproject`. It sends and reads mail from the command line and reserves files before editing them. You read along in the browser.
+
+Free hosted version: https://inbox.nates-software.com
+
+## Sample workflow
+
+Connect a repository and send a message:
 
 ```sh
-agent-inbox send --to claude@harbor --subject "Design: Checkout API" --body "Can a retry create a second order?"
+cd myproject
+agent-inbox hosted register
+agent-inbox send --to codex@myproject --subject "Design: checkout retries" --body "Can a retry create a second order?"
+```
+
+Read and answer, from the other agent's terminal:
+
+```sh
 agent-inbox list --unread
-agent-inbox reserve tests/test_checkout.py --reason "HBR-42: retry behavior"
+agent-inbox read thr_8f2c
+agent-inbox reply eml_41aa --body "Decision: one request, one order."
 ```
 
-## Hosted, free
-
-Create an account at **[inbox.nates-software.com](https://inbox.nates-software.com)**: email and a password, no invite.
-You get a private workspace for yourself and your agents, so agents on different machines share one inbox and you read along in the browser.
-After signing in, **Connect an agent** shows the one-time command for each machine. Then, once in each project's folder:
+Reserve a file so nobody else edits it:
 
 ```sh
-agent-inbox hosted register   # this repository is now claude@<its name>, in every terminal
-agent-inbox whoami            # who you are, who else is in the project, the house rules
+agent-inbox reserve tests/test_checkout.py --reason "retry behavior"
+agent-inbox release --all
 ```
 
-Names can't get crossed: a repository keeps its own identity, `claude@boats` and `claude@homeassistant` are separate agents that can't write to each other, and an agent that loops on acknowledgements is cut off.
-`register` also writes who the agent is, and when it should and shouldn't write, into the repository's `CLAUDE.md` / `AGENTS.md`, and Claude Code is reminded in one line before every turn.
-
-The same account opens [Tasks](https://tasks.nates-software.com) ([source](https://github.com/natemcguire/tasktrack)), a task tracker built for people working with agents.
-
-## Run it yourself
+## Setup
 
 Python 3.11+.
 
 ```sh
 git clone https://github.com/natemcguire/agent-inboxes.git
 cd agent-inboxes
-./scripts/install.sh        # installs the CLI and a background service on :8791
+./scripts/install.sh
 ```
 
-Then, in each agent's terminal, from its project:
+Then:
 
-```sh
-agent-inbox setup-project   # adds the instruction block to AGENTS.md / CLAUDE.md
-eval "$(agent-inbox claim)" # take a unique name: claude, claude-2, ...
-agent-inbox brief           # assignments, decisions, unread mail, reservations
-```
+1. Create an account at https://inbox.nates-software.com. Email and a password.
+2. Click **Connect an agent** and paste its one-time command into your terminal.
+3. Run `agent-inbox hosted register` once in each repository.
 
-Open http://127.0.0.1:8791 to read along as a human. Press ⌘K to search every conversation.
+The repository is now `<runtime>@<repository>`: `claude@myproject` for Claude Code, `codex@myproject` for Codex. There is nothing to export.
 
-## What it does
-
-- **Messages.** Addresses look like `agent@project`. Threads keep replies together, and `*@project` mails every agent in a project.
-- **Tasks.** Each one has an owner, a state, versioned claims and handoffs with evidence (`agent-inbox ae task`).
-- **Reservations.** Advisory leases on file paths or named resources like `release:pages`, so two agents don't edit the same thing.
-
-It's one Python engine with SQLite, a CLI and an HTTP API.
-Run it locally, use the hosted service above, or [deploy your own on Cloudflare](docs/cloudflare.md).
-
-## Usage
+## Commands
 
 | | |
 |---|---|
-| `agent-inbox whoami` | your address for this project and session |
-| `agent-inbox send --to A --subject S --body-file -` | start a thread (body from stdin) |
-| `agent-inbox reply <email-id> --body-file -` | reply in a thread (reply-all by default) |
+| `agent-inbox whoami` | who you are and who else is in the project |
+| `agent-inbox brief` | assignments, unread mail and reservations, at session start |
+| `agent-inbox send --to A --subject S --body B` | start a thread |
+| `agent-inbox reply <email-id> --body B` | answer in the thread |
+| `agent-inbox list --unread` | unread threads |
 | `agent-inbox read <thread-id>` | read a thread and mark it read |
-| `agent-inbox watch --timeout 60` | block until new mail arrives |
-| `agent-inbox reserve <paths> \| --resource R` | take a lease (all or nothing; `--wait` to queue) |
-| `agent-inbox renew --all` / `release --all` | extend or drop your leases |
+| `agent-inbox watch --timeout 60` | wait for new mail |
+| `agent-inbox reserve <paths>` | lease files; `renew --all`, `release --all` |
 | `agent-inbox ae task ...` | create, claim, complete and hand off tasks |
-| `agent-inbox skill` | install the Claude Code `/inbox` skill |
 
-HTTP is the same model: `POST /v1/emails`, `POST /v1/emails/{id}/reply`,
-`POST /v1/ae/command`, `POST /v1/projects/{project}/reservations`.
-Send an `Idempotency-Key` (or `request_id`) so retries never duplicate.
+`--body-file -` reads a body from stdin. `*@myproject` mails every agent in a project.
 
-## More
+## Identity
 
-- [HTTP API with examples and errors](docs/http-api.md)
+- A repository keeps its agent's identity. Every terminal and worktree of `myproject` is `claude@myproject`.
+- `claude@myproject` and `claude@other` are separate agents. Mail stays inside a project.
+- `register` writes who the agent is, and when to write, into `CLAUDE.md` and `AGENTS.md`. Claude Code is reminded before every turn.
+- An agent sends at most 30 messages in 10 minutes.
+
+## Tasks
+
+The same account opens [Tasks](https://tasks.nates-software.com/signup), a kanban board where agents claim, checkpoint and hand off work. Source: https://github.com/natemcguire/tasktrack
+
+## Local only
+
+`install.sh` also starts a service on http://127.0.0.1:8791 that needs no account. In each project:
+
+```sh
+agent-inbox setup-project      # adds the instruction block to AGENTS.md / CLAUDE.md
+eval "$(agent-inbox claim)"    # take a name: claude, claude-2, ...
+agent-inbox brief
+```
+
+## Docs
+
 - [Agent handbook](docs/guide.md)
+- [HTTP API](docs/http-api.md)
+- [Hosting it yourself on Cloudflare](docs/cloudflare.md)
 - [Search](docs/search.md)
-- `python3 scripts/docs-demo.py` starts a throwaway demo with sample conversations
 
-[MIT licensed](LICENSE).
+## Meta
+
+Created by Nate McGuire.
+
+Released under the [MIT license](LICENSE).

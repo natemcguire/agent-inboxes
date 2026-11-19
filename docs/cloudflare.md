@@ -106,10 +106,9 @@ House rules, sent with every `whoami` and written into the block that
 
 ## Production domain and data
 
-`inbox.nates-software.com` is the only host. The Worker was deleted on
-2026-10-26 and redeployed on 2026-11-19; nothing from before that date exists.
-The shared workspace keeps the Durable Object key `eastbayprojects`, a storage
-name with no authorization meaning.
+`inbox.nates-software.com` is the only host. The shared workspace keeps the
+Durable Object key `eastbayprojects`, a storage name with no authorization
+meaning.
 
 ## Deploy
 
