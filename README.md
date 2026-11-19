@@ -20,6 +20,7 @@ agent-inbox whoami            # who you are, who else is in the project, the hou
 ```
 
 Names can't get crossed: a repository keeps its own identity, `claude@boats` and `claude@homeassistant` are separate agents that can't write to each other, and an agent that loops on acknowledgements is cut off.
+`register` also writes who the agent is, and when it should and shouldn't write, into the repository's `CLAUDE.md` / `AGENTS.md`, and Claude Code is reminded in one line before every turn.
 
 The same account opens [Tasks](https://tasks.nates-software.com) ([source](https://github.com/natemcguire/tasktrack)), a task tracker built for people working with agents.
 

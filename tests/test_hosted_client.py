@@ -222,3 +222,57 @@ class RepositoryIdentityTests(unittest.TestCase):
         # A local or test service chosen on purpose is not replaced by the repository's hosted identity.
         self.run_in('boats', ['inboxes'], shell={'AGENT_INBOX_URL': self.url})
         self.assertEqual(self.callers(), [''])
+
+    def test_connecting_puts_the_identity_where_the_agent_reads_it_every_session(self):
+        notes = self.root / 'boats' / 'CLAUDE.md'
+        notes.write_text('# Boats\n\nKeep the deck dry.\n')
+        said = self.connect('boats')
+        text = notes.read_text()
+        self.assertIn('CLAUDE.md', said)
+        self.assertTrue(text.startswith('# Boats\n\nKeep the deck dry.\n'))
+        self.assertIn('this repository is project `boats`', text)
+        self.assertIn('Claude is `claude@boats`', text)
+        self.assertIn('is a different agent, not you', text)
+        self.assertIn('Never send an acknowledgement', text)
+        # Connecting again, or connecting the other repository, leaves one block naming this project.
+        self.connect('boats');self.connect('homeassistant')
+        self.assertEqual(notes.read_text(), text)
+        self.assertEqual(text.count('<!-- agent-inboxes:start -->'), 1)
+        other = (self.root / 'homeassistant' / 'CLAUDE.md').read_text()
+        self.assertIn('Claude is `claude@homeassistant`', other)
+        self.assertNotIn('boats', other)
+
+    def test_claude_code_is_told_who_it_is_before_every_turn(self):
+        settings = self.root / 'boats' / '.claude' / 'settings.local.json'
+        settings.parent.mkdir()
+        mine = {'permissions': {'allow': ['Bash(ls:*)']}, 'hooks': {'UserPromptSubmit': [{'hooks': [{'type': 'command', 'command': 'echo mine'}]}]}}
+        settings.write_text(json.dumps(mine))
+        self.connect('boats');self.connect('boats');self.connect('homeassistant')
+        config = json.loads(settings.read_text())
+        self.assertEqual(config['permissions'], mine['permissions'])
+        commands = [hook['command'] for group in config['hooks']['UserPromptSubmit'] for hook in group['hooks']]
+        self.assertEqual(commands[0], 'echo mine')
+        self.assertEqual(len(commands), 2)
+        self.assertTrue(commands[1].endswith('agent-inbox identity'), commands)
+        # What that command prints, in each repository and outside any.
+        self.seen.clear()
+        for repository in ('boats', 'homeassistant'):
+            status, output, _ = self.run_in(repository, ['identity'])
+            self.assertEqual(status, 0)
+            self.assertEqual(len(output.strip().splitlines()), 1)
+            self.assertIn(f'you are claude@{repository}', output)
+            self.assertIn('different agent', output);self.assertIn('never an acknowledgement', output)
+        (self.root / 'elsewhere').mkdir()
+        self.assertEqual(self.run_in('elsewhere', ['identity']), (0, '', ''))
+        self.assertEqual(self.seen, [], 'the reminder must not use the network')
+        # A Codex session in the boats repository is not told it is Claude.
+        self.assertEqual(self.run_in('boats', ['identity'], shell={'CLAUDE_CODE_SESSION_ID': '', 'CODEX_SESSION_ID': 'c'})[1], '')
+
+    def test_instructions_can_be_declined(self):
+        self.connect('boats', '--no-instructions')
+        self.assertFalse((self.root / 'boats' / 'CLAUDE.md').exists())
+        self.assertFalse((self.root / 'boats' / 'AGENTS.md').exists())
+        self.assertFalse((self.root / 'boats' / '.claude').exists())
+        self.seen.clear()
+        self.run_in('boats', ['inboxes'])
+        self.assertEqual(self.callers(), ['claude@boats'])

@@ -1144,6 +1144,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_hc.add_argument("--format", dest="hc_format", choices=["plain", "json"], default="plain")
     subparsers.add_parser('heartbeat', help='Silently refresh this session name; for opt-in harness activity hooks')
 
+    subparsers.add_parser("identity", help="Print one offline line saying who the agent in this repository is")
     p_prompt = subparsers.add_parser("prompt", help="Print the compact agent onboarding prompt")
     p_prompt.add_argument("--copy", action="store_true", help="Also copy the prompt to the clipboard (macOS)")
 
@@ -1175,6 +1176,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "hosted":
         from agent_inbox.client import run_hosted
         return run_hosted(args)
+
+    if args.command == "identity":
+        # Runs before every agent turn: offline, one line, silent when not connected.
+        from agent_inbox.client import identity_line
+        line = identity_line()
+        if line:
+            print(line)
+        return 0
 
     # A connected repository supplies the identity; a conflicting shell stops here.
     try:

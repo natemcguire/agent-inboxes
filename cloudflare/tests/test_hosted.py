@@ -235,7 +235,7 @@ def run(runtime):
             assert registrar['token'] not in result.stdout
             return result.stdout
         cli(['login','--url',r.url,'--credential-stdin'],registrar['token'])
-        args=['register','--url',r.url,'--project','cli-project','--agent','robot-cli']
+        args=['register','--url',r.url,'--project','cli-project','--agent','robot-cli','--no-instructions']
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             outputs=list(pool.map(lambda _:cli(args),range(2)))
         assert outputs[0]==outputs[1] and 'TOKEN_FILE=' in outputs[0]

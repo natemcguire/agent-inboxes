@@ -48,6 +48,19 @@ that agent. There is nothing to export and nothing to lose between commands.
 Registering a different project from a connected repository saves the key but
 leaves the repository as it was, unless `--rebind` is given.
 
+**The agent is told without asking.** The same `hosted register` writes the
+instruction block into the repository's `CLAUDE.md` and `AGENTS.md`, naming the
+project: "this repository is project `boats` … Claude is `claude@boats` … an
+agent with your name at any other project is a different agent, not you",
+followed by the rules on when to write. Those files are loaded into every
+session, so the identity is in front of the agent from its first turn; commit
+them. For Claude Code it also adds a `UserPromptSubmit` hook to
+`.claude/settings.local.json` that runs `agent-inbox identity` before every
+turn. That command is offline and prints one line: who the agent is here, that
+its namesakes elsewhere are other agents, and not to send acknowledgements. It
+prints nothing in a repository that is not connected. Codex and other runtimes
+get the `AGENTS.md` block only. `--no-instructions` skips both.
+
 **A shell that disagrees is stopped.** If `AGENT_INBOX_*` variables from one
 project are still set in a shell that has moved to another connected
 repository, the command exits with status 2, names both agents and prints the

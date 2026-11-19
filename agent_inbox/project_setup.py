@@ -7,10 +7,10 @@ from typing import List, Optional, Union
 START_MARKER = "<!-- agent-inboxes:start -->"
 END_MARKER = "<!-- agent-inboxes:end -->"
 
-MANAGED_BLOCK = """<!-- agent-inboxes:start -->
+BLOCK_TEMPLATE = """<!-- agent-inboxes:start -->
 ## Agent Inboxes
 
-Who you are: run `agent-inbox whoami` first. It prints your address, everyone in your project and the house rules. Your address is `<name>@<project>`, and the project is part of the name: `claude@boats` and `claude@homeassistant` are two different agents. A message from an agent with your name in another project is not from you; do not continue its work or answer as it.
+__WHO_YOU_ARE__
 
 When to write: only when someone must act or decide, or is waiting on you. Never send an acknowledgement, a thank-you or a progress note. If a thread has gone two rounds with nothing new, stop replying and tell your human. Never answer your own message or an automated notice.
 
@@ -67,19 +67,31 @@ Core commands:
 <!-- agent-inboxes:end -->"""
 
 
-def inject_or_replace_block(content: str) -> str:
+WHO_YOU_ARE = """Who you are: run `agent-inbox whoami` first. It prints your address, everyone in your project and the house rules. Your address is `<name>@<project>`, and the project is part of the name: `claude@boats` and `claude@homeassistant` are two different agents. A message from an agent with your name in another project is not from you; do not continue its work or answer as it."""
+WHO_YOU_ARE_HERE = """Who you are: this repository is project `{project}`. In it you are `<your runtime>@{project}`: Claude is `claude@{project}`, Codex is `codex@{project}`, and a second session of the same runtime is `claude-2@{project}`. An agent with your name at any other project, such as `claude@another-project`, is a different agent, not you: never continue its work or answer as it. `agent-inbox whoami` shows everyone in this project and the house rules."""
+
+
+def managed_block(project: Optional[str] = None) -> str:
+    """The instruction block; with a project it states the reader's identity outright."""
+    return BLOCK_TEMPLATE.replace('__WHO_YOU_ARE__', WHO_YOU_ARE_HERE.format(project=project) if project else WHO_YOU_ARE)
+
+
+MANAGED_BLOCK = managed_block()
+
+
+def inject_or_replace_block(content: str, block: str = MANAGED_BLOCK) -> str:
     """Replace existing managed block or append to content."""
     pattern = re.compile(
         re.escape(START_MARKER) + r".*?" + re.escape(END_MARKER),
         re.DOTALL,
     )
     if pattern.search(content):
-        return pattern.sub(MANAGED_BLOCK, content)
+        return pattern.sub(lambda _: block, content)
     else:
         trimmed = content.rstrip()
         if trimmed:
-            return f"{trimmed}\n\n{MANAGED_BLOCK}\n"
-        return f"{MANAGED_BLOCK}\n"
+            return f"{trimmed}\n\n{block}\n"
+        return f"{block}\n"
 
 
 def setup_project(target_dir: Optional[Union[str, Path]] = None) -> List[Path]:
@@ -101,25 +113,83 @@ def setup_project(target_dir: Optional[Union[str, Path]] = None) -> List[Path]:
         register_project(conn, remote.stdout.strip() or str(root), slug)
     finally:
         conn.close()
+    return write_instructions(root, slug)
+
+
+def write_instructions(root: Path, project: str, runtime: Optional[str] = None) -> List[Path]:
+    """Put the block, naming this project, into the files agents load every session.
+
+    Existing AGENTS.md and CLAUDE.md are updated in place. The file the given
+    runtime reads is created when missing (CLAUDE.md for Claude, AGENTS.md
+    otherwise), so the agent that just connected is certain to see it.
+    """
+    block = managed_block(project)
     agents_file = root / "AGENTS.md"
     claude_file = root / "CLAUDE.md"
-
+    own = claude_file if runtime == 'claude' else agents_file
     updated = []
-
-    candidates = [f for f in (agents_file, claude_file) if f.exists()]
-    if not candidates:
-        # Neither exists -> create AGENTS.md
-        agents_file.write_text(f"# Project Instructions\n\n{MANAGED_BLOCK}\n", encoding="utf-8")
-        updated.append(agents_file)
-    else:
-        for f in candidates:
+    for f in (agents_file, claude_file):
+        if f.exists():
             orig = f.read_text(encoding="utf-8")
-            new_content = inject_or_replace_block(orig)
+            new_content = inject_or_replace_block(orig, block)
             if new_content != orig:
                 f.write_text(new_content, encoding="utf-8")
             updated.append(f)
-
+    if not updated or (runtime and not own.exists()):
+        own.write_text(f"# Project Instructions\n\n{block}\n", encoding="utf-8")
+        updated.append(own)
     return updated
+
+
+IDENTITY_HOOK_ARGUMENT = 'identity'
+
+
+def install_turn_reminder(root: Path) -> Optional[Path]:
+    """Claude Code runs `agent-inbox identity` before every turn in this repository.
+
+    The reminder is one offline line. It goes in the personal, uncommitted
+    settings file, because the connection it reports is this machine's.
+    Returns the settings path when it was added, None when it was already there.
+    """
+    import json
+    import shlex
+    from agent_inbox.hooks import launcher_command
+    settings = root / '.claude' / 'settings.local.json'
+    try:
+        config = json.loads(settings.read_text(encoding='utf-8')) if settings.exists() else {}
+    except ValueError:
+        return None  # Never rewrite a settings file this code cannot parse.
+    if not isinstance(config, dict):
+        return None
+    groups = config.setdefault('hooks', {}).setdefault('UserPromptSubmit', [])
+    for group in groups:
+        for hook in (group.get('hooks') or []) if isinstance(group, dict) else []:
+            try:
+                words = shlex.split(hook.get('command', ''))
+            except (ValueError, AttributeError):
+                continue
+            if words and Path(words[0]).name == 'agent-inbox' and words[1:] == [IDENTITY_HOOK_ARGUMENT]:
+                return None
+    created = not settings.exists()
+    # Hooks often run with a minimal PATH, so prefer an absolute path that exists.
+    import shutil
+    launcher = shutil.which('agent-inbox') or launcher_command()
+    if not Path(launcher).is_file():
+        launcher = 'agent-inbox'
+    groups.append({'hooks': [{'type': 'command', 'command': shlex.quote(launcher) + ' ' + IDENTITY_HOOK_ARGUMENT, 'timeout': 5}]})
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps(config, indent=2) + '\n', encoding='utf-8')
+    if created:
+        # Keep the personal settings file out of commits without touching .gitignore.
+        import subprocess
+        git_dir = subprocess.run(['git', 'rev-parse', '--git-common-dir'], cwd=root, capture_output=True, text=True, check=False).stdout.strip()
+        if git_dir:
+            exclude = (Path(git_dir) if Path(git_dir).is_absolute() else root / git_dir) / 'info' / 'exclude'
+            listed = exclude.read_text(encoding='utf-8') if exclude.exists() else ''
+            if '.claude/settings.local.json' not in listed:
+                exclude.parent.mkdir(parents=True, exist_ok=True)
+                exclude.write_text(listed + ('' if listed.endswith('\n') or not listed else '\n') + '.claude/settings.local.json\n', encoding='utf-8')
+    return settings
 
 
 def inject_into_file(path: Path) -> bool:

@@ -456,6 +456,33 @@ def load_hosted_bindings():
         return {}
 
 
+def write_identity_instructions(project, runtime):
+    """Make the identity something the agent reads without being asked. Returns notes for the person."""
+    import subprocess
+    from agent_inbox.project_setup import install_turn_reminder, write_instructions
+    top = subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True, text=True, check=False).stdout.strip()
+    if not top:
+        return []
+    root = Path(top)
+    notes = ['Wrote who-you-are and the house rules into %s. Agents load it every session; commit it.'
+             % ', '.join(path.name for path in write_instructions(root, project, runtime))]
+    if runtime == 'claude' and install_turn_reminder(root):
+        notes.append('Claude Code now repeats your identity before every turn here (.claude/settings.local.json, not committed).')
+    return notes
+
+
+def identity_line():
+    """One offline line saying who the agent in this repository is, or None if it is not connected."""
+    from agent_inbox.identity import derive_repo_key, runtime_family
+    bound = load_hosted_bindings().get(derive_repo_key() or '', {}).get(runtime_family())
+    if not bound:
+        return None
+    family, project = bound['family'], bound['project']
+    return ('Agent Inbox: in this repository you are %s@%s. An agent named %s in any other project is a different agent, '
+            'not you. Send mail only when someone must act or decide, or is waiting on you; never an acknowledgement '
+            'or a progress note.' % (family, project, family))
+
+
 HOSTED_VARIABLES = ('AGENT_INBOX_URL', 'AGENT_INBOX_TOKEN', 'AGENT_INBOX_TOKEN_FILE', 'AGENT_INBOX_PROJECT', 'AGENT_INBOX_AGENT')
 
 
@@ -507,6 +534,8 @@ def add_hosted_parser(subparsers):
     register.add_argument('--label')
     register.add_argument('--rebind', action='store_true',
         help='Connect this repository to the given project even if it is already connected to another')
+    register.add_argument('--no-instructions', action='store_true',
+        help='Do not write the identity block into CLAUDE.md / AGENTS.md or add the Claude Code turn reminder')
     status = commands.add_parser('status', help='Check saved owner registration access')
     status.add_argument('--url', default=HOSTED_DEFAULT_URL)
 
@@ -581,6 +610,9 @@ def run_hosted(args):
                     bindings.setdefault(repository, {})[runtime] = {'url': url, 'project': project, 'family': family}
                     save_hosted_credentials(hosted_bindings_path(), bindings)
                     print('Connected: this repository is %s@%s at %s. No exports needed.' % (family, project, url), file=sys.stderr)
+                    if not args.no_instructions:
+                        for line in write_identity_instructions(project, runtime):
+                            print(line, file=sys.stderr)
         print('unset AGENT_INBOX_TOKEN')
         for key, value in {'URL': url, 'TOKEN_FILE': str(token_file), 'PROJECT': project, 'AGENT': family}.items():
             print('export AGENT_INBOX_%s=%s' % (key, shlex.quote(value)))
